@@ -15,12 +15,12 @@ if ! command -v capnp >/dev/null 2>&1; then
 fi
 
 # C++ generation (used by runtime-macos, encoder-macos, quest-app NDK).
-capnp compile -oc++:"$OUT/cpp" --src-prefix=proto proto/fuvr.capnp
+capnp compile -oc++:"$OUT/cpp" --src-prefix=proto proto/fuvr.capnp proto/fuvrd.capnp
 
 # Rust generation (used by transport crate).
 # capnpc-rust is installed via `cargo install capnpc`; check optimistically.
 if command -v capnpc-rust >/dev/null 2>&1; then
-  capnp compile -orust:"$OUT/rust" --src-prefix=proto proto/fuvr.capnp
+  capnp compile -orust:"$OUT/rust" --src-prefix=proto proto/fuvr.capnp proto/fuvrd.capnp
 else
   echo "warning: capnpc-rust missing; Rust bindings skipped (cargo install capnpc)" >&2
 fi

@@ -43,11 +43,20 @@ jobs:
 
       # Wire-compatibility guard: any rotation of the schema id silently breaks
       # every deployed Mac/Quest pair, so we pin it explicitly here.
-      - name: Verify schema id is pinned
+      - name: Verify wire schema id is pinned
         run: |
           expected='@0xb1f5d4f7c2a830e5'
           if ! grep -q "$expected;" proto/fuvr.capnp; then
             echo "::error::proto/fuvr.capnp schema id has changed; expected $expected"
             grep '^@0x' proto/fuvr.capnp || true
+            exit 1
+          fi
+
+      - name: Verify daemon schema id is pinned
+        run: |
+          expected='@0xc8a4f30f6df21a7b'
+          if ! grep -q "$expected;" proto/fuvrd.capnp; then
+            echo "::error::proto/fuvrd.capnp schema id has changed; expected $expected"
+            grep '^@0x' proto/fuvrd.capnp || true
             exit 1
           fi

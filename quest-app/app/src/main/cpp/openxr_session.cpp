@@ -130,6 +130,7 @@ bool OpenXrSession::create_action_set() {
     make_action("thumbstick", "Thumbstick", XR_ACTION_TYPE_VECTOR2F_INPUT, &thumbstick_action_);
     make_action("button_a", "Button A/X", XR_ACTION_TYPE_BOOLEAN_INPUT, &button_a_action_);
     make_action("button_b", "Button B/Y", XR_ACTION_TYPE_BOOLEAN_INPUT, &button_b_action_);
+    make_action("haptic", "Haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT, &haptic_action_);
 
     XrPath profile_path;
     xrStringToPath(instance_, "/interaction_profiles/oculus/touch_plus_controller", &profile_path);
@@ -148,6 +149,8 @@ bool OpenXrSession::create_action_set() {
         {button_a_action_,   p("/user/hand/right/input/a/click")},
         {button_b_action_,   p("/user/hand/left/input/y/click")},
         {button_b_action_,   p("/user/hand/right/input/b/click")},
+        {haptic_action_,     p("/user/hand/left/output/haptic")},
+        {haptic_action_,     p("/user/hand/right/output/haptic")},
     };
     XrInteractionProfileSuggestedBinding suggest{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
     suggest.interactionProfile = profile_path;

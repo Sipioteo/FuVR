@@ -11,8 +11,13 @@ Mac at ~1 kHz.
 - Android NDK r26+ (`26.3.11579264` pinned in `gradle.properties`)
 - Gradle 8.7 (wrapper provided)
 - JDK 17
-- `capnp` CLI on `$PATH` (used by the `generateCapnp` task that emits C++
-  sources from `../proto/fuvr.capnp` into `app/src/main/cpp/proto_gen/`)
+- `capnp` CLI on `$PATH` — **build-time dependency**. The `generateCapnp`
+  Gradle task wires into `preBuild` and emits C++ sources from
+  `../proto/fuvr.capnp` into `app/src/main/cpp/proto_gen/`. The build fails
+  with an explicit error if `capnp` is missing (`brew install capnp` /
+  `apt-get install capnproto`). The Cap'n Proto C++ runtime itself is built
+  from a pinned source tarball via `ExternalProject_Add` inside CMake — no
+  separate runtime install is needed.
 - Quest in Developer Mode, USB cable, ADB
 
 ## Build
@@ -50,3 +55,26 @@ See its CLI for spike testing (`cargo run -p transport --example spike`).
 - The OpenXR loader is pulled in via the AAR at
   `org.khronos.openxr:openxr_loader_for_android:1.1.36` with `prefab=true`.
 - See `TODO.md` for the runtime work still pending after the M0 skeleton.
+
+## Side-by-side stereo strategy
+
+The Mac encoder produces a single `4128 × 2208` frame per timestamp, with the
+left eye occupying `x ∈ [0, 2064)` and the right eye `x ∈ [2064, 4128)`. We
+deliberately decode it once into a single `AHardwareBuffer` (zero-copy via
+`AImageReader`), bind it as a `GL_TEXTURE_EXTERNAL_OES`, and then run a tiny
+GLES3 fullscreen-triangle shader twice per frame: once to blit the left half
+into the left per-eye `XrSwapchain` image (sampling `u ∈ [0, 0.5]`) and once
+into the right (sampling `u ∈ [0.5, 1.0]`). This keeps the wire format
+codec-agnostic and avoids the cost of two encoder/decoder pairs while
+maintaining IPD-correct projection through OpenXR's
+`XrCompositionLayerProjection`.
+
+## Host-side native tests
+
+```sh
+./gradlew :app:hostTest
+```
+
+Builds and runs `app/src/main/cpp/tests/test_fragment_reassembly` with the
+host C++ toolchain (NOT the NDK). It validates fragment reassembly logic
+without a Quest device.

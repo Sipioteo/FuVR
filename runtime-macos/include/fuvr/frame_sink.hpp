@@ -4,7 +4,13 @@
 #include <cstdint>
 #include <memory>
 
+#include "fuvr/pose_predictor.hpp"
+
+typedef struct __IOSurface* IOSurfaceRef;
+
 namespace fuvr::runtime {
+
+class DaemonClient;
 
 struct SubmittedFrame {
   uint64_t frameId{0};
@@ -14,6 +20,11 @@ struct SubmittedFrame {
   void* rightMetalTexture{nullptr};
   uint32_t width{0};
   uint32_t height{0};
+  IOSurfaceRef ioSurface{nullptr};
+  uint64_t sessionId{0};
+  Pose renderedLeft{};
+  Pose renderedRight{};
+  bool forceIdr{false};
 };
 
 class FrameSink {
@@ -27,6 +38,16 @@ class NullFrameSink final : public FrameSink {
   void submit(const SubmittedFrame&) noexcept override {}
 };
 
+class DaemonFrameSink final : public FrameSink {
+ public:
+  explicit DaemonFrameSink(DaemonClient* client) noexcept : client_(client) {}
+  void submit(const SubmittedFrame& frame) noexcept override;
+
+ private:
+  DaemonClient* client_{nullptr};
+};
+
 std::unique_ptr<FrameSink> makeDefaultFrameSink();
+std::unique_ptr<FrameSink> makeDaemonFrameSink(DaemonClient* client);
 
 }  // namespace fuvr::runtime

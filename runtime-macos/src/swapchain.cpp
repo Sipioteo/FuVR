@@ -2,7 +2,9 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "fuvr/iosurface_swapchain.hpp"
 #include "fuvr/runtime.hpp"
+#include "fuvr/xr_fuvr_metal_enable.h"
 
 namespace fuvr::runtime {
 
@@ -64,6 +66,11 @@ XrResult xrCreateSwapchain_impl(XrSession sessionHandle,
   sc->height = info->height;
   sc->format = info->format;
   sc->arraySize = info->arraySize;
+  sc->images = allocateIOSurfaceSwapchain(s->metalDevice, info->width,
+                                          info->height, 3);
+  if (sc->images.empty()) {
+    return XR_ERROR_OUT_OF_MEMORY;
+  }
   const uint64_t h = detail::nextHandleAlloc();
   sc->handle = reinterpret_cast<XrSwapchain>(h);
   Swapchain* raw = sc.get();
@@ -102,26 +109,40 @@ XrResult xrDestroySwapchain_impl(XrSwapchain handle) noexcept {
 XrResult xrEnumerateSwapchainImages_impl(
     XrSwapchain handle, uint32_t capacity, uint32_t* count,
     XrSwapchainImageBaseHeader* images) noexcept {
-  if (lookupSwapchain(handle) == nullptr || count == nullptr) {
+  Swapchain* sc = lookupSwapchain(handle);
+  if (sc == nullptr || count == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
   }
-  (void)images;
-  if (capacity == 0) {
-    *count = 0;
+  const uint32_t total = static_cast<uint32_t>(sc->images.size());
+  if (images == nullptr || capacity == 0) {
+    *count = total;
     return XR_SUCCESS;
   }
-  return XR_ERROR_FUNCTION_UNSUPPORTED;
+  if (capacity < total) {
+    *count = total;
+    return XR_ERROR_SIZE_INSUFFICIENT;
+  }
+  // Per XR_FUVR_metal_enable, app passes an array of XrSwapchainImageMetalFUVR.
+  auto* mtl = reinterpret_cast<XrSwapchainImageMetalFUVR*>(images);
+  for (uint32_t i = 0; i < total; ++i) {
+    mtl[i].type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_FUVR;
+    mtl[i].next = nullptr;
+    mtl[i].texture = sc->images[i]->mtlTexture;
+  }
+  *count = total;
+  return XR_SUCCESS;
 }
 
 XrResult xrAcquireSwapchainImage_impl(XrSwapchain handle,
                                        const XrSwapchainImageAcquireInfo*,
                                        uint32_t* index) noexcept {
   Swapchain* sc = lookupSwapchain(handle);
-  if (sc == nullptr || index == nullptr) {
+  if (sc == nullptr || index == nullptr || sc->images.empty()) {
     return XR_ERROR_HANDLE_INVALID;
   }
   *index = sc->acquiredIndex;
-  sc->acquiredIndex = (sc->acquiredIndex + 1) % 3;
+  sc->acquiredIndex =
+      (sc->acquiredIndex + 1) % static_cast<uint32_t>(sc->images.size());
   return XR_SUCCESS;
 }
 
@@ -132,7 +153,16 @@ XrResult xrWaitSwapchainImage_impl(XrSwapchain handle,
 
 XrResult xrReleaseSwapchainImage_impl(XrSwapchain handle,
                                        const XrSwapchainImageReleaseInfo*) noexcept {
-  return lookupSwapchain(handle) ? XR_SUCCESS : XR_ERROR_HANDLE_INVALID;
+  Swapchain* sc = lookupSwapchain(handle);
+  if (sc == nullptr) return XR_ERROR_HANDLE_INVALID;
+  if (!sc->images.empty()) {
+    // Track which image was just released so xrEndFrame can locate the
+    // IOSurface backing the frame the app just finished rendering.
+    sc->lastReleasedIndex =
+        (sc->acquiredIndex + static_cast<uint32_t>(sc->images.size()) - 1) %
+        static_cast<uint32_t>(sc->images.size());
+  }
+  return XR_SUCCESS;
 }
 
 }  // namespace fuvr::runtime

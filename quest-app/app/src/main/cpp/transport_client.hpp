@@ -11,6 +11,10 @@
 
 namespace fuvr {
 
+// Why: channel ids must match the Rust transport crate's `Channel` enum at
+// transport/transport-core/src/channel.rs exactly — that crate is the
+// single source of truth for the wire framing across all FuVR endpoints.
+// Audited against commit 75fb94b: order is identical.
 enum class Channel : uint8_t {
     Video   = 0,
     Audio   = 1,

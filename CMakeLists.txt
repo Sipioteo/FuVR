@@ -37,7 +37,11 @@ target_include_directories(fuvr_proto INTERFACE ${CAPNP_INCLUDE_DIRS})
 target_link_directories(fuvr_proto INTERFACE ${CAPNP_LIBRARY_DIRS})
 target_link_libraries(fuvr_proto INTERFACE ${CAPNP_LIBRARIES})
 
+include(CTest)
+enable_testing()
+
 # Component subdirectories. Each is independently buildable.
 add_subdirectory(encoder-macos)
 add_subdirectory(runtime-macos)
 add_subdirectory(virtual-display-helper)
+add_subdirectory(daemon)

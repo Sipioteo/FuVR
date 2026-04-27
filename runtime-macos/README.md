@@ -88,6 +88,46 @@ To unregister:
 ./build/runtime-macos/fuvr-register --unregister
 ```
 
+## Daemon split (ADR-0002)
+
+The runtime is loaded into the app's address space by the standard Khronos
+OpenXR loader. Long-running work (transport, encoder, virtual display) lives
+in a separate daemon `fuvrd`. The runtime opens a Cap'n Proto Unix-domain
+socket connection to the daemon at:
+
+- `$XDG_RUNTIME_DIR/fuvr/rpc.sock`, or
+- `~/Library/Caches/fuvr/rpc.sock` as a fallback.
+
+Connection is lazy and uses exponential backoff up to 1 s. When the daemon is
+absent the runtime still functions enough for registration/lifecycle work
+(`fuvr-register`, `xrCreateInstance`, extension enumeration, unit tests). For
+streaming, `fuvrd` must be running.
+
+### Frame submission protocol
+
+`xrEndFrame` looks up the IOSurface backing the most recently released
+swapchain image and hands it to `DaemonFrameSink::submit`, which:
+
+1. Calls `IOSurfaceCreateMachPort` to get a mach send-right.
+2. Sends a `SubmitFrameRequest` envelope carrying the mach port name in
+   `surfaceToken` plus the per-eye rendered pose.
+3. Releases its local copy of the mach port (the daemon receives its own
+   reference via the IOSurface registry).
+
+Note: although the proto comment mentions SCM_RIGHTS, macOS only supports
+file descriptors (not mach ports) over SCM_RIGHTS. The current implementation
+sends the mach port name in-band; cross-task transfer for a real out-of-process
+daemon will require a `mach_msg` side channel — see `TODO.md`.
+
+### XR_FUVR_metal_enable
+
+Apps select the Metal graphics binding by chaining
+`XrGraphicsBindingMetalFUVR { mtlDevice }` into `XrSessionCreateInfo::next`.
+Swapchain images are returned as `XrSwapchainImageMetalFUVR { texture }` —
+each `texture` is an `id<MTLTexture>` backed by an `IOSurfaceRef` allocated
+by the runtime. The runtime owns the IOSurface for the lifetime of the
+swapchain (released on `xrDestroySwapchain`).
+
 ## Tests
 
 ```sh

@@ -67,6 +67,13 @@ private:
     XrAction thumbstick_action_{XR_NULL_HANDLE};
     XrAction button_a_action_{XR_NULL_HANDLE};
     XrAction button_b_action_{XR_NULL_HANDLE};
+    XrAction haptic_action_{XR_NULL_HANDLE};
+
+public:
+    XrAction haptic_action() const { return haptic_action_; }
+    const std::vector<XrViewConfigurationView>& view_configs() const { return view_configs_; }
+
+private:
 
     XrSessionState session_state_{XR_SESSION_STATE_UNKNOWN};
     bool running_{false};

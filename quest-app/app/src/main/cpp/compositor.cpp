@@ -9,6 +9,8 @@
 #include <android/log.h>
 #include <GLES2/gl2ext.h>
 
+#include <algorithm>
+
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "fuvr.comp", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "fuvr.comp", __VA_ARGS__)
 
@@ -34,6 +36,10 @@ void load_gl_extensions() {
 bool Compositor::init() {
     if (!create_egl_context()) return false;
     load_gl_extensions();
+    if (!blit_.init()) {
+        LOGE("EyeBlit init failed");
+        return false;
+    }
     return create_swapchains();
 }
 
@@ -63,10 +69,69 @@ bool Compositor::create_egl_context() {
 }
 
 bool Compositor::create_swapchains() {
-    // TODO: enumerate XrViewConfigurationView from session for each eye and
-    // create XrSwapchain with GL_SRGB8_ALPHA8 format. Enumerate images.
-    // The compositor owns these GL textures; per-frame we blit the decoded
-    // AHardwareBuffer-backed external texture into the eye's framebuffer.
+    XrSession session = xr_.session();
+    if (session == XR_NULL_HANDLE) return false;
+
+    const auto& vc = xr_.view_configs();
+    if (vc.size() < 2) {
+        LOGE("expected 2 view configs, got %zu", vc.size());
+        return false;
+    }
+
+    uint32_t fmt_count = 0;
+    xrEnumerateSwapchainFormats(session, 0, &fmt_count, nullptr);
+    std::vector<int64_t> formats(fmt_count);
+    xrEnumerateSwapchainFormats(session, fmt_count, &fmt_count, formats.data());
+
+    auto pick_format = [&]() -> int64_t {
+        for (int64_t want : {(int64_t)GL_SRGB8_ALPHA8, (int64_t)GL_RGBA8}) {
+            if (std::find(formats.begin(), formats.end(), want) != formats.end()) return want;
+        }
+        return formats.empty() ? (int64_t)GL_RGBA8 : formats.front();
+    };
+    const int64_t color_format = pick_format();
+
+    for (int eye = 0; eye < 2; ++eye) {
+        auto& e = eyes_[eye];
+        e.width  = (int32_t)vc[eye].recommendedImageRectWidth;
+        e.height = (int32_t)vc[eye].recommendedImageRectHeight;
+        e.format = color_format;
+
+        XrSwapchainCreateInfo sci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+        sci.format = color_format;
+        sci.sampleCount = 1;
+        sci.width = e.width;
+        sci.height = e.height;
+        sci.faceCount = 1;
+        sci.arraySize = 1;
+        sci.mipCount = 1;
+        if (xrCreateSwapchain(session, &sci, &e.handle) != XR_SUCCESS) {
+            LOGE("xrCreateSwapchain eye=%d failed", eye);
+            return false;
+        }
+
+        uint32_t img_count = 0;
+        xrEnumerateSwapchainImages(e.handle, 0, &img_count, nullptr);
+        e.images.assign(img_count, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
+        xrEnumerateSwapchainImages(e.handle, img_count, &img_count,
+            (XrSwapchainImageBaseHeader*)e.images.data());
+
+        e.framebuffers.assign(img_count, 0);
+        glGenFramebuffers((GLsizei)img_count, e.framebuffers.data());
+        for (uint32_t i = 0; i < img_count; ++i) {
+            glBindFramebuffer(GL_FRAMEBUFFER, e.framebuffers[i]);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, e.images[i].image, 0);
+            GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            if (st != GL_FRAMEBUFFER_COMPLETE) {
+                LOGE("eye %d FBO %u incomplete: 0x%x", eye, i, st);
+            }
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        LOGI("eye %d swapchain %dx%d images=%u format=0x%x",
+             eye, e.width, e.height, img_count, (uint32_t)color_format);
+    }
     return true;
 }
 
@@ -102,27 +167,59 @@ void Compositor::submit_frame(const DecodedFrame& frame) {
     has_frame_ = true;
 }
 
+bool Compositor::render_eye(int eye_index) {
+    auto& e = eyes_[eye_index];
+    if (e.handle == XR_NULL_HANDLE) return false;
+
+    uint32_t image_index = 0;
+    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (xrAcquireSwapchainImage(e.handle, &ai, &image_index) != XR_SUCCESS) return false;
+
+    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    if (xrWaitSwapchainImage(e.handle, &wi) != XR_SUCCESS) return false;
+
+    GLint prev_fbo = 0, prev_viewport[4] = {0};
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glGetIntegerv(GL_VIEWPORT, prev_viewport);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, e.framebuffers[image_index]);
+    glViewport(0, 0, e.width, e.height);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    blit_.blit(current_texture_, eye_index);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+    glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2], prev_viewport[3]);
+
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    return xrReleaseSwapchainImage(e.handle, &ri) == XR_SUCCESS;
+}
+
 bool Compositor::build_projection_layer(OpenXrSession& xr,
                                         XrCompositionLayerProjection& out,
                                         std::array<XrCompositionLayerProjectionView, 2>& views) {
-    if (!has_frame_) return false;
-    // TODO: acquire/wait/release each eye swapchain image, blit
-    // current_texture_ (left half / right half of side-by-side frame)
-    // into the eye framebuffer with a fullscreen-quad shader.
+    if (!has_frame_ || eyes_[0].handle == XR_NULL_HANDLE || eyes_[1].handle == XR_NULL_HANDLE)
+        return false;
+
+    if (!render_eye(0) || !render_eye(1)) return false;
+
     const auto& snap = xr.last_views();
     for (int i = 0; i < 2; ++i) {
         views[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
         views[i].pose = snap[i].pose;
         views[i].fov = snap[i].fov;
         views[i].subImage.swapchain = eyes_[i].handle;
+        views[i].subImage.imageRect.offset = {0, 0};
         views[i].subImage.imageRect.extent.width = eyes_[i].width;
         views[i].subImage.imageRect.extent.height = eyes_[i].height;
+        views[i].subImage.imageArrayIndex = 0;
     }
     out = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     out.space = xr.stage_space();
     out.viewCount = 2;
     out.views = views.data();
-    return eyes_[0].handle != XR_NULL_HANDLE && eyes_[1].handle != XR_NULL_HANDLE;
+    return true;
 }
 
 bool Compositor::build_placeholder_layer(OpenXrSession& xr, XrCompositionLayerQuad& out) {
@@ -138,6 +235,14 @@ bool Compositor::build_placeholder_layer(OpenXrSession& xr, XrCompositionLayerQu
 }
 
 void Compositor::shutdown() {
+    blit_.shutdown();
+    for (auto& e : eyes_) {
+        if (!e.framebuffers.empty()) {
+            glDeleteFramebuffers((GLsizei)e.framebuffers.size(), e.framebuffers.data());
+            e.framebuffers.clear();
+        }
+        if (e.handle) { xrDestroySwapchain(e.handle); e.handle = XR_NULL_HANDLE; }
+    }
     if (current_image_ != EGL_NO_IMAGE_KHR && eglDestroyImageKHR_)
         eglDestroyImageKHR_(egl_display_, current_image_);
     if (current_texture_) glDeleteTextures(1, &current_texture_);

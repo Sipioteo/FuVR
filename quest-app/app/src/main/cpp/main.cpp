@@ -10,6 +10,7 @@
 #include "decoder_pipeline.hpp"
 #include "pose_forwarder.hpp"
 #include "compositor.hpp"
+#include "protocol_router.hpp"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "fuvr", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "fuvr", __VA_ARGS__)
@@ -46,13 +47,17 @@ extern "C" void android_main(android_app* app) {
     }
 
     fuvr::TransportClient transport;
-    transport.start("127.0.0.1", 9943);
 
     fuvr::DecoderPipeline decoder;
     decoder.start(fuvr::DecoderPipeline::Codec::Hevc);
 
     fuvr::Compositor compositor(session);
     compositor.init();
+
+    fuvr::ProtocolRouter router(transport, decoder, session);
+    router.install();
+    transport.start("127.0.0.1", 9943);
+    router.send_hello_from_quest();
 
     fuvr::PoseForwarder pose_forwarder(session, transport);
     pose_forwarder.start();

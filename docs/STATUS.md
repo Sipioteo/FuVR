@@ -1,104 +1,117 @@
 # FuVR — Implementation status
 
-Snapshot as of 2026-04-27. Updated by the coordinator at the end of each
-multi-component scaffolding pass.
+Snapshot as of 2026-04-27, after coordinator pass 2. Updated at the end of
+each multi-component pass.
 
 ## Where we are on the SPEC roadmap
 
-We are at the very start of **M0 — Spike Plan** (SPEC §5). The repo now has a
-complete, buildable, tested skeleton across all components, with stubs marking
-the work that the M0 spikes will validate.
+End of pass 2: **late M0 / very early M1**. The skeleton is wired
+end-to-end on the host: top-level CMake builds every component, daemon and
+runtime are bound by Cap'n Proto RPC over a Unix domain socket, the Quest
+app speaks Cap'n Proto on every wire channel, and per-eye swapchains plus a
+side-by-side blit shader are in place. **Nothing has run on real hardware
+yet.**
 
-## Per-component state
+## Top-line verification
 
-### `proto/` — wire schema
+| Check | Result |
+|---|---|
+| `cmake -S . -B build` (top level) | clean configure |
+| `cmake --build build` | clean build, all targets |
+| `ctest --test-dir build` | **11/11 passed**, 1 disabled (vdisplay needs GUI) |
+| `cargo test --workspace` (transport) | **all suites passed** (FEC, UDP loopback) |
+| `swift test --package-path mac-app` | **10/10 passed** |
+| `bash scripts/check-licenses.sh` | clean (105 files) |
 
-- `fuvr.capnp` complete for v1: math types, upstream (HMD/controllers/inputs),
-  video fragments, audio packets, haptics, control messages.
-- Schema id frozen: `@0xb1f5d4f7c2a830e5`. CI guards it.
-- Code generation script: `scripts/gen-proto.sh`.
+## Per-component state (post pass 2)
 
-### `runtime-macos/` — OpenXR runtime
+### `proto/` — schemas
 
-- 16 files. Configures and builds clean.
-- Real: loader negotiation, dispatch table covering ~50 entries, instance/
-  session/swapchain/action lifecycle with handle registries, frame loop,
-  pose predictor (5 unit tests passing), `fuvr-register` CLI.
-- Stubs returning `XR_ERROR_FUNCTION_UNSUPPORTED`: reference/action spaces,
-  path-to-string, swapchain image enumeration, action pose state. Listed in
-  `runtime-macos/TODO.md`.
-- Vulkan platform define removed until MoltenVK lands; Metal vendor extension
-  reserved.
+- `fuvr.capnp` (the Mac↔Quest wire) — schema id `@0xb1f5d4f7c2a830e5`. Frozen.
+- `fuvrd.capnp` (the runtime↔daemon RPC) — schema id `@0xc8a4f30f6df21a7b`.
+  Frozen. Covers session lifecycle, frame submission with IOSurface handoff,
+  pose / metrics / log streaming, ping/pong.
+- Both schemas guarded by `proto-check.yml`.
+
+### `runtime-macos/` — OpenXR runtime + daemon client
+
+- Pass 1: lifecycle dispatch, pose predictor, registration CLI.
+- Pass 2: `DaemonClient` (UDS Cap'n Proto, lazy connect with backoff), pose
+  stream subscription feeding `PosePredictor`, IOSurface-backed swapchains
+  (3 images, BGRA8, Metal `MTLTexture` + companion `IOSurfaceRef`), the
+  `XR_FUVR_metal_enable` extension surface (`XrSwapchainImageMetalFUVR`),
+  `DaemonFrameSink` that mints a mach send-right and submits per-frame to
+  the daemon.
+- 7/7 tests passing.
 
 ### `encoder-macos/` — VideoToolbox wrapper
 
-- Builds clean; static library `libfuvr_encoder.a`.
-- Real: VTCompressionSession with HEVC + H.264 paths (low-latency mode for
-  H.264 per WWDC21), AVCC→Annex-B conversion, CSD extraction & emission,
-  forced IDR.
-- M0 spike tool: `fuvr-encode-synthetic` (4128×2208 @ 90 Hz HEVC).
-- Smoke test wired (GoogleTest via FetchContent).
-- Each frame currently emits as a single `endOfFrame` fragment; transport-side
-  fragmentation handles MTU.
+- Unchanged in pass 2. Still: HEVC + H.264 low-latency,
+  AVCC→Annex-B framing, CSD emission, IDR forcing, `fuvr-encode-synthetic`
+  M0 spike tool, smoke test passing.
 
 ### `transport/` — Rust workspace
 
-- 5 crates: `transport-core`, `transport-usb`, `transport-udp`, `transport-cli`,
-  `transport-ffi`.
-- Builds clean; tests pass: 10k random frames with 5% loss round-tripping
-  through Reed-Solomon FEC, plus in-process UDP loopback.
-- CLI: `fuvr-transport` with `loopback-bench`, `dump`, `clock-sync`. This is
-  the M0 spike tool for SPEC §5.M0 question 1 (ADB reverse throughput/latency).
-- C ABI exported via `cbindgen` to `transport-ffi/include/fuvr_transport.h`.
+- Unchanged in pass 2. 5 crates, FEC round-trip + UDP loopback tests
+  passing.
 
 ### `quest-app/` — Android NDK client
 
-- 24 files. Gradle project + NDK CMake.
-- Real: OpenXR loader bootstrap, action set (touch_plus_controller),
-  instance/session/spaces, frame loop with projection + quad-placeholder paths,
-  MediaCodec async skeleton (HEVC default, H.264 fallback), TCP transport
-  client matching Rust framing, 1 kHz pose forwarder, EGL/GLES3 + zero-copy
-  AHardwareBuffer → external texture upload.
-- Stubs in `quest-app/TODO.md`: Cap'n Proto wire serialisation, per-eye
-  swapchain enumeration, decoder Surface↔AImageReader plumbing, UDP transport
-  mode, action state read-back.
-- Not exercised by Gradle here (no Android SDK available in coordinator
-  sandbox); CI workflow `android.yml` will exercise on real runners.
+- Pass 1: skeleton OpenXR + MediaCodec + transport + pose forwarder.
+- Pass 2: Cap'n Proto C++ runtime as `ExternalProject_Add` (capnproto-c++
+  1.0.2) for arm64-v8a; real `UpstreamFrame` packed serialisation at 1 kHz;
+  `VideoFragmentHeader` parse + fragment reassembly indexed by
+  `frameId`/`fragmentIndex`; `ControlMessage` handling (helloFromMac,
+  clockSync, haptic); per-eye swapchain creation honoring
+  `recommendedImageRect{Width,Height}`; GLES3 side-by-side blit shader
+  splitting `4128×2208` into two `2064×2208` per-eye targets with full GL
+  state save/restore; host-side `test_fragment_reassembly` covering
+  in-order, out-of-order, duplicate, interleaved, and eviction cases.
+
+### `daemon/` (new in pass 2)
+
+- 16 files: UDS Cap'n Proto server, per-session encoder + transport-ffi
+  bridge, IOSurface→CVPixelBuffer mach-port lookup, pose router fanning
+  inbound `UpstreamFrame` messages out to subscribers, virtual-display
+  spawn, 10 Hz metrics ticker, JSON↔Cap'n Proto bridge for the mac-app
+  control plane.
+- Configure-time fallback when the Rust transport dylib isn't built:
+  `FUVR_DAEMON_NO_TRANSPORT` stubs the FFI calls so the daemon still
+  builds.
+- 5/5 tests passing (rolling-window metrics, RPC envelope round-trip, pose
+  router fan-out).
 
 ### `mac-app/` — SwiftUI control surface
 
-- Swift Package; `swift build` clean, `swift test` 10/10 passing.
-- Targets: executable `FuVR` + library `FuVRControl` + tests.
-- Views: Session, EncoderSettings, TransportSettings, Diagnostics, Log, About.
-- Control plane: line-delimited JSON over Unix domain socket (`Network.framework`).
-- `MockDaemon` allows standalone development.
-- Liquid Glass aesthetic via `regularMaterial`/`thinMaterial`; `glassEffect()`
-  guarded for macOS 26+.
+- Unchanged in pass 2. `FuVRControl` library + `FuVR` executable +
+  `MockDaemon`. 10/10 tests passing.
 
 ### `virtual-display-helper/` — phase-2 subprocess
 
-- Builds clean in isolation.
-- Real: argv parsing, descriptor + settings + applySettings, posix_spawn'd
-  control library with stdin pipe lifetime, M4/M5 6720-pixel-pipe-0 split,
-  reverse-engineered `CGVirtualDisplay` Obj-C interface declarations vendored
-  with per-symbol risk notes.
-- E2E test marked `DISABLED_` (requires logged-in GUI session).
+- Unchanged in pass 2. Builds clean; e2e test gated on a GUI session.
 
 ### CI / infra
 
-- 6 GitHub Actions workflows: macOS CMake matrix, Rust (Ubuntu),
-  Android, Swift, proto schema-id guard, license check.
-- All actions pinned to major version, all workflows have minimum permissions
-  and concurrency cancellation on non-default refs.
-- `.clang-format`, `.editorconfig`, `CODEOWNERS`, PR/issue templates.
+- 6 workflows from pass 1.
+- `proto-check.yml` extended in pass 2 to also pin the daemon schema id
+  `@0xc8a4f30f6df21a7b`.
+- Top-level `enable_testing()` added so `ctest --test-dir build` aggregates
+  every component's CTest registration.
 
 ## What works end-to-end today
 
-Nothing streams a frame yet. By component:
+In-process integration test:
 
-- The Rust transport workspace can be exercised with `cargo run -p transport-cli --bin fuvr-transport -- loopback-bench` to measure local throughput and FEC behaviour.
-- The mac-app can be run standalone with the mock daemon: `swift run --package-path mac-app FuVR`.
-- The runtime can be registered with `fuvr-register` and will be picked up by an OpenXR loader, but it does not yet expose any way for the encoder to receive its frames.
+1. Start `fuvrd` from `build/daemon/fuvrd`.
+2. Set `OPENXR_ACTIVE_RUNTIME` to the runtime dylib (or use the
+   `fuvr-register` CLI).
+3. Run any OpenXR-capable test app linked against `fuvr_openxr_runtime`.
+4. The runtime connects to the daemon, starts a session, hands off
+   IOSurface-backed swapchain images per frame.
+
+This works today **only when runtime and daemon share a mach task** (i.e.
+the in-process unit tests). True cross-process IOSurface handoff needs the
+mach-service side channel from ADR-0007, which is the first item of pass 3.
 
 ## Critical M0 spikes (SPEC §5.M0)
 
@@ -106,14 +119,31 @@ Nothing streams a frame yet. By component:
 |---|----------|------|-------|
 | 1 | ADB reverse over USB ≥100 Mbps with <15 ms RTT? | `transport-cli loopback-bench` | tool ready, hardware run pending |
 | 2 | VideoToolbox HEVC `RealTime=true` <15 ms encode on M2/M3? | `fuvr-encode-synthetic` | tool ready, hardware run pending |
-| 3 | Quest receive UDP + MediaCodec + projection layer @ 90 Hz? | `quest-app` debug build | needs Cap'n Proto + per-eye swapchain wiring |
+| 3 | Quest receive UDP + MediaCodec + projection layer @ 90 Hz? | `quest-app` debug build | transport + per-eye swapchains landed; needs decoder Surface↔AImageReader plumbing for visual output |
 | 4 | `CGVirtualDisplay` works on macOS 14/15/16? | `fuvr-vdisplay-helper --width ... --height ... --refresh ...` | tool ready, multi-version run pending |
 
-## Next coordinator pass
+## Next coordinator pass (pass 3)
 
-1. Daemon (`fuvrd/`) — owns the encoder + transport + (later) virtual display.
-2. Runtime ↔ daemon RPC over UDS (Cap'n Proto, separate schema).
-3. Wire the runtime's `FrameSink` to encoder → transport.
-4. Quest: serialize `UpstreamFrame` over Cap'n Proto on the pose channel;
-   parse `VideoFragmentHeader` on the video channel.
-5. Per-eye swapchain creation in the quest-app compositor.
+1. **ADR-0007 implementation**: mach service `com.fuvr.daemon.surface` on
+   the daemon side; `bootstrap_look_up` + per-frame `mach_msg_send` on the
+   runtime side. Symmetric work, must land together.
+2. **MediaCodec output → AHardwareBuffer plumbing on the Quest**, so the
+   blit shader sees real frames instead of `current_texture_=0`.
+3. **EncodeStats response path**: encoder → daemon → runtime, fed into a
+   metrics view in the mac-app.
+4. **Real clock sync**: implement the `ClockSync` ping/pong on both sides
+   so `StartSessionResponse.clockOffsetNs` is actually populated.
+5. **`xrPollEvent`** emitting `XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED` from
+   daemon connection state transitions.
+6. **`xrLocateSpace` + reference spaces**: currently stubbed; needed before
+   any real OpenXR app can run.
+
+## ADR index
+
+- 0001: record architecture decisions
+- 0002: OpenXR runtime in-process; daemon owns auxiliary work
+- 0003: Cap'n Proto for the wire, JSON for the local control plane
+- 0004: CGVirtualDisplay subprocess
+- 0005: Reed-Solomon FEC, no ARQ
+- 0006: ADB reverse over USB
+- 0007: IOSurface handoff via parallel mach service (NEW)

@@ -69,16 +69,33 @@ dependencies {
     implementation("org.khronos.openxr:openxr_loader_for_android:1.1.36")
 }
 
-// Cap'n Proto code generation. Runs `capnp compile` against ../proto/fuvr.capnp
-// and emits C++ sources into src/main/cpp/proto_gen.
+// Cap'n Proto code generation. Fails clearly if `capnp` isn't on PATH.
 val capnpProtoFile = rootProject.file("../proto/fuvr.capnp")
 val capnpOutDir = layout.projectDirectory.dir("src/main/cpp/proto_gen")
+
+fun resolveCapnpBinary(): String? {
+    val pathEntries = (System.getenv("PATH") ?: "").split(File.pathSeparator)
+    for (entry in pathEntries) {
+        val candidate = file("$entry/capnp")
+        if (candidate.exists() && candidate.canExecute()) return candidate.absolutePath
+    }
+    return null
+}
 
 val generateCapnp = tasks.register<Exec>("generateCapnp") {
     val outDir = capnpOutDir.asFile
     inputs.file(capnpProtoFile)
     outputs.dir(outDir)
-    doFirst { outDir.mkdirs() }
+    doFirst {
+        if (resolveCapnpBinary() == null) {
+            throw GradleException(
+                "`capnp` (Cap'n Proto compiler) was not found on PATH. " +
+                "Install it (e.g. `brew install capnp` on macOS, " +
+                "`apt-get install capnproto` on Debian/Ubuntu) and re-run."
+            )
+        }
+        outDir.mkdirs()
+    }
     workingDir = capnpProtoFile.parentFile
     commandLine = listOf(
         "capnp", "compile",
@@ -86,8 +103,35 @@ val generateCapnp = tasks.register<Exec>("generateCapnp") {
         "--src-prefix=${capnpProtoFile.parentFile.absolutePath}",
         capnpProtoFile.absolutePath
     )
-    isIgnoreExitValue = true
 }
 
+tasks.named("preBuild").configure { dependsOn(generateCapnp) }
 tasks.matching { it.name.startsWith("externalNativeBuild") || it.name.startsWith("configureCMake") }
     .configureEach { dependsOn(generateCapnp) }
+
+// Host-side native unit tests for fragment reassembly logic. Compiled with
+// the host toolchain (NOT the NDK), so they can run in CI without a device.
+val hostTestBuildDir = layout.buildDirectory.dir("host_tests")
+
+val configureHostTests = tasks.register<Exec>("configureHostTests") {
+    doFirst { hostTestBuildDir.get().asFile.mkdirs() }
+    workingDir = hostTestBuildDir.get().asFile
+    commandLine = listOf(
+        "cmake",
+        "-S", file("src/main/cpp/tests").absolutePath,
+        "-B", hostTestBuildDir.get().asFile.absolutePath,
+        "-DCMAKE_BUILD_TYPE=Debug"
+    )
+}
+
+val buildHostTests = tasks.register<Exec>("buildHostTests") {
+    dependsOn(configureHostTests)
+    workingDir = hostTestBuildDir.get().asFile
+    commandLine = listOf("cmake", "--build", hostTestBuildDir.get().asFile.absolutePath)
+}
+
+tasks.register<Exec>("hostTest") {
+    dependsOn(buildHostTests)
+    workingDir = hostTestBuildDir.get().asFile
+    commandLine = listOf("./test_fragment_reassembly")
+}

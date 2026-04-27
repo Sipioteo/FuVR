@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "eye_blit.hpp"
+
 namespace fuvr {
 
 class OpenXrSession;
@@ -23,6 +25,7 @@ struct EyeSwapchain {
     XrSwapchain handle{XR_NULL_HANDLE};
     int32_t width{0};
     int32_t height{0};
+    int64_t format{0};
     std::vector<XrSwapchainImageOpenGLESKHR> images;
     std::vector<GLuint> framebuffers;
 };
@@ -65,6 +68,8 @@ private:
     EGLImageKHR current_image_{EGL_NO_IMAGE_KHR};
     GLuint current_texture_{0};
     bool has_frame_{false};
+
+    EyeBlit blit_;
 };
 
 }

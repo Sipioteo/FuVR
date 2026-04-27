@@ -2,10 +2,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
+#include "fuvr/daemon_client.hpp"
+#include "fuvr/iosurface_swapchain.hpp"
 #include "fuvr/runtime.hpp"
+#include "fuvr/xr_fuvr_metal_enable.h"
 
 namespace fuvr::runtime {
 
@@ -24,7 +28,44 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
   auto session = std::make_unique<Session>();
   session->instance = inst;
   session->state = XR_SESSION_STATE_IDLE;
-  session->frameSink = makeDefaultFrameSink();
+
+  void* mtlDevice = nullptr;
+  for (const XrBaseInStructure* p =
+           static_cast<const XrBaseInStructure*>(info->next);
+       p != nullptr; p = p->next) {
+    if (p->type == XR_TYPE_GRAPHICS_BINDING_METAL_FUVR) {
+      const auto* b = reinterpret_cast<const XrGraphicsBindingMetalFUVR*>(p);
+      mtlDevice = b->mtlDevice;
+      break;
+    }
+  }
+  // Why: M0/M1 apps don't yet pass XR_FUVR_metal_enable; fall back to the
+  // system default device. M3 apps will provide their own.
+  if (mtlDevice == nullptr) {
+    mtlDevice = defaultMetalDevice();
+  }
+  session->metalDevice = mtlDevice;
+
+  auto daemon = std::make_shared<DaemonClient>();
+  session->daemon = daemon;
+  session->frameSink = makeDaemonFrameSink(daemon.get());
+
+  if (daemon->ensureConnected()) {
+    StartSessionParams params{};
+    params.perEyeWidth = 2064;
+    params.perEyeHeight = 2208;
+    params.refreshRateHz = 90;
+    StartSessionResult result{};
+    if (daemon->startSession(params, &result)) {
+      session->daemonSessionId = result.sessionId;
+      daemon->subscribePoses(result.sessionId);
+    }
+    Session* sessRaw = session.get();
+    daemon->setPoseCallback([sessRaw](const PoseSample& s) {
+      sessRaw->predictor.push(s);
+    });
+  }
+
   const uint64_t h = detail::nextHandleAlloc();
   session->handle = reinterpret_cast<XrSession>(h);
   Session* raw = session.get();
@@ -44,6 +85,13 @@ XrResult xrDestroySession_impl(XrSession sessionHandle) noexcept {
   Session* s = lookupSession(sessionHandle);
   if (s == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
+  }
+  if (s->daemon) {
+    s->daemon->shutdown();
+  }
+  if (s->metalDevice != nullptr) {
+    releaseMetalDevice(s->metalDevice);
+    s->metalDevice = nullptr;
   }
   {
     std::lock_guard<std::mutex> lk(detail::globalMutex());
@@ -124,6 +172,27 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
     SubmittedFrame f{};
     f.frameId = s->frameId.load(std::memory_order_relaxed);
     f.targetDisplayTimeNs = static_cast<uint64_t>(info->displayTime);
+    f.sessionId = s->daemonSessionId;
+    {
+      std::lock_guard<std::mutex> lk(s->mutex);
+      if (!s->swapchains.empty()) {
+        Swapchain* sc = s->swapchains.front().get();
+        if (!sc->images.empty()) {
+          const uint32_t idx = sc->lastReleasedIndex %
+                               static_cast<uint32_t>(sc->images.size());
+          f.ioSurface = sc->images[idx]->surface;
+          f.leftMetalTexture = sc->images[idx]->mtlTexture;
+          f.rightMetalTexture = sc->images[idx]->mtlTexture;
+          f.width = sc->width;
+          f.height = sc->height;
+        }
+      }
+    }
+    auto latest = s->predictor.latest();
+    if (latest.has_value()) {
+      f.renderedLeft = latest->leftEye;
+      f.renderedRight = latest->rightEye;
+    }
     s->frameSink->submit(f);
   }
   return XR_SUCCESS;

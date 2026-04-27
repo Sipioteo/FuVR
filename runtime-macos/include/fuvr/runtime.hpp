@@ -11,9 +11,12 @@
 #include <vector>
 
 #include "fuvr/frame_sink.hpp"
+#include "fuvr/iosurface_swapchain.hpp"
 #include "fuvr/pose_predictor.hpp"
 
 namespace fuvr::runtime {
+
+class DaemonClient;
 
 constexpr const char* kRuntimeName = "FuVR";
 constexpr uint32_t kRuntimeVersion = XR_MAKE_VERSION(0, 1, 0);
@@ -44,6 +47,8 @@ struct Swapchain {
   int64_t format{0};
   uint32_t arraySize{1};
   uint32_t acquiredIndex{0};
+  uint32_t lastReleasedIndex{0};
+  std::vector<std::unique_ptr<IOSurfaceImage>> images;
 };
 
 struct Session {
@@ -55,6 +60,9 @@ struct Session {
   std::vector<ActionSet*> attachedActionSets;
   std::unique_ptr<FrameSink> frameSink;
   PosePredictor predictor;
+  std::shared_ptr<DaemonClient> daemon;
+  uint64_t daemonSessionId{0};
+  void* metalDevice{nullptr};  // id<MTLDevice>, retained
   std::mutex mutex;
 };
 
