@@ -25,28 +25,41 @@ FuVR lets an Apple Silicon Mac render VR content and stream it to a Meta Quest h
 
 ## How it works
 
-```
-  Apple Silicon Mac
-  ┌─────────────────────────────────────────────────────────┐
-  │                                                         │
-  │   XR App  ──▶  OpenXR Runtime  ──▶  VideoToolbox       │
-  │  (Blender,     (custom dylib)        HEVC / H.264       │
-  │   Godot,            │                    │              │
-  │   Unity…)           │ pose + input        │ encoded frames│
-  │                     ▼                    ▼              │
-  │              fuvrd daemon  ◀────────────────────────    │
-  │              (Cap'n Proto RPC)                          │
-  │                     │                                   │
-  │              Rust transport  ──▶  USB-C / Wi-Fi 6       │
-  └─────────────────────────────────────────────────────────┘
-                              │
-  ┌─────────────────────────────────────────────────────────┐
-  │  Meta Quest                                             │
-  │                                                         │
-  │   Transport receiver  ──▶  MediaCodec  ──▶  OpenXR     │
-  │                                            compositor   │
-  │   Pose forwarder (1 kHz)  ──────────────────────────▶  │
-  └─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph MAC["🖥️  Apple Silicon Mac"]
+        direction LR
+        APP["XR App\n(Blender / Godot / Unity)"]
+        RT["OpenXR Runtime\ncustom dylib"]
+        ENC["VideoToolbox\nHEVC / H.264"]
+        DAEMON["fuvrd daemon\nCap'n Proto RPC"]
+        TRANSPORT["Rust transport"]
+
+        APP -- "xrEndFrame" --> RT
+        RT -- "encoded frames" --> ENC
+        ENC -- "Annex-B" --> DAEMON
+        RT -- "pose + input" --> DAEMON
+        DAEMON --> TRANSPORT
+    end
+
+    TRANSPORT -- "USB-C / Wi-Fi 6" --> RX
+
+    subgraph QUEST["🥽  Meta Quest"]
+        direction LR
+        RX["Transport receiver"]
+        DEC["MediaCodec\nHEVC decoder"]
+        COMP["OpenXR compositor\n+ ATW"]
+        POSE["Pose forwarder\n1 kHz"]
+
+        RX --> DEC
+        DEC --> COMP
+        RX --> POSE
+    end
+
+    POSE -- "head + controller pose" --> DAEMON
+
+    style MAC fill:#0d1117,stroke:#334155,color:#e2e8f0
+    style QUEST fill:#0d1117,stroke:#1e40af,color:#e2e8f0
 ```
 
 ---
