@@ -183,6 +183,10 @@ Issues, hardware test reports, and ADR proposals are all welcome — especially 
 
 ## Development notes
 
+> *Accurate representation of trying to make Apple and Meta work together.*
+>
+> ![Making Apple and Meta cooperate](docs/dev-collab.gif)
+
 This project was designed and built by [Sipioteo](https://github.com/Sipioteo). [Claude Opus 4.7](https://anthropic.com) was used as a development companion — sounding board, code reviewer, and implementation aid — throughout the process. All architectural decisions, technical direction, and intellectual authorship are the author's own.
 
 ---
