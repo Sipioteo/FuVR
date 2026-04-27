@@ -84,8 +84,18 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
     StartSessionParams params{};
     DeviceCapabilities caps{};
     if (daemon->getDeviceCapabilities(&caps) && caps.valid) {
-      params.perEyeWidth = caps.perEyeWidth != 0 ? caps.perEyeWidth : 2064;
-      params.perEyeHeight = caps.perEyeHeight != 0 ? caps.perEyeHeight : 2208;
+      // Why: the Quest decoder is currently created at fixed 4128x2208
+      // (decoder_pipeline.hpp default) and never reconfigured — the daemon
+      // doesn't send helloFromMac with the negotiated session config. Until
+      // we wire that handshake, pin encoder dims to perEye=2064x2208 so the
+      // SBS output stays 4128x2208 and matches the Quest decoder. The Quest
+      // GL compositor scales into its actual swapchain (1680x1760 on Quest 3)
+      // via eye_blit, so the visible image is correct either way.
+      // TODO: send helloFromMac post-startSession so we can use caps.perEye*.
+      params.perEyeWidth = 2064;
+      params.perEyeHeight = 2208;
+      (void)caps.perEyeWidth;
+      (void)caps.perEyeHeight;
       // Pick the highest advertised rate <= 120; Quest 3 reports 120 but PCVR
       // streaming over TCP rarely hits 120 stable, so cap at 90 by default.
       // Override via FUVR_RT_REFRESH_HZ if you want to force a specific rate.
@@ -125,30 +135,32 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
       daemon->subscribeInputs(result.sessionId);
       daemon->subscribeEncodeStats();
     }
-    // Pose lookahead: render budget (encode 25 + decode 15 + scanout 5 = 45ms)
-    // + measured one-way network delay from daemon's clock-sync handshake.
-    // If oneWayDelay is unknown (no Quest peer yet), fall back to the env var
-    // FUVR_RT_POSE_LOOKAHEAD_MS, else 70ms. This is a one-shot offset, not an
-    // integrator, so it cannot drift.
+    // Pose lookahead: how far into the future Blender renders. With Quest-side
+    // ATW correctly handling Δq from xrLocateViews(now)·q_render⁻¹ using
+    // IMU-Kalman ω, we want the *minimum* lookahead that keeps ATW's warp
+    // small enough to stay inside the rendered FOV during typical motion.
+    // Larger lookahead = smaller ATW warp BUT bigger noise amplification
+    // (ω·Δt amplifies sub-degree IMU jitter linearly with Δt).
+    //
+    // ALVR/Air Link target ~30 ms here. We override via FUVR_RT_POSE_LOOKAHEAD_MS
+    // for tuning. Earlier 70 ms produced visible tremor on micro head motion.
     {
-      constexpr uint64_t kRenderBudgetNs = 45'000'000ull;
       uint64_t lookahead = 0;
-      if (result.oneWayDelayNs != 0) {
-        lookahead = kRenderBudgetNs + result.oneWayDelayNs;
-      } else if (const char* env = std::getenv("FUVR_RT_POSE_LOOKAHEAD_MS")) {
+      if (const char* env = std::getenv("FUVR_RT_POSE_LOOKAHEAD_MS")) {
         lookahead = static_cast<uint64_t>(std::strtoull(env, nullptr, 10)) *
                     1'000'000ull;
       } else {
-        lookahead = 70'000'000ull;
+        // Phase C measurement (Δq peak 69° at aggressive motion, lookahead=0):
+        // pipeline Mac→Quest ≈ 50ms. ATW must correct that motion. With
+        // lookahead = pipeline_estimate (50ms), Mac predicts forward by ~the
+        // pipeline and at display q_render ≈ q_now → ATW Δq small. ALVR uses
+        // 30-50ms range. Override via FUVR_RT_POSE_LOOKAHEAD_MS.
+        lookahead = 50'000'000ull;
       }
       session->poseLookaheadNs = lookahead;
       if (std::getenv("FUVR_RT_DEBUG"))
-        std::fprintf(stderr,
-                     "[fuvr-rt] pose lookahead = %llu ms (oneWayDelay=%llu ns, "
-                     "renderBudget=%llu ns)\n",
-                     (unsigned long long)(lookahead / 1'000'000ull),
-                     (unsigned long long)result.oneWayDelayNs,
-                     (unsigned long long)kRenderBudgetNs);
+        std::fprintf(stderr, "[fuvr-rt] pose lookahead = %llu ms\n",
+                     (unsigned long long)(lookahead / 1'000'000ull));
     }
     Session* sessRaw = session.get();
     sessRaw->daemonAlive.store(true);
@@ -442,6 +454,11 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
       f.renderedLeft = rendered->leftEye;
       f.renderedRight = rendered->rightEye;
     }
+    // Carry the same (overscan-applied) FOV that xrLocateViews returned, so
+    // the Quest ATW shader gets fov_render right and doesn't fall back to
+    // fov_now (which is narrower than what Blender actually rendered).
+    f.renderedLeftFov  = s->lastRenderedLeftFov;
+    f.renderedRightFov = s->lastRenderedRightFov;
     s->frameSink->submit(f);
   }
   return XR_SUCCESS;
@@ -470,6 +487,40 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
                             XR_VIEW_STATE_POSITION_TRACKED_BIT;
   }
   auto predicted = s->predictor.predict(static_cast<uint64_t>(info->displayTime));
+  // [LATENCY-DEBUG] At 1Hz, log how far ahead xrLocateViews is asking the
+  // predictor to extrapolate (dt_ms), whether the predictor's 60ms cap
+  // (pose_predictor.cpp:223) is firing, and how stale the latest sample is
+  // at the call site. Gated on FUVR_RT_DEBUG (cached once).
+  {
+    static const bool kLatencyDebug = std::getenv("FUVR_RT_DEBUG") != nullptr;
+    if (kLatencyDebug) {
+      static std::atomic<uint64_t> lastLogNs{0};
+      uint64_t nowL = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count());
+      uint64_t prev = lastLogNs.load(std::memory_order_relaxed);
+      if (nowL - prev >= 1'000'000'000ull &&
+          lastLogNs.compare_exchange_strong(prev, nowL)) {
+        auto latest = s->predictor.latest();
+        long long dtMs = 0;
+        long long ageMs = 0;
+        int capFired = 0;
+        if (latest.has_value()) {
+          dtMs = static_cast<long long>(
+              (static_cast<int64_t>(info->displayTime) -
+               static_cast<int64_t>(latest->timestampNs)) / 1'000'000);
+          ageMs = static_cast<long long>(
+              (static_cast<int64_t>(nowL) -
+               static_cast<int64_t>(latest->timestampNs)) / 1'000'000);
+          capFired = (dtMs > 60) ? 1 : 0;
+        }
+        std::fprintf(stderr,
+                     "[fuvr-rt] [LATENCY-DEBUG] predict: dt_ms=%lld "
+                     "cap_fired=%d sample_age_ms=%lld\n",
+                     dtMs, capFired, ageMs);
+      }
+    }
+  }
   // Why: the Quest reports its actual per-eye fov in every UpstreamFrame and
   // the daemon now forwards it through PoseSnapshot. Use the headset's real
   // fov so Blender renders with the same projection the headset is built
@@ -495,10 +546,47 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
     out.angleDown = -kVert;
     return out;
   };
+  // Why: Blender renders only what we report through xrLocateViews fov, but
+  // the Quest's ATW must reproject during head motion that happens between
+  // render-time and display-time. If render fov == headset fov, fast turns
+  // make ATW sample outside the rendered region → black wedge ("see the
+  // screen edge"). Overscan: enlarge each angle by ~25% so the rendered
+  // texture has slack on every side. The wider fov gets stamped into the
+  // wire VideoFragmentHeader so the Quest shader knows the real fov_render
+  // and produces a correct, slack-having warp. Tunable via env var.
+  // Overscan disabled by default (1.0) until validated. With the wire-fov
+  // plumbing now active, the Quest's ATW shader uses fov_render correctly,
+  // so the right approach is moderate overscan (1.05-1.10). Aggressive values
+  // (1.25+) blow tan(angleLeft) past sane limits and Blender's projection
+  // becomes degenerate. Tunable via FUVR_RT_FOV_OVERSCAN env var.
+  static const float kOverscan = []() {
+    if (const char* env = std::getenv("FUVR_RT_FOV_OVERSCAN")) {
+      float v = static_cast<float>(std::strtof(env, nullptr));
+      if (v >= 1.0f && v <= 1.5f) return v;
+    }
+    // Phase C iteration 2: with lookahead=50ms Δq peaks dropped from 69° to
+    // ~5-6°, but a persistent ~5° offset during stillness still drove the
+    // rendered viewport's edge into the user's view. 1.30× overscan gives
+    // ATW ~19° headroom on each side — covers any residual pipeline mismatch
+    // plus aggressive head motion (200°/s × 50ms = 10°) without ever showing
+    // the wedge. Marginal Blender rendering cost (30% more pixels per eye)
+    // is acceptable on M3 Pro at 90 Hz.
+    return 1.30f;
+  }();
   for (uint32_t i = 0; i < 2; ++i) {
     views[i].type = XR_TYPE_VIEW;
     views[i].next = nullptr;
-    views[i].fov = pickFov(static_cast<int>(i));
+    XrFovf fov = pickFov(static_cast<int>(i));
+    fov.angleLeft  *= kOverscan;
+    fov.angleRight *= kOverscan;
+    fov.angleUp    *= kOverscan;
+    fov.angleDown  *= kOverscan;
+    views[i].fov = fov;
+    Fov& cache = (i == 0) ? s->lastRenderedLeftFov : s->lastRenderedRightFov;
+    cache.angleLeft  = fov.angleLeft;
+    cache.angleRight = fov.angleRight;
+    cache.angleUp    = fov.angleUp;
+    cache.angleDown  = fov.angleDown;
     if (predicted.has_value()) {
       const Pose& p = (i == 0) ? predicted->leftEye : predicted->rightEye;
       views[i].pose.position = {p.position.x, p.position.y, p.position.z};

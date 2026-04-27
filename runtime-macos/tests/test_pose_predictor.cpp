@@ -150,6 +150,95 @@ TEST(PosePredictor, NoImuVelocityFallsBackToFiniteDifferenceLinear) {
   EXPECT_FLOAT_EQ(out->leftEye.orientation.w, 1.0f);
 }
 
+TEST(PosePredictor, SteadyStateOmegaExtrapolatesCorrectly) {
+  // Push 10 samples 11 ms apart, all reporting ω = (0, π/2, 0) rad/s
+  // (90°/s yaw) and zero linear velocity. After the last sample, ask for
+  // a prediction 30 ms in the future. The predictor's exp(½·ω·Δt) ·
+  // q_base produces a quaternion whose .y component is sin(½·π/2·0.030)
+  // = sin(0.04712). Compare against that closed form.
+  PosePredictor p;
+  uint64_t t = 0;
+  for (int i = 0; i < 10; ++i) {
+    PoseSample s{};
+    s.timestampNs = t;
+    // Nudge position by 1 µm each step so the dedup in push() doesn't
+    // collapse the history to a single entry. We are *not* testing linear
+    // extrapolation here; linVel stays {0,0,0}.
+    s.leftEye.position = Vec3{static_cast<float>(i) * 1e-6f, 0.0f, 0.0f};
+    s.rightEye.position = Vec3{0.06f + static_cast<float>(i) * 1e-6f, 0.0f, 0.0f};
+    s.leftEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+    s.rightEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+    s.linearVelocity = Vec3{0.0f, 0.0f, 0.0f};
+    s.angularVelocity = Vec3{0.0f, static_cast<float>(M_PI_2), 0.0f};
+    p.push(s);
+    t += 11'000'000ull;
+  }
+  const uint64_t last_t = t - 11'000'000ull;
+  auto out = p.predict(last_t + 30'000'000ull);
+  ASSERT_TRUE(out.has_value());
+  const float expectedHalf = 0.5f * static_cast<float>(M_PI_2) * 0.030f;
+  EXPECT_NEAR(out->leftEye.orientation.y, std::sin(expectedHalf), 1e-3f);
+  EXPECT_NEAR(out->leftEye.orientation.w, std::cos(expectedHalf), 1e-3f);
+  EXPECT_NEAR(out->leftEye.orientation.x, 0.0f, 1e-4f);
+  EXPECT_NEAR(out->leftEye.orientation.z, 0.0f, 1e-4f);
+  // Axis-angle magnitude check: angle = 2·acos(w) = π/2·0.030 = 0.04712 rad.
+  const float angle = 2.0f * std::acos(out->leftEye.orientation.w);
+  EXPECT_NEAR(angle,
+              static_cast<float>(M_PI_2) * 0.030f, 1e-3f);
+}
+
+TEST(PosePredictor, StalePredictorCapsExtrapolation) {
+  // Single sample with ω=π/2 rad/s. Ask for a prediction 2.011 s in the
+  // future. The 60 ms cap (kMaxPredictSec inside predict()) must clamp the
+  // effective Δt — final rotation magnitude should be π/2·0.060 = 0.09425
+  // rad, NOT 2 s of rotation (which would be ~π rad and effectively flip
+  // the quaternion the wrong way around the great circle).
+  PosePredictor p;
+  PoseSample s{};
+  s.timestampNs = 0;
+  s.leftEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+  s.rightEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+  s.angularVelocity = Vec3{0.0f, static_cast<float>(M_PI_2), 0.0f};
+  p.push(s);
+  auto out = p.predict(2'011'000'000ull);
+  ASSERT_TRUE(out.has_value());
+  const float expectedAngle =
+      static_cast<float>(M_PI_2) * 0.060f;  // 60 ms cap
+  // angle = 2·acos(w) for a unit quat representing rotation by `angle`.
+  const float angle = 2.0f * std::acos(out->leftEye.orientation.w);
+  EXPECT_NEAR(angle, expectedAngle, 1e-3f);
+  // And bounded: must NOT have rotated by ~π (which is what 2 s of π/2 rad/s
+  // would produce). Use a wide guard band to be unambiguous about the cap.
+  EXPECT_LT(angle, 0.5f);
+}
+
+TEST(PosePredictor, DedupSkipsBitIdenticalPushes) {
+  // The predictor's push() drops bit-identical eye-pose samples to keep the
+  // 4-sample lookback at a stable ~44 ms window. Three identical pushes
+  // should land as one entry; a fourth push with a slightly different
+  // orientation should land normally → final size_ == 2.
+  PosePredictor p;
+  PoseSample s{};
+  s.timestampNs = 0;
+  s.leftEye.position = Vec3{0.1f, 0.2f, 0.3f};
+  s.rightEye.position = Vec3{0.16f, 0.2f, 0.3f};
+  s.leftEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+  s.rightEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+  for (int i = 0; i < 3; ++i) {
+    s.timestampNs = static_cast<uint64_t>(i) * 1'000'000ull;
+    p.push(s);
+  }
+  EXPECT_EQ(p.size(), 1u);
+  // Now perturb the orientation a hair. Must NOT be the antipodal of the
+  // previous quat (the sign-fix path would canonicalize that to bit-equal
+  // and the dedup would still drop it). A small +y rotation works.
+  s.timestampNs = 4'000'000ull;
+  s.leftEye.orientation = Quat{0.0f, 0.001f, 0.0f, 0.9999995f};
+  s.rightEye.orientation = Quat{0.0f, 0.001f, 0.0f, 0.9999995f};
+  p.push(s);
+  EXPECT_EQ(p.size(), 2u);
+}
+
 TEST(PosePredictor, OrientationStaysNormalized) {
   PosePredictor p;
   for (int i = 0; i < 5; ++i) {

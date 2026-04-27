@@ -54,6 +54,18 @@ void InputRouter::removeSubscriber(uint64_t streamId) {
     subs_.erase(streamId);
 }
 
+void InputRouter::removeSubscribersForSessions(const std::vector<uint64_t>& sessionIds) {
+    std::lock_guard lk(mu_);
+    for (auto it = subs_.begin(); it != subs_.end(); ) {
+        bool match = false;
+        for (uint64_t sid : sessionIds) {
+            if (it->second.sessionId == sid) { match = true; break; }
+        }
+        if (match) it = subs_.erase(it);
+        else ++it;
+    }
+}
+
 bool InputRouter::ingestPackedUpstreamFrame(const uint8_t* data, std::size_t len,
                                             uint64_t sessionId, uint64_t receivedAtNs) {
     kj::ArrayInputStream is(kj::arrayPtr(data, len));

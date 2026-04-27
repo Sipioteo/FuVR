@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "fuvr/pose_router.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+
 #include <capnp/message.h>
 #include <capnp/serialize-packed.h>
 #include <capnp/serialize.h>
@@ -8,9 +12,24 @@
 #include <kj/io.h>
 
 #include "fuvr.capnp.h"
+#include "fuvr/logger.hpp"
 #include "fuvrd.capnp.h"
 
 namespace fuvr::daemon {
+
+namespace {
+// Read FUVR_RT_DEBUG once at startup; gate all [LATENCY-DEBUG] logs on it so
+// release builds pay nothing.
+bool latencyDebugEnabled() noexcept {
+    static const bool on = std::getenv("FUVR_RT_DEBUG") != nullptr;
+    return on;
+}
+inline uint64_t monoNs() noexcept {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+}  // namespace
 
 uint64_t PoseRouter::addSubscriber(uint64_t sessionId, PoseSubscriber cb) {
     std::lock_guard lk(mu_);
@@ -22,6 +41,18 @@ uint64_t PoseRouter::addSubscriber(uint64_t sessionId, PoseSubscriber cb) {
 void PoseRouter::removeSubscriber(uint64_t streamId) {
     std::lock_guard lk(mu_);
     subs_.erase(streamId);
+}
+
+void PoseRouter::removeSubscribersForSessions(const std::vector<uint64_t>& sessionIds) {
+    std::lock_guard lk(mu_);
+    for (auto it = subs_.begin(); it != subs_.end(); ) {
+        bool match = false;
+        for (uint64_t sid : sessionIds) {
+            if (it->second.sessionId == sid) { match = true; break; }
+        }
+        if (match) it = subs_.erase(it);
+        else ++it;
+    }
 }
 
 static void fillSnapshot(::fuvr::daemon::PoseSnapshot::Builder& snap,
@@ -96,6 +127,7 @@ void PoseRouter::dispatchSnapshot(uint64_t sessionId,
                                   const ControllerSampleIn& rightCtrl,
                                   const FovIn& leftFov,
                                   const FovIn& rightFov) {
+    const uint64_t tStartNs = latencyDebugEnabled() ? monoNs() : 0ull;
     std::vector<std::pair<uint64_t, PoseSubscriber>> targets;
     {
         std::lock_guard lk(mu_);
@@ -119,6 +151,27 @@ void PoseRouter::dispatchSnapshot(uint64_t sessionId,
         kj::Array<::capnp::word> flat = ::capnp::messageToFlatArray(out);
         auto bytes = flat.asBytes();
         cb(bytes.begin(), bytes.size());
+    }
+
+    if (latencyDebugEnabled()) {
+        // Increment a per-second dispatch counter; only snapshot it when the
+        // 1Hz throttle fires. Both atomics are file-static so they hold across
+        // calls without allocation.
+        static std::atomic<uint32_t> dispatchCalls{0};
+        static std::atomic<uint64_t> lastLogNs{0};
+        dispatchCalls.fetch_add(1, std::memory_order_relaxed);
+        uint64_t nowL = monoNs();
+        uint64_t prev = lastLogNs.load(std::memory_order_relaxed);
+        if (nowL - prev >= 1'000'000'000ull &&
+            lastLogNs.compare_exchange_strong(prev, nowL)) {
+            uint32_t cps = dispatchCalls.exchange(0, std::memory_order_relaxed);
+            uint64_t durUs = (nowL - tStartNs) / 1000ull;
+            FUVR_LOG_INFO("daemon",
+                          "[LATENCY-DEBUG] poseRouter: subs=%zu duration_us=%llu "
+                          "calls/s=%u",
+                          targets.size(), (unsigned long long)durUs,
+                          (unsigned)cps);
+        }
     }
 }
 

@@ -82,6 +82,23 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         no_player: bool,
     },
+    /// Pretend to be a Quest and measure pose round-trip latency.
+    /// Connects to the daemon (TCP 127.0.0.1:PORT), sends synthetic pose
+    /// frames at `--rate-hz` with a deterministic yaw rotation, and watches
+    /// the Video channel for `VideoFragmentHeader` messages whose
+    /// `renderedLeft.pose.position.x` carries the seq number we baked in.
+    /// Each second prints P50 / P95 / max round-trip latency along with
+    /// pose-frames sent vs video-frames received.
+    FakeQuestPoseEcho {
+        #[arg(long, default_value_t = 9943)]
+        port: u16,
+        /// Pose send rate in Hz.
+        #[arg(long, default_value_t = 1000)]
+        rate_hz: u32,
+        /// Yaw rate (rad/s) used to drive the deterministic head rotation.
+        #[arg(long, default_value_t = std::f32::consts::FRAC_PI_2)]
+        rotation_rad_s: f32,
+    },
     /// Listen on TCP 9943 and stream a pre-encoded HEVC Annex-B file to
     /// the connected Quest as a debug test pattern. Loops the file forever.
     FeedQuest {
@@ -128,6 +145,9 @@ async fn main() -> Result<()> {
         }
         Cmd::FakeQuest { port, per_eye_width, per_eye_height, fps, out, no_player } => {
             fake_quest(port, per_eye_width, per_eye_height, fps, out, no_player).await
+        }
+        Cmd::FakeQuestPoseEcho { port, rate_hz, rotation_rad_s } => {
+            fake_quest_pose_echo(port, rate_hz, rotation_rad_s).await
         }
     }
 }
@@ -445,6 +465,343 @@ async fn fake_quest(
         drop(player_stdin);
         let _ = child.wait();
     }
+    Ok(())
+}
+
+async fn fake_quest_pose_echo(
+    port: u16,
+    rate_hz: u32,
+    rotation_rad_s: f32,
+) -> Result<()> {
+    use ::capnp::message::{Builder, HeapAllocator, ReaderOptions};
+    use ::capnp::serialize_packed;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::sync::Mutex;
+    use transport_core::proto as wire;
+
+    if rate_hz == 0 {
+        anyhow::bail!("--rate-hz must be > 0");
+    }
+
+    let sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("connecting to 127.0.0.1:{port}"))?;
+    println!("fake-quest-pose-echo: connected to 127.0.0.1:{port}");
+
+    let (mut rd, wr) = sock.into_split();
+    let wr = Arc::new(Mutex::new(wr));
+
+    // helloFromQuest — Quest 3 reasonable defaults.
+    let per_eye_width: u32 = 2064;
+    let per_eye_height: u32 = 2208;
+    let refresh_rates: [u32; 3] = [72, 90, 120];
+    let mut hello = Builder::<HeapAllocator>::new_default();
+    {
+        let mut ctrl = hello.init_root::<wire::control_message::Builder>();
+        let mut caps = ctrl.reborrow().init_hello_from_quest();
+        caps.set_device_model("Fake Quest 3 (pose-echo)");
+        caps.set_system_version("fake");
+        caps.set_per_eye_width(per_eye_width);
+        caps.set_per_eye_height(per_eye_height);
+        {
+            let mut rates = caps.reborrow().init_refresh_rates_hz(refresh_rates.len() as u32);
+            for (i, r) in refresh_rates.iter().enumerate() {
+                rates.set(i as u32, *r);
+            }
+        }
+        {
+            let mut codecs = caps.reborrow().init_supported_codecs(2);
+            codecs.set(0, wire::VideoCodec::Hevc);
+            codecs.set(1, wire::VideoCodec::H264);
+        }
+        caps.set_has_hand_tracking(false);
+        caps.set_has_eye_tracking(false);
+    }
+    let mut hello_bytes = Vec::new();
+    serialize_packed::write_message(&mut hello_bytes, &hello)?;
+    let hello_frame = transport_core::wire::encode_usb_frame(
+        transport_core::channel::Channel::Control as u8,
+        &hello_bytes,
+    );
+    {
+        let mut w = wr.lock().await;
+        w.write_all(&hello_frame).await?;
+    }
+    println!(
+        "fake-quest-pose-echo: sent helloFromQuest ({}x{} @ {:?}Hz)",
+        per_eye_width, per_eye_height, refresh_rates
+    );
+
+    // Send-history ring buffer keyed by seq -> send_time_ns.
+    // Capped at 4096 entries (~4s at 1 kHz), oldest dropped first.
+    type History = VecDeque<(u32, u64)>;
+    let history: Arc<Mutex<History>> = Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
+
+    // Stats shared between video-rx + stats-printer tasks.
+    struct Stats {
+        sent: u64,
+        recv: u64,
+        rtts_ns: Vec<u64>,
+    }
+    let stats: Arc<Mutex<Stats>> = Arc::new(Mutex::new(Stats {
+        sent: 0,
+        recv: 0,
+        rtts_ns: Vec::with_capacity(2048),
+    }));
+
+    // Pose sender: ticks at rate_hz, increments seq, encodes seq as f32 in
+    // position.x (seq directly cast to f32 — exact for seq < 2^24, then
+    // gracefully degrades; we recover by rounding on the receiver side).
+    let sender_history = history.clone();
+    let sender_stats = stats.clone();
+    let sender_wr = wr.clone();
+    let sender_task = tokio::spawn(async move {
+        let period = Duration::from_nanos(1_000_000_000u64 / rate_hz as u64);
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut seq: u32 = 0;
+        let dt = 1.0_f32 / rate_hz as f32;
+        loop {
+            tick.tick().await;
+            seq = seq.wrapping_add(1);
+            let angle = (seq as f32) * dt * rotation_rad_s;
+            let half = angle * 0.5;
+            let qy = half.sin();
+            let qw = half.cos();
+
+            let mut fb = Builder::<HeapAllocator>::new_default();
+            {
+                let mut up = fb.init_root::<wire::upstream_frame::Builder>();
+                up.set_correlation_frame_id(seq as u64);
+                let mut hmd = up.reborrow().init_hmd();
+                hmd.set_timestamp_ns(now_ns());
+                hmd.set_predicted_display_time_ns(now_ns());
+
+                // Helper: fill a ViewState with our deterministic pose.
+                {
+                    let mut lv = hmd.reborrow().init_left_view();
+                    {
+                        let mut pose = lv.reborrow().init_pose();
+                        {
+                            let mut p = pose.reborrow().init_position();
+                            // Encode seq directly as f32 — exact through 2^24,
+                            // and we're using u32 anyway. Receiver rounds.
+                            p.set_x(seq as f32);
+                            p.set_y(0.0);
+                            p.set_z(0.0);
+                        }
+                        {
+                            let mut q = pose.reborrow().init_orientation();
+                            q.set_x(0.0);
+                            q.set_y(qy);
+                            q.set_z(0.0);
+                            q.set_w(qw);
+                        }
+                    }
+                    let mut fov = lv.reborrow().init_fov();
+                    fov.set_angle_left(-0.9);
+                    fov.set_angle_right(0.9);
+                    fov.set_angle_up(0.9);
+                    fov.set_angle_down(-0.9);
+                }
+                {
+                    let mut rv = hmd.reborrow().init_right_view();
+                    {
+                        let mut pose = rv.reborrow().init_pose();
+                        {
+                            let mut p = pose.reborrow().init_position();
+                            p.set_x(seq as f32);
+                            p.set_y(0.0);
+                            p.set_z(0.0);
+                        }
+                        {
+                            let mut q = pose.reborrow().init_orientation();
+                            q.set_x(0.0);
+                            q.set_y(qy);
+                            q.set_z(0.0);
+                            q.set_w(qw);
+                        }
+                    }
+                    let mut fov = rv.reborrow().init_fov();
+                    fov.set_angle_left(-0.9);
+                    fov.set_angle_right(0.9);
+                    fov.set_angle_up(0.9);
+                    fov.set_angle_down(-0.9);
+                }
+
+                {
+                    let mut lin = hmd.reborrow().init_linear_velocity();
+                    lin.set_x(0.0);
+                    lin.set_y(0.0);
+                    lin.set_z(0.0);
+                }
+                {
+                    let mut ang = hmd.reborrow().init_angular_velocity();
+                    ang.set_x(0.0);
+                    ang.set_y(rotation_rad_s);
+                    ang.set_z(0.0);
+                }
+
+                // Empty controllers/inputs lists.
+                up.reborrow().init_controllers(0);
+                up.reborrow().init_inputs(0);
+            }
+
+            let mut buf = Vec::new();
+            if serialize_packed::write_message(&mut buf, &fb).is_err() {
+                continue;
+            }
+            let frame = transport_core::wire::encode_usb_frame(
+                transport_core::channel::Channel::Pose as u8,
+                &buf,
+            );
+
+            let send_ns = now_ns();
+            {
+                let mut w = sender_wr.lock().await;
+                if w.write_all(&frame).await.is_err() {
+                    eprintln!("fake-quest-pose-echo: pose write failed; sender exiting");
+                    break;
+                }
+            }
+
+            {
+                let mut h = sender_history.lock().await;
+                if h.len() >= 4096 {
+                    h.pop_front();
+                }
+                h.push_back((seq, send_ns));
+            }
+            {
+                let mut s = sender_stats.lock().await;
+                s.sent += 1;
+            }
+        }
+    });
+
+    // Video receiver: parse VideoFragmentHeader, recover seq from
+    // renderedLeft.pose.position.x, look up send time, record round-trip.
+    let rx_history = history.clone();
+    let rx_stats = stats.clone();
+    let rx_task = tokio::spawn(async move {
+        let mut hdr = [0u8; 4];
+        loop {
+            if rd.read_exact(&mut hdr).await.is_err() {
+                eprintln!("fake-quest-pose-echo: peer closed (rx)");
+                break;
+            }
+            let total_len = u32::from_be_bytes(hdr) as usize;
+            if total_len == 0 || total_len > 64 * 1024 * 1024 {
+                eprintln!("fake-quest-pose-echo: unreasonable frame length {total_len}");
+                break;
+            }
+            let mut buf = vec![0u8; total_len];
+            if rd.read_exact(&mut buf).await.is_err() {
+                eprintln!("fake-quest-pose-echo: short read");
+                break;
+            }
+            let channel = buf[0];
+            let payload = &buf[1..];
+
+            match transport_core::channel::Channel::try_from(channel) {
+                Ok(transport_core::channel::Channel::Video) => {
+                    let mut cursor = std::io::Cursor::new(payload);
+                    let reader = match serialize_packed::read_message(
+                        &mut cursor,
+                        ReaderOptions::new(),
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let h: wire::video_fragment_header::Reader = match reader.get_root() {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    // Only count once per video frame: first fragment.
+                    if h.get_fragment_index() != 0 {
+                        continue;
+                    }
+                    let recv_ns = now_ns();
+                    let pos_x = match h.get_rendered_left().and_then(|v| v.get_pose()).and_then(|p| p.get_position()) {
+                        Ok(p) => p.get_x(),
+                        Err(_) => continue,
+                    };
+                    if !pos_x.is_finite() || pos_x < 0.0 {
+                        continue;
+                    }
+                    let seq = pos_x.round() as u32;
+
+                    let send_ns_opt = {
+                        let h = rx_history.lock().await;
+                        h.iter().find(|(s, _)| *s == seq).map(|(_, t)| *t)
+                    };
+                    let mut s = rx_stats.lock().await;
+                    s.recv += 1;
+                    if let Some(send_ns) = send_ns_opt {
+                        if recv_ns >= send_ns {
+                            s.rtts_ns.push(recv_ns - send_ns);
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Ignore Control / Pose / Audio / Haptic on the rx side.
+                }
+                Err(_) => {}
+            }
+        }
+    });
+
+    // Stats printer: every second, log p50/p95/max + counters; reset window.
+    let stats_print = stats.clone();
+    let stats_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        // Skip immediate first tick.
+        tick.tick().await;
+        let mut last_sent: u64 = 0;
+        let mut last_recv: u64 = 0;
+        loop {
+            tick.tick().await;
+            let (sent, recv, rtts) = {
+                let mut s = stats_print.lock().await;
+                let mut r = std::mem::take(&mut s.rtts_ns);
+                r.sort_unstable();
+                (s.sent, s.recv, r)
+            };
+            let dsent = sent - last_sent;
+            let drecv = recv - last_recv;
+            last_sent = sent;
+            last_recv = recv;
+            if rtts.is_empty() {
+                println!(
+                    "[ECHO] sent={dsent}/s recv={drecv}/s p50=-- p95=-- max=-- (totals sent={sent} recv={recv})"
+                );
+            } else {
+                let n = rtts.len();
+                let p50 = rtts[n / 2];
+                let p95_idx = ((n as f64 * 0.95) as usize).min(n - 1);
+                let p95 = rtts[p95_idx];
+                let max = *rtts.last().unwrap();
+                let to_ms = |ns: u64| ns as f64 / 1.0e6;
+                println!(
+                    "[ECHO] sent={dsent}/s recv={drecv}/s p50={:.2}ms p95={:.2}ms max={:.2}ms n={} (totals sent={sent} recv={recv})",
+                    to_ms(p50),
+                    to_ms(p95),
+                    to_ms(max),
+                    rtts.len()
+                );
+            }
+        }
+    });
+
+    // Wait for Ctrl-C, then shut down.
+    tokio::signal::ctrl_c().await.ok();
+    println!("fake-quest-pose-echo: Ctrl-C received, exiting");
+    sender_task.abort();
+    rx_task.abort();
+    stats_task.abort();
     Ok(())
 }
 

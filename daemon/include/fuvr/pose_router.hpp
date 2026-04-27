@@ -39,6 +39,9 @@ class PoseRouter {
 public:
     uint64_t addSubscriber(uint64_t sessionId, PoseSubscriber cb);
     void removeSubscriber(uint64_t streamId);
+    // Drop every subscriber whose sessionId is in the provided set.
+    // Used by daemon to GC subscribers when their owning session is destroyed.
+    void removeSubscribersForSessions(const std::vector<uint64_t>& sessionIds);
 
     bool ingestPackedUpstreamFrame(const uint8_t* data, std::size_t len,
                                    uint64_t sessionId, uint64_t receivedAtNs);

@@ -51,6 +51,12 @@ bool OpenXrSession::create_instance(android_app* app) {
         XR_FB_COLOR_SPACE_EXTENSION_NAME,
         XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME,
         XR_EXT_HAND_TRACKING_EXTENSION_NAME,
+        // Why: pose_forwarder needs to query head pose at "now" (not the
+        // future predictedDisplayTime) so Mac receives the sample-time pose,
+        // and ATW Quest-side has a non-trivial Δq to correct the pipeline
+        // latency. The macro is gated on XR_USE_TIMESPEC, so we hard-code the
+        // string to keep this file independent of the platform define order.
+        "XR_KHR_convert_timespec_time",
     };
 
     XrInstanceCreateInfoAndroidKHR android_info{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};

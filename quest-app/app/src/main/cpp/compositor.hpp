@@ -85,6 +85,12 @@ private:
     float prev_q_now_[2][4]{{0,0,0,1},{0,0,0,1}};
     float prev_q_ren_[2][4]{{0,0,0,1},{0,0,0,1}};
     uint64_t last_quat_dbg_ns_{0};
+    // Per-1Hz-window minimum dot products (= maximum angular deltas). Reset
+    // each time the QUAT-DEBUG line fires so we capture motion peaks instead
+    // of whatever single frame the throttle happens to hit.
+    float min_d_now_window_{1.0f};
+    float min_d_ren_window_{1.0f};
+    float min_d_pair_window_{1.0f};
 
     EyeBlit blit_;
 };

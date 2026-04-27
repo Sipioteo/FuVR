@@ -36,7 +36,7 @@ impl UsbServer {
         let listener = TcpListener::bind(("127.0.0.1", port)).await?;
         info!(port, "transport-usb listening on loopback");
 
-        let (out_tx, mut out_rx) = mpsc::channel::<(Channel, Bytes)>(1024);
+        let (out_tx, out_rx) = mpsc::channel::<(Channel, Bytes)>(1024);
         let (in_tx, in_rx) = mpsc::channel::<(Channel, Bytes)>(1024);
 
         let server = Arc::new(Self {
@@ -44,36 +44,67 @@ impl UsbServer {
             incoming_rx: Mutex::new(Some(in_rx)),
         });
 
+        // Why: the previous implementation moved `out_rx` into the per-peer
+        // writer task and called `break` after the first peer disconnected,
+        // so once Quest dropped its connection the daemon stopped accepting
+        // new peers entirely (and the user had to `launchctl kickstart`).
+        //
+        // Resilient pattern: the outgoing receiver lives in a single
+        // long-running pump task that holds a `Mutex<Option<OwnedWriteHalf>>`
+        // for the current peer. The accept loop hot-swaps the writer half
+        // when peers come and go. Messages sent while no peer is connected
+        // are dropped (the alternative — buffering forever — would build
+        // unbounded back-pressure in 1 kHz pose flow).
+        let writer_slot: Arc<Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>> =
+            Arc::new(Mutex::new(None));
+        {
+            let writer_slot = writer_slot.clone();
+            tokio::spawn(async move {
+                let mut out_rx = out_rx;
+                while let Some((ch, payload)) = out_rx.recv().await {
+                    let frame = transport_core::wire::encode_usb_frame(ch.into(), &payload);
+                    let mut guard = writer_slot.lock().await;
+                    if let Some(wr) = guard.as_mut() {
+                        if let Err(e) = wr.write_all(&frame).await {
+                            warn!(error = %e, "write failed; clearing writer slot");
+                            *guard = None;
+                        }
+                    }
+                    // No peer → drop frame silently.
+                }
+            });
+        }
+
         tokio::spawn(async move {
             loop {
                 let (sock, peer) = match listener.accept().await {
                     Ok(v) => v,
                     Err(e) => {
                         warn!(error = %e, "accept failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         continue;
                     }
                 };
                 info!(%peer, "transport-usb peer connected");
+                let (mut rd, wr) = sock.into_split();
+                {
+                    // Replace the writer slot with this peer's write half.
+                    let mut guard = writer_slot.lock().await;
+                    *guard = Some(wr);
+                }
                 let in_tx_c = in_tx.clone();
-                let (mut rd, mut wr) = sock.into_split();
-                let reader = tokio::spawn(async move {
+                let writer_slot_c = writer_slot.clone();
+                tokio::spawn(async move {
                     if let Err(e) = read_loop(&mut rd, in_tx_c).await {
                         debug!(error = %e, "read loop ended");
                     }
+                    // Reader exited → peer is gone. Clear the writer slot so
+                    // outgoing pump stops trying to write to a dead socket.
+                    let mut guard = writer_slot_c.lock().await;
+                    *guard = None;
+                    info!("transport-usb peer disconnected; awaiting next");
                 });
-                let writer = tokio::spawn(async move {
-                    while let Some((ch, payload)) = out_rx.recv().await {
-                        let frame = transport_core::wire::encode_usb_frame(ch.into(), &payload);
-                        if let Err(e) = wr.write_all(&frame).await {
-                            warn!(error = %e, "write failed");
-                            break;
-                        }
-                    }
-                });
-                let _ = tokio::join!(reader, writer);
-                // After disconnect, fall back to accepting next peer. We re-bind
-                // by looping; rebind not necessary because listener still owns port.
-                break;
+                // Continue accepting; the next peer takes over the writer slot.
             }
         });
 

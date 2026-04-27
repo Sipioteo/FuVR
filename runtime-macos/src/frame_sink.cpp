@@ -30,6 +30,8 @@ void DaemonFrameSink::submit(const SubmittedFrame& frame) noexcept {
     args.forceIdr = frame.forceIdr;
     args.leftEye = frame.renderedLeft;
     args.rightEye = frame.renderedRight;
+    args.leftFov = frame.renderedLeftFov;
+    args.rightFov = frame.renderedRightFov;
     client_->submitFrame(frame.sessionId, args);
   };
 

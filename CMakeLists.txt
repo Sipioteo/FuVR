@@ -45,3 +45,18 @@ add_subdirectory(encoder-macos)
 add_subdirectory(runtime-macos)
 add_subdirectory(virtual-display-helper)
 add_subdirectory(daemon)
+
+# Optional: build the host-side ATW math test on the Mac (no NDK needed).
+# Just the rotational-ATW math test is built from the top-level project; the
+# rest of the quest-app host tests live under their own standalone
+# CMakeLists.txt and are built via /tmp/quest-host-tests during dev.
+option(FUVR_QUEST_HOST_TESTS "Build quest-app host-side ATW math test on the Mac" ON)
+if(FUVR_QUEST_HOST_TESTS)
+  add_executable(test_atw_math
+    quest-app/app/src/main/cpp/tests/test_atw_math.cpp
+  )
+  target_include_directories(test_atw_math PRIVATE
+    quest-app/app/src/main/cpp
+  )
+  add_test(NAME test_atw_math COMMAND test_atw_math)
+endif()

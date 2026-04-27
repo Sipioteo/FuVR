@@ -125,6 +125,10 @@ void Daemon::onTransportRecv(void* user, uint8_t channel,
     }
     {
         static std::atomic<uint64_t> lastPoseLogNs{0};
+        // Per-second pose-frame counter: incremented on every pose frame,
+        // snapshotted+reset only when the 1Hz throttle fires below.
+        static std::atomic<uint32_t> poseFrameCount{0};
+        poseFrameCount.fetch_add(1, std::memory_order_relaxed);
         uint64_t nowL = now;
         uint64_t prev = lastPoseLogNs.load();
         if (nowL - prev >= 1'000'000'000ull &&
@@ -132,6 +136,30 @@ void Daemon::onTransportRecv(void* user, uint8_t channel,
             FUVR_LOG_INFO("daemon",
                           "[DEBUG-POSE] pose frame: %zu bytes, sessions=%zu",
                           len, sids.size());
+            // [LATENCY-DEBUG] Decode the UpstreamFrame *only* on the 1Hz tick
+            // to peek hmd timestamps. Lag is across-clock (Mac mono vs Quest
+            // mono); only the *trend* over a 60s session is diagnostic.
+            uint32_t fps = poseFrameCount.exchange(0, std::memory_order_relaxed);
+            uint64_t questTsNs = 0;
+            uint64_t questPredictedNs = 0;
+            auto e = kj::runCatchingExceptions([&]() {
+                kj::ArrayInputStream is(kj::arrayPtr(data, len));
+                ::capnp::PackedMessageReader reader(is);
+                auto frame = reader.getRoot<::fuvr::proto::UpstreamFrame>();
+                auto hmd = frame.getHmd();
+                questTsNs = hmd.getTimestampNs();
+                questPredictedNs = hmd.getPredictedDisplayTimeNs();
+            });
+            (void)e;
+            int64_t lagMs = static_cast<int64_t>(
+                (static_cast<int64_t>(nowL) -
+                 static_cast<int64_t>(questPredictedNs)) / 1'000'000);
+            FUVR_LOG_INFO("daemon",
+                          "[LATENCY-DEBUG] onTransportRecv: pose_fps=%u "
+                          "lag_ms=%lld questTs_ns=%llu predict_ns=%llu",
+                          (unsigned)fps, (long long)lagMs,
+                          (unsigned long long)questTsNs,
+                          (unsigned long long)questPredictedNs);
         }
     }
 }
@@ -298,6 +326,41 @@ void Daemon::onEnvelope(const InboundRpc& rpc) {
         cfg.bitrateBps = req.getVideoBitrateBps();
         cfg.forceIdrEveryFrames = req.getForceIdrEveryFrames();
         cfg.enableVirtualDisplay = req.getEnableVirtualDisplay();
+
+        // Why: Blender (and other XR apps) reconnect across "Start VR Session"
+        // cycles without sending stopSession. Without cleanup, sessions_ grows
+        // and so do all the per-session subscriber lists (poseRouter,
+        // inputRouter, metricsSubs, encodeStatsSubs). Every encoded frame then
+        // fans out to all stale subscribers — most pointing at dead RPC fds —
+        // and the daemon visibly slows down after ~30 s. Drop every prior
+        // session and its subs whenever a new client starts up. Single-client
+        // assumption is fine for now (only one runtime per Mac).
+        std::vector<uint64_t> staleSessionIds;
+        {
+            std::lock_guard lk(sessionsMu_);
+            staleSessionIds.reserve(sessions_.size());
+            for (auto& [sid, _] : sessions_) staleSessionIds.push_back(sid);
+            sessions_.clear();
+        }
+        if (!staleSessionIds.empty()) {
+            poseRouter_.removeSubscribersForSessions(staleSessionIds);
+            inputRouter_.removeSubscribersForSessions(staleSessionIds);
+            FUVR_LOG_INFO("daemon",
+                          "evicted %zu stale session(s) on new startSession",
+                          staleSessionIds.size());
+        }
+        {
+            std::lock_guard lk(metricsSubsMu_);
+            metricsSubs_.clear();
+        }
+        {
+            std::lock_guard lk(encodeStatsSubsMu_);
+            encodeStatsSubs_.clear();
+        }
+        {
+            std::lock_guard lk(logSubsMu_);
+            logSubs_.clear();
+        }
 
         uint64_t id;
         uint32_t vid = 0;

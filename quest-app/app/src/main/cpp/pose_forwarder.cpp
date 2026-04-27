@@ -9,7 +9,18 @@
 
 #include <android/log.h>
 #include <chrono>
+#include <ctime>
 #include <thread>
+
+// XR_KHR_convert_timespec_time prototype + PFN. Declared here directly to
+// avoid pulling in openxr_platform.h, which on Android additionally needs
+// jni + EGL headers and balloons the include surface for one extension.
+extern "C" {
+typedef XrResult (XRAPI_PTR *PFN_xrConvertTimespecTimeToTimeKHR)(
+    XrInstance instance,
+    const struct timespec* timespecTime,
+    XrTime* time);
+}
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "fuvr.pose", __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "fuvr.pose", __VA_ARGS__)
@@ -58,6 +69,16 @@ void PoseForwarder::run() {
     auto last_heartbeat = steady_clock::now();
     uint64_t ticks_total = 0, ticks_running = 0, sends_ok = 0, sends_fail = 0;
 
+    // Resolve xrConvertTimespecTimeToTimeKHR once. It maps clock_gettime(MONO)
+    // into the headset's XrTime, which we then feed to xrLocateSpace to get
+    // the *current* head pose (not the future-predicted one in last_views).
+    PFN_xrConvertTimespecTimeToTimeKHR pfnConvertTimespec = nullptr;
+    if (xr_.instance() != XR_NULL_HANDLE) {
+        xrGetInstanceProcAddr(
+            xr_.instance(), "xrConvertTimespecTimeToTimeKHR",
+            reinterpret_cast<PFN_xrVoidFunction*>(&pfnConvertTimespec));
+    }
+
     while (running_.load()) {
         next += period;
         ++ticks_total;
@@ -66,11 +87,33 @@ void PoseForwarder::run() {
         const bool xr_sess = (xr_.session() != XR_NULL_HANDLE);
         if (xr_run && xr_sess) {
             ++ticks_running;
-            const XrTime t = xr_.predicted_display_time();
+            const XrTime t_predicted = xr_.predicted_display_time();
+            // Why: send the head pose at "now" (CLOCK_MONOTONIC) rather than at
+            // predictedDisplayTime. The compositor's q_now is itself derived
+            // from xrLocateViews(predictedDisplayTime), so if we send that
+            // same future-pose to Mac, Mac echoes it back as q_render and
+            // pair(ren,now) ≡ 1.0 ⇒ ATW Δq = identity ⇒ no warp ⇒ visible
+            // lag during head motion. With t_now = CLOCK_MONOTONIC, q_render
+            // is sample-time and ATW gets a real Δq covering the full pipeline
+            // latency to correct.
+            XrTime t_now = t_predicted;
+            if (pfnConvertTimespec != nullptr && xr_.instance() != XR_NULL_HANDLE) {
+                struct timespec ts{};
+                if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+                    XrTime converted = 0;
+                    if (pfnConvertTimespec(xr_.instance(), &ts, &converted) ==
+                        XR_SUCCESS) {
+                        t_now = converted;
+                    }
+                }
+            }
 
             // Single sync per tick: shared by pose locate + action read.
+            // Use predicted display time for actions / capture (those want the
+            // future-aligned data). t_now is only for the sample we send.
             xr_.sync_actions();
-            xr_.capture_local_origin_if_needed(t);
+            xr_.capture_local_origin_if_needed(t_predicted);
+            const XrTime t = t_now;
 
             // Hand poses with velocity. ALVR / Carmack: the headset runtime
             // owns the IMU integrator; its velocity is dramatically cleaner
@@ -102,14 +145,33 @@ void PoseForwarder::run() {
             const bool head_ang_valid =
                 (head_vel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) != 0;
 
-            const auto& views = xr_.last_views();
+            // Fresh per-eye locate at t_now (instead of cached last_views,
+            // which is at predictedDisplayTime). FOV is an intrinsic of the
+            // headset and doesn't change frame-to-frame, so we still take it
+            // from the cached views — saves a structure copy.
+            const auto& cached_views = xr_.last_views();
+            XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
+            vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+            vli.displayTime = t;
+            vli.space = xr_.stage_space();
+            XrViewState vstate{XR_TYPE_VIEW_STATE};
+            uint32_t out_count = 0;
+            XrView fresh_views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+            XrResult lvr = xrLocateViews(xr_.session(), &vli, &vstate, 2,
+                                          &out_count, fresh_views);
+            const bool fresh_ok =
+                (lvr == XR_SUCCESS && out_count == 2 &&
+                 (vstate.viewStateFlags &
+                  XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0);
+            XrPosef pose0 = fresh_ok ? fresh_views[0].pose : cached_views[0].pose;
+            XrPosef pose1 = fresh_ok ? fresh_views[1].pose : cached_views[1].pose;
 
             PlainUpstreamFrame f;
             f.correlationFrameId = 0;
             f.hmd.timestampNs = now_ns();
             f.hmd.predictedDisplayTimeNs = (uint64_t)t;
-            f.hmd.leftView  = to_plain(views[0].pose, views[0].fov);
-            f.hmd.rightView = to_plain(views[1].pose, views[1].fov);
+            f.hmd.leftView  = to_plain(pose0, cached_views[0].fov);
+            f.hmd.rightView = to_plain(pose1, cached_views[1].fov);
             if (head_lin_valid) {
                 f.hmd.linVelX = head_vel.linearVelocity.x;
                 f.hmd.linVelY = head_vel.linearVelocity.y;

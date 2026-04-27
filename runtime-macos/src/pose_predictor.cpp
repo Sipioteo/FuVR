@@ -226,6 +226,38 @@ std::optional<PoseSample> PosePredictor::predict(
   Vec3 linVel = last.linearVelocity;
   Vec3 angVel = last.angularVelocity;
 
+  // Why: deadband on angular velocity. The IMU Kalman delivers a clean ω,
+  // but it's never *exactly* zero — there's always sub-degree-per-second
+  // residual noise around true zero. Multiplying that by a 70 ms lookahead
+  // amplifies it into a sub-degree warp angle that ATW applies every frame,
+  // visible as tremor when the user holds their head still. Real conscious
+  // head motion is well above 5°/s, so zero out ω whose magnitude is below
+  // a small threshold. The user's "hypersensitive to micromovement" symptom
+  // disappears, and motion-onset response is unaffected (ω ramps past the
+  // deadband within ~1 sample of any real movement).
+  // Linear velocity isn't deadbanded: position drift over 70 ms is below
+  // sub-mm even with noisy IMU, and the parallax effect of a wrong position
+  // delta at typical interaction distance is below a pixel.
+  // Default 0 = no deadband. The Meta IMU Kalman already produces a clean ω;
+  // a hard deadband introduces a discontinuity at zero-crossings (e.g. fast
+  // back-and-forth head turns) that ATW perceives as accumulated drift.
+  // Tunable via FUVR_RT_POSE_ANGVEL_DEADBAND_RAD_S if a specific headset
+  // turns out to need filtering.
+  static const float kAngVelDeadband = []() {
+    if (const char* env = std::getenv("FUVR_RT_POSE_ANGVEL_DEADBAND_RAD_S")) {
+      float v = std::strtof(env, nullptr);
+      if (v >= 0.0f && v <= 1.0f) return v;
+    }
+    return 0.0f;
+  }();
+  {
+    const float magSq =
+        angVel.x * angVel.x + angVel.y * angVel.y + angVel.z * angVel.z;
+    if (magSq < kAngVelDeadband * kAngVelDeadband) {
+      angVel = Vec3{0.0f, 0.0f, 0.0f};
+    }
+  }
+
   // Detect "no IMU velocity provided" — fall back to one-sample finite
   // difference for linear velocity only. Angular velocity stays zero (we
   // refuse to amplify finite-difference noise into a wild rotation).

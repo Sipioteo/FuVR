@@ -51,28 +51,36 @@ public:
             if (it != owner_->renderedPoses_.end()) rp = it->second;
         }
         auto fillView = [](::fuvr::proto::ViewState::Builder vb,
-                           const std::array<float, 7>& v) {
+                           const std::array<float, 7>& v,
+                           const std::array<float, 4>* fov) {
             auto pose = vb.initPose();
             auto pos = pose.initPosition();
             pos.setX(v[0]); pos.setY(v[1]); pos.setZ(v[2]);
             auto rot = pose.initOrientation();
             rot.setX(v[3]); rot.setY(v[4]); rot.setZ(v[5]); rot.setW(v[6]);
-            // Fov is left as default (zeros). The Quest derives the warp
-            // matrix from xrLocateViews fov on present-time and pairs it
-            // with the rendered fov reported by the runtime — but until
-            // we plumb fov through SubmitFrameRequest the Quest falls
-            // back to assuming the now-fov also matches render-fov, which
-            // is correct to within ~0.1° per frame on Quest 3.
-            (void)vb.initFov();
+            auto fb = vb.initFov();
+            if (fov != nullptr) {
+                fb.setAngleLeft((*fov)[0]);
+                fb.setAngleRight((*fov)[1]);
+                fb.setAngleUp((*fov)[2]);
+                fb.setAngleDown((*fov)[3]);
+            }
+            // If fov is null/unset, fields default to 0 and Quest's ATW shader
+            // falls back to assuming fov_render == fov_now (under-corrects but
+            // no NaNs). With overscan enabled on the runtime side we MUST ship
+            // fov here or the Quest won't see the rendered overscan and will
+            // appear to "see the screen edge" during fast head turns.
         };
+        const std::array<float, 4>* lFov = rp.fovValid ? &rp.leftFov  : nullptr;
+        const std::array<float, 4>* rFov = rp.fovValid ? &rp.rightFov : nullptr;
         if (rp.valid) {
-            fillView(hdr.initRenderedLeft(), rp.left);
-            fillView(hdr.initRenderedRight(), rp.right);
+            fillView(hdr.initRenderedLeft(), rp.left, lFov);
+            fillView(hdr.initRenderedRight(), rp.right, rFov);
         } else {
             // Identity pose so the wire side never reads garbage.
             std::array<float, 7> id{0,0,0, 0,0,0, 1};
-            fillView(hdr.initRenderedLeft(), id);
-            fillView(hdr.initRenderedRight(), id);
+            fillView(hdr.initRenderedLeft(), id, nullptr);
+            fillView(hdr.initRenderedRight(), id, nullptr);
         }
         hdr.setCodec(owner_->cfg_.codec == fuvr::VideoCodec::H264
                          ? ::fuvr::proto::VideoCodec::H264
@@ -177,7 +185,9 @@ bool Session::submitFrame(CVPixelBufferRef pb,
                           uint64_t renderStartNs,
                           bool forceIdr,
                           const float renderedLeft[7],
-                          const float renderedRight[7]) {
+                          const float renderedRight[7],
+                          const float renderedLeftFov[4],
+                          const float renderedRightFov[4]) {
     if (!encoder_ || !pb) return false;
     lastEncodeStartNs_.store(nowMonoNs());
 
@@ -192,6 +202,14 @@ bool Session::submitFrame(CVPixelBufferRef pb,
             for (int i = 0; i < 7; ++i) {
                 rp.left[i]  = renderedLeft[i];
                 rp.right[i] = renderedRight[i];
+            }
+        }
+        if (renderedLeftFov != nullptr && renderedRightFov != nullptr &&
+            (renderedLeftFov[0] != 0.0f || renderedLeftFov[1] != 0.0f)) {
+            rp.fovValid = true;
+            for (int i = 0; i < 4; ++i) {
+                rp.leftFov[i]  = renderedLeftFov[i];
+                rp.rightFov[i] = renderedRightFov[i];
             }
         }
         std::lock_guard lk(renderedPosesMu_);

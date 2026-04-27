@@ -61,3 +61,13 @@ add_executable(test_local_origin_math
     test_local_origin_math.cpp
 )
 target_include_directories(test_local_origin_math PRIVATE ..)
+
+# ATW reprojection math (eye_blit fragment shader replicated in C++) +
+# the shared quat helpers from quat_math.hpp. Header-only, no Android linkage.
+add_executable(test_atw_math
+    test_atw_math.cpp
+)
+target_include_directories(test_atw_math PRIVATE ..)
+if(COMMAND add_test)
+    add_test(NAME test_atw_math COMMAND test_atw_math)
+endif()

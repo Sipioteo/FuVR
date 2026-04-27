@@ -40,12 +40,16 @@ public:
 
 private:
     void recv_loop();
+    bool connect_locked();   // Establish fd_; caller must hold send_mutex_.
+    void close_fd_locked();
 
     int fd_{-1};
     std::atomic<bool> running_{false};
     std::thread thread_;
     std::mutex send_mutex_;
     Handler handler_;
+    std::string host_;
+    uint16_t port_{0};
 };
 
 }

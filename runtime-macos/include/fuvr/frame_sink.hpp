@@ -27,6 +27,11 @@ struct SubmittedFrame {
   uint64_t sessionId{0};
   Pose renderedLeft{};
   Pose renderedRight{};
+  // FOV the runtime returned to the app (with overscan). The Quest's ATW
+  // shader needs it as `fov_render` so it can correctly map sample UVs into
+  // the (overscanned) rendered region instead of falling back to fov_now.
+  Fov renderedLeftFov{};
+  Fov renderedRightFov{};
   bool forceIdr{false};
   // Extra composition layers beyond the primary (`ioSurface` above). Each
   // gets its own surface token / SubmitFrameRequest envelope.

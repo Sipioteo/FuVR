@@ -88,7 +88,14 @@ private:
     // asynchronous: submitFrame stashes the pose, FragmentSink::onFragment
     // pops it back out so it can stamp the wire VideoFragmentHeader. Cleared
     // on endOfFrame (and bounded against runaway growth).
-    struct RenderedPose { std::array<float, 7> left{}; std::array<float, 7> right{}; bool valid{false}; };
+    struct RenderedPose {
+        std::array<float, 7> left{};
+        std::array<float, 7> right{};
+        std::array<float, 4> leftFov{};   // angleLeft, angleRight, angleUp, angleDown
+        std::array<float, 4> rightFov{};
+        bool valid{false};
+        bool fovValid{false};
+    };
     std::mutex renderedPosesMu_;
     std::unordered_map<uint64_t, RenderedPose> renderedPoses_;
 

@@ -115,6 +115,14 @@ struct Session {
   // Set at session start from daemon's measured oneWayDelayNs plus a fixed
   // render-budget; overridable via FUVR_RT_POSE_LOOKAHEAD_MS.
   uint64_t poseLookaheadNs{70'000'000};
+  // Per-eye FOV last returned by xrLocateViews. xrEndFrame copies this into
+  // SubmittedFrame so the daemon (and ultimately the Quest's ATW shader)
+  // knows the *rendered* FOV — including any overscan we applied — instead
+  // of the headset's native fov_now. Without this the ATW falls back to
+  // assuming render-fov == now-fov and the warp samples outside the actual
+  // rendered region during fast head turns ("see the screen edge").
+  Fov lastRenderedLeftFov{};
+  Fov lastRenderedRightFov{};
   void* metalDevice{nullptr};  // id<MTLDevice>, retained
   void* metalCommandQueue{nullptr};  // id<MTLCommandQueue> from KHR binding (NOT retained — owned by app)
   std::vector<std::unique_ptr<Space>> spaces;

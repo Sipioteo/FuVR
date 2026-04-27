@@ -6,8 +6,10 @@
 #include <kj/array.h>
 #include <kj/io.h>
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <pwd.h>
@@ -24,6 +26,13 @@ namespace fuvr::runtime {
 namespace {
 
 constexpr size_t kReadBufBytes = 64 * 1024;
+
+// Read FUVR_RT_DEBUG once at startup; cached so the 1Hz hot-path branch is
+// just an atomic-load + compare.
+inline bool latencyDebugEnabled() noexcept {
+    static const bool on = std::getenv("FUVR_RT_DEBUG") != nullptr;
+    return on;
+}
 
 PoseSample poseFromSnapshot(const fuvr::daemon::PoseSnapshot::Reader& s) noexcept {
   PoseSample out{};
@@ -305,6 +314,27 @@ void DaemonClient::readerLoop() noexcept {
             cb = poseCb_;
           }
           if (cb) cb(s);
+          // [LATENCY-DEBUG] Most diagnostic line for the user's "2-3s lag"
+          // hypothesis: age_us is steady_clock(now) - sample.timestampNs.
+          // If age_us ramps from ~10ms at session start to seconds at 30s in,
+          // the dispatch chain is queueing.
+          if (latencyDebugEnabled()) {
+            static std::atomic<uint64_t> lastLogNs{0};
+            uint64_t nowL = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            uint64_t prev = lastLogNs.load(std::memory_order_relaxed);
+            if (nowL - prev >= 1'000'000'000ull &&
+                lastLogNs.compare_exchange_strong(prev, nowL)) {
+              long long ageUs = static_cast<long long>(
+                  (static_cast<int64_t>(nowL) -
+                   static_cast<int64_t>(s.timestampNs)) / 1000);
+              std::fprintf(stderr,
+                           "[fuvr-rt] [LATENCY-DEBUG] pose recv: "
+                           "age_us=%lld bufsize=%u\n",
+                           ageUs, static_cast<unsigned>(buf.size()));
+            }
+          }
           break;
         }
         case fuvr::daemon::Envelope::Body::ENCODE_STATS: {

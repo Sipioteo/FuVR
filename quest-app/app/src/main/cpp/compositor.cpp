@@ -4,6 +4,7 @@
 
 #include "decoder_pipeline.hpp"
 #include "openxr_session.hpp"
+#include "quat_math.hpp"
 
 #include <android/hardware_buffer.h>
 #include <android/log.h>
@@ -25,35 +26,9 @@ PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR_ = nullptr;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR_ = nullptr;
 PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_ = nullptr;
 
-// --- Quaternion helpers (rotational ATW). Kept tiny — no glm dependency.
-struct Quat { float x{0}, y{0}, z{0}, w{1}; };
-
-inline Quat quat_normalize(Quat q) {
-    float n = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
-    if (n <= 0.0f) return {0,0,0,1};
-    float inv = 1.0f / n;
-    return { q.x*inv, q.y*inv, q.z*inv, q.w*inv };
-}
-inline Quat quat_conjugate(Quat q) { return { -q.x, -q.y, -q.z, q.w }; }
-// Hamilton product: a then b -> b * a (apply a first when rotating a vector).
-inline Quat quat_mul(Quat a, Quat b) {
-    return {
-        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
-        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
-        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
-        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
-    };
-}
-// Convert a unit quaternion to a row-major 3x3.
-inline void quat_to_mat3_rowmajor(Quat q, float m[9]) {
-    q = quat_normalize(q);
-    const float xx = q.x*q.x, yy = q.y*q.y, zz = q.z*q.z;
-    const float xy = q.x*q.y, xz = q.x*q.z, yz = q.y*q.z;
-    const float wx = q.w*q.x, wy = q.w*q.y, wz = q.w*q.z;
-    m[0] = 1 - 2*(yy + zz); m[1] = 2*(xy - wz);     m[2] = 2*(xz + wy);
-    m[3] = 2*(xy + wz);     m[4] = 1 - 2*(xx + zz); m[5] = 2*(yz - wx);
-    m[6] = 2*(xz - wy);     m[7] = 2*(yz + wx);     m[8] = 1 - 2*(xx + yy);
-}
+// Quaternion helpers live in quat_math.hpp so the host-side ATW math test can
+// reuse the same Quat / quat_mul / quat_conjugate / quat_to_mat3_rowmajor /
+// qdot / qneg implementations the runtime uses. Do not redefine them here.
 
 uint64_t now_ns_steady() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -287,10 +262,7 @@ bool Compositor::render_eye(int eye_index) {
     // produces a Δq through the long way ~360° → instant ATW snap. Pin both
     // onto the same sheet as the previous frame's canonical values, then
     // recompute Δq.
-    auto qdot = [](const float a[4], const Quat& b) {
-        return a[0]*b.x + a[1]*b.y + a[2]*b.z + a[3]*b.w;
-    };
-    auto qneg = [](Quat& q) { q.x=-q.x; q.y=-q.y; q.z=-q.z; q.w=-q.w; };
+    // qdot / qneg now live in quat_math.hpp.
     float* prev_now = prev_q_now_[eye_index];
     float* prev_ren = prev_q_ren_[eye_index];
     if (qdot(prev_now, q_now) < 0.0f) qneg(q_now);
@@ -302,6 +274,15 @@ bool Compositor::render_eye(int eye_index) {
                         q_ren.z*q_now.z + q_ren.w*q_now.w;
         if (d < 0.0f) qneg(q_ren);
     }
+
+    // Compute frame-to-frame and pair(ren,now) BEFORE updating prev_*, then
+    // store extremes (min dot = max angular delta) over the 1Hz window so the
+    // log captures motion peaks instead of whatever sample the throttle picks.
+    const float d_now_frame = qdot(prev_q_now_[eye_index], q_now);
+    const float d_ren_frame = qdot(prev_q_ren_[eye_index], q_ren);
+    const float d_pair_frame = q_ren.x*q_now.x + q_ren.y*q_now.y +
+                                q_ren.z*q_now.z + q_ren.w*q_now.w;
+
     prev_q_now_[eye_index][0] = q_now.x; prev_q_now_[eye_index][1] = q_now.y;
     prev_q_now_[eye_index][2] = q_now.z; prev_q_now_[eye_index][3] = q_now.w;
     if (render_pose_valid) {
@@ -310,15 +291,30 @@ bool Compositor::render_eye(int eye_index) {
     }
 
     if (eye_index == 0) {
+        // Track minimum dot (= maximum angular delta) within the 1Hz window
+        // for each metric so we don't miss motion peaks. Reset on log emit.
+        if (d_now_frame  < min_d_now_window_)  min_d_now_window_  = d_now_frame;
+        if (d_ren_frame  < min_d_ren_window_)  min_d_ren_window_  = d_ren_frame;
+        if (d_pair_frame < min_d_pair_window_) min_d_pair_window_ = d_pair_frame;
         const uint64_t t = now_ns_steady();
         if (t - last_quat_dbg_ns_ > 1'000'000'000ull) {
             last_quat_dbg_ns_ = t;
-            const float d_now = qdot(prev_q_now_[0], q_now); // post-fix: ~+1
-            const float d_ren = qdot(prev_q_ren_[0], q_ren);
-            const float d_pair = q_ren.x*q_now.x + q_ren.y*q_now.y +
-                                 q_ren.z*q_now.z + q_ren.w*q_now.w;
-            LOGI("[QUAT-DEBUG] dot(q_n,q_n-1)now=%.4f ren=%.4f pair(ren,now)=%.4f valid=%d",
-                 d_now, d_ren, d_pair, (int)render_pose_valid);
+            // Convert min-dot to peak angle (degrees) so sub-degree motion is
+            // still readable. angle = 2 * acos(|dot|).
+            auto dot_to_deg = [](float d) {
+                if (d > 1.0f) d = 1.0f; if (d < -1.0f) d = -1.0f;
+                return 2.0f * std::acos(std::fabs(d)) * 57.2957795f;
+            };
+            LOGI("[QUAT-DEBUG] window peak: dq_now=%.3f° dq_ren=%.3f° "
+                 "Δq_pair=%.3f° (min_dot pair=%.6f) valid=%d",
+                 dot_to_deg(min_d_now_window_),
+                 dot_to_deg(min_d_ren_window_),
+                 dot_to_deg(min_d_pair_window_),
+                 min_d_pair_window_,
+                 (int)render_pose_valid);
+            min_d_now_window_  = 1.0f;
+            min_d_ren_window_  = 1.0f;
+            min_d_pair_window_ = 1.0f;
         }
     }
 
