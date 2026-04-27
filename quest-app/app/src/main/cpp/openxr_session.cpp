@@ -430,52 +430,16 @@ void OpenXrSession::begin_frame() {
         last_views_[i].fov = views[i].fov;
     }
 
-    // Why: we also locate views against view_space so the compositor can
-    // submit a head-locked projection layer (out.space = view_space).
-    // In view space the per-eye pose collapses to the IPD offset (and any
-    // eye-convergence rotation), with no head rotation/translation — the
-    // runtime then composites the layer rigidly attached to the head, so
-    // fast rotations never reveal the empty world while the remote frame
-    // is still in flight.
-    XrViewLocateInfo vli_view{XR_TYPE_VIEW_LOCATE_INFO};
-    vli_view.viewConfigurationType = kViewConfig;
-    vli_view.displayTime = predicted_display_time_;
+    // Also locate views against view_space so the head-locked-quad path can
+    // size each per-eye quad to the eye's IPD offset (essentially constant,
+    // ≈ (±IPD/2, 0, 0)) without baking the IPD constant in code.
+    XrViewLocateInfo vli_view = vli;
     vli_view.space = view_space_;
-    XrViewState vs_view{XR_TYPE_VIEW_STATE};
-    uint32_t out_count_view = 0;
     XrView views_view[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-    xrLocateViews(session_, &vli_view, &vs_view, 2, &out_count_view, views_view);
+    xrLocateViews(session_, &vli_view, &vs, 2, &out_count, views_view);
     for (int i = 0; i < 2; ++i) {
         last_views_view_[i].pose = views_view[i].pose;
         last_views_view_[i].fov = views_view[i].fov;
-    }
-
-    // [DRIFT-DIAG #1] How far ahead does the runtime predict, and is the
-    // predicted view pose marked valid? A runaway predictedDisplayTime
-    // (clock drift / sync issue) makes xrLocateViews extrapolate IMU forward
-    // by huge dt, so the projection-layer pose we submit ends up at a stale
-    // world-space position even though the head is still — exactly the
-    // symptom of "the plane drifts in stage_space, then snaps back".
-    {
-        static uint64_t last_log_ns = 0;
-        const uint64_t t_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (t_now_ns - last_log_ns > 1'000'000'000ull) {
-            last_log_ns = t_now_ns;
-            const int64_t lookahead_ns =
-                (int64_t)predicted_display_time_ - (int64_t)t_now_ns;
-            __android_log_print(ANDROID_LOG_INFO, "fuvr.drift",
-                "[DRIFT #1] predictedDisplayTime lookahead=%.2fms "
-                "viewStateFlags=0x%x posValid=%d ornValid=%d "
-                "eye0.pos=(%.3f,%.3f,%.3f)",
-                lookahead_ns * 1e-6,
-                (unsigned)vs.viewStateFlags,
-                (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ? 1 : 0,
-                (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) ? 1 : 0,
-                last_views_[0].pose.position.x,
-                last_views_[0].pose.position.y,
-                last_views_[0].pose.position.z);
-        }
     }
 }
 
@@ -483,17 +447,19 @@ void OpenXrSession::end_frame(Compositor& compositor) {
     if (!frame_in_flight_) return;
     frame_in_flight_ = false;
 
-    // Why head-locked quads, not a projection layer:
-    // Meta Quest's compositor ignores `space = view_space` on
-    // XrCompositionLayerProjection — the layer ends up world-locked, producing
-    // the "plane lags behind the gaze, then snaps back into place" symptom
-    // during head rotation. Quad layers DO honor view_space, so we submit two
-    // XrCompositionLayerQuads (eyeVisibility LEFT/RIGHT) anchored to the
-    // headset's view space. The OS compositor then re-anchors them to the
-    // latest head pose at scan-out, driven by the headset's native tracking,
-    // fully decoupled from network/decoder latency. See
-    // Compositor::build_head_locked_quads() in compositor.cpp for the
-    // per-eye geometry derivation.
+    // Head-locked dual-quad layers in view_space. Empirically on this Quest,
+    // anchoring a stage_space projection layer to the render-time pose +
+    // expanded FOV did NOT produce a rigidly head-glued image: the OS
+    // compositor's scan-out timewarp is not strong enough to keep the layer
+    // glued during fast head rotation, so the user could still see the
+    // edges of the rendered frame. The bug the user is fighting is the
+    // QUAD POSITION not refreshing at headset polling rate, not a texture-
+    // content issue. Two view_space quads (per-eye, sized to each eye's
+    // asymmetric FOV) are rigidly attached to the head at the OS level —
+    // the rectangle never drifts, regardless of network/decoder pipeline
+    // state. The cost is no rotational ATW (the world inside the rectangle
+    // rotates with the head with ~pipeline-latency lag) — accepted by the
+    // user as the lesser evil. See Compositor::build_head_locked_quads.
     std::array<XrCompositionLayerQuad, 2> head_quads{};
     XrCompositionLayerQuad placeholder{XR_TYPE_COMPOSITION_LAYER_QUAD};
     const XrCompositionLayerBaseHeader* layers[2] = {nullptr, nullptr};

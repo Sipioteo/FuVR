@@ -4,14 +4,12 @@
 
 #include "decoder_pipeline.hpp"
 #include "openxr_session.hpp"
-#include "quat_math.hpp"
 
 #include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <GLES2/gl2ext.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdlib>
 
@@ -25,15 +23,6 @@ PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC eglGetNativeClientBufferANDROID_ = nullpt
 PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR_ = nullptr;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR_ = nullptr;
 PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_ = nullptr;
-
-// Quaternion helpers live in quat_math.hpp so the host-side ATW math test can
-// reuse the same Quat / quat_mul / quat_conjugate / quat_to_mat3_rowmajor /
-// qdot / qneg implementations the runtime uses. Do not redefine them here.
-
-uint64_t now_ns_steady() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
 
 void load_gl_extensions() {
     if (eglCreateImageKHR_) return;
@@ -53,8 +42,6 @@ bool Compositor::init() {
         LOGE("EyeBlit init failed");
         return false;
     }
-    const char* dbg = std::getenv("FUVR_QUEST_DEBUG");
-    debug_atw_ = (dbg && dbg[0] && dbg[0] != '0');
     return create_swapchains();
 }
 
@@ -217,137 +204,23 @@ bool Compositor::render_eye(int eye_index) {
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // --- Build per-eye warp params. ---------------------------------------
+    // Plain texture copy. The OS compositor performs scan-out timewarp
+    // against (rendered_pose, rendered_fov) submitted on the projection
+    // layer, so the shader must NOT apply any rotation here — doing so
+    // would double-warp. The blit just splits the SBS source 50/50 into
+    // each eye's swapchain. EyeBlit's identity-warp path handles this:
+    // r_delta_inv = I, fov_now == fov_render, ur=u and vr=v.
     EyeBlit::WarpParams warp{};
-    const auto& views_now = xr_.last_views();
-    const PlainViewState& rv = (eye_index == 0) ? rendered_left_ : rendered_right_;
-    const auto& nv = views_now[eye_index];
-
-    // Now-fov (xrLocateViews this frame). Always trusted.
-    warp.fov_now.angleLeft  = nv.fov.angleLeft;
-    warp.fov_now.angleRight = nv.fov.angleRight;
-    warp.fov_now.angleUp    = nv.fov.angleUp;
-    warp.fov_now.angleDown  = nv.fov.angleDown;
-
-    // Render-fov: the daemon currently doesn't ship a real fov in the wire
-    // header (TODO: plumb through SubmitFrameRequest). Until it does, the
-    // safest assumption is that the Mac rendered with the same per-eye fov
-    // the headset reported on its last upstream pose sample, which is the
-    // current OpenXR fov. The shader is robust to drift here — using the
-    // now-fov gives a slightly under-corrected warp, never an over-correction.
-    bool have_render_fov = (rv.fov.angleLeft != 0.0f || rv.fov.angleRight != 0.0f);
-    warp.fov_render = have_render_fov
-        ? EyeBlit::Fov{rv.fov.angleLeft, rv.fov.angleRight, rv.fov.angleUp, rv.fov.angleDown}
-        : warp.fov_now;
-
-    // The shader needs R_delta_inv: a rotation that maps a ray direction
-    // expressed in the present-time eye frame into the render-time eye frame.
-    // Vectors transform between frames by their *inverse* world rotations:
-    //   v_world  = R(q_eye) * v_eye
-    //   v_render = R(q_render⁻¹) * R(q_now) * v_now
-    //            = R(q_render⁻¹ · q_now) * v_now
-    // so R_delta_inv corresponds to the quaternion (q_render⁻¹ · q_now).
-    // If either pose is invalid (still defaulted), fall back to identity so
-    // the blit still produces a sensible image.
-    Quat q_now { nv.pose.orientation.x, nv.pose.orientation.y,
-                 nv.pose.orientation.z, nv.pose.orientation.w };
-    Quat q_ren { rv.pose.ox, rv.pose.oy, rv.pose.oz, rv.pose.ow };
-    bool render_pose_valid = (q_ren.x != 0.0f || q_ren.y != 0.0f ||
-                              q_ren.z != 0.0f || q_ren.w != 1.0f);
-
-    // QUAT-FIX: q_now arrives raw from xrLocateViews (Meta makes no continuity
-    // guarantee across the q vs -q double cover) while q_ren came over the
-    // wire from the Mac predictor (which canonicalizes against its own
-    // history). The two sign threads can drift, and a single antipodal frame
-    // produces a Δq through the long way ~360° → instant ATW snap. Pin both
-    // onto the same sheet as the previous frame's canonical values, then
-    // recompute Δq.
-    // qdot / qneg now live in quat_math.hpp.
-    float* prev_now = prev_q_now_[eye_index];
-    float* prev_ren = prev_q_ren_[eye_index];
-    if (qdot(prev_now, q_now) < 0.0f) qneg(q_now);
-    if (render_pose_valid && qdot(prev_ren, q_ren) < 0.0f) qneg(q_ren);
-    // Additionally make q_ren live on the same sheet as q_now so the
-    // conjugate-product never crosses the cover.
-    if (render_pose_valid) {
-        const float d = q_ren.x*q_now.x + q_ren.y*q_now.y +
-                        q_ren.z*q_now.z + q_ren.w*q_now.w;
-        if (d < 0.0f) qneg(q_ren);
-    }
-
-    // Compute frame-to-frame and pair(ren,now) BEFORE updating prev_*, then
-    // store extremes (min dot = max angular delta) over the 1Hz window so the
-    // log captures motion peaks instead of whatever sample the throttle picks.
-    const float d_now_frame = qdot(prev_q_now_[eye_index], q_now);
-    const float d_ren_frame = qdot(prev_q_ren_[eye_index], q_ren);
-    const float d_pair_frame = q_ren.x*q_now.x + q_ren.y*q_now.y +
-                                q_ren.z*q_now.z + q_ren.w*q_now.w;
-
-    prev_q_now_[eye_index][0] = q_now.x; prev_q_now_[eye_index][1] = q_now.y;
-    prev_q_now_[eye_index][2] = q_now.z; prev_q_now_[eye_index][3] = q_now.w;
-    if (render_pose_valid) {
-        prev_q_ren_[eye_index][0] = q_ren.x; prev_q_ren_[eye_index][1] = q_ren.y;
-        prev_q_ren_[eye_index][2] = q_ren.z; prev_q_ren_[eye_index][3] = q_ren.w;
-    }
-
-    if (eye_index == 0) {
-        // Track minimum dot (= maximum angular delta) within the 1Hz window
-        // for each metric so we don't miss motion peaks. Reset on log emit.
-        if (d_now_frame  < min_d_now_window_)  min_d_now_window_  = d_now_frame;
-        if (d_ren_frame  < min_d_ren_window_)  min_d_ren_window_  = d_ren_frame;
-        if (d_pair_frame < min_d_pair_window_) min_d_pair_window_ = d_pair_frame;
-        const uint64_t t = now_ns_steady();
-        if (t - last_quat_dbg_ns_ > 1'000'000'000ull) {
-            last_quat_dbg_ns_ = t;
-            // Convert min-dot to peak angle (degrees) so sub-degree motion is
-            // still readable. angle = 2 * acos(|dot|).
-            auto dot_to_deg = [](float d) {
-                if (d > 1.0f) d = 1.0f; if (d < -1.0f) d = -1.0f;
-                return 2.0f * std::acos(std::fabs(d)) * 57.2957795f;
-            };
-            LOGI("[QUAT-DEBUG] window peak: dq_now=%.3f° dq_ren=%.3f° "
-                 "Δq_pair=%.3f° (min_dot pair=%.6f) valid=%d",
-                 dot_to_deg(min_d_now_window_),
-                 dot_to_deg(min_d_ren_window_),
-                 dot_to_deg(min_d_pair_window_),
-                 min_d_pair_window_,
-                 (int)render_pose_valid);
-            min_d_now_window_  = 1.0f;
-            min_d_ren_window_  = 1.0f;
-            min_d_pair_window_ = 1.0f;
-        }
-    }
-
-    if (render_pose_valid) {
-        Quat dq = quat_mul(quat_conjugate(quat_normalize(q_ren)),
-                           quat_normalize(q_now));
-        quat_to_mat3_rowmajor(dq, warp.r_delta_inv);
-    } else {
-        // Identity row-major.
-        warp.r_delta_inv[0] = warp.r_delta_inv[4] = warp.r_delta_inv[8] = 1.0f;
-        warp.r_delta_inv[1] = warp.r_delta_inv[2] = warp.r_delta_inv[3] = 0.0f;
-        warp.r_delta_inv[5] = warp.r_delta_inv[6] = warp.r_delta_inv[7] = 0.0f;
-    }
-
-    if (debug_atw_ && eye_index == 0) {
-        const uint64_t t = now_ns_steady();
-        if (t - last_debug_log_ns_ > 1'000'000'000ull) {
-            last_debug_log_ns_ = t;
-            // Δq norm relative to identity == |sin(theta/2)| ≈ theta/2 (rad)
-            // for small angles. Useful sanity number to confirm the warp is
-            // actually responsive to head motion.
-            Quat dq_dbg = quat_mul(quat_conjugate(quat_normalize(q_ren)),
-                                   quat_normalize(q_now));
-            const float vec_norm = std::sqrt(dq_dbg.x*dq_dbg.x +
-                                             dq_dbg.y*dq_dbg.y +
-                                             dq_dbg.z*dq_dbg.z);
-            LOGI("ATW eye0 fov_now(L=%.3f R=%.3f U=%.3f D=%.3f) "
-                 "fov_render_present=%d |sin(theta/2)|=%.4f render_pose_valid=%d",
-                 warp.fov_now.angleLeft, warp.fov_now.angleRight,
-                 warp.fov_now.angleUp, warp.fov_now.angleDown,
-                 (int)have_render_fov, vec_norm, (int)render_pose_valid);
-        }
-    }
+    warp.r_delta_inv[0] = warp.r_delta_inv[4] = warp.r_delta_inv[8] = 1.0f;
+    warp.r_delta_inv[1] = warp.r_delta_inv[2] = warp.r_delta_inv[3] = 0.0f;
+    warp.r_delta_inv[5] = warp.r_delta_inv[6] = warp.r_delta_inv[7] = 0.0f;
+    // Pick any consistent fov — with R_delta_inv = I and fov_now == fov_render
+    // the math reduces to ur = (vNdc.x+1)/2, vr = (vNdc.y+1)/2 regardless of
+    // the actual angle values. Use a neutral non-zero value to avoid
+    // tan(0)=0 division degeneracies at the shader edges.
+    const EyeBlit::Fov neutral{ -1.0f, 1.0f, 1.0f, -1.0f };
+    warp.fov_now = neutral;
+    warp.fov_render = neutral;
 
     blit_.blit(current_texture_, eye_index, warp);
 
@@ -361,14 +234,19 @@ bool Compositor::render_eye(int eye_index) {
 bool Compositor::build_projection_layer(OpenXrSession& xr,
                                         XrCompositionLayerProjection& out,
                                         std::array<XrCompositionLayerProjectionView, 2>& views) {
-    // Why: we deliberately do NOT gate on has_frame_. If the layer is
-    // skipped on frames where no fresh remote texture has arrived yet, the
-    // OS compositor draws no layer and the user sees the empty world —
-    // which is exactly the "void during head rotation" symptom. As long
-    // as we have valid swapchains we always submit the layer; render_eye
-    // re-uses the last bound texture (current_texture_) and applies
-    // identity ATW when the render pose is not yet valid, producing a
-    // continuous image that follows the head.
+    // Why: stereo XrCompositionLayerProjection in stage_space, with each
+    // eye's pose+fov set to the render-time values shipped by the Mac in
+    // VideoFragmentHeader. This is what tells Meta's compositor "this
+    // swapchain was rasterized FROM this eye-pose with this fov" — it then
+    // performs per-pixel scan-out timewarp against the present-time head
+    // pose. Mac renders with a +12° margin on every side (see
+    // runtime-macos/src/session.cpp); that margin is the OS's reprojection
+    // headroom for fast head rotation between render and display.
+    //
+    // We deliberately do NOT gate on has_frame_: render_eye reuses the last
+    // bound texture so the layer keeps presenting smoothly between Mac
+    // frames. Submitting consistently each vsync also gives the OS a stable
+    // history to time-warp against.
     if (eyes_[0].handle == XR_NULL_HANDLE || eyes_[1].handle == XR_NULL_HANDLE)
         return false;
     if (current_texture_ == 0) return false;
@@ -377,65 +255,30 @@ bool Compositor::build_projection_layer(OpenXrSession& xr,
 
     const auto& snap = xr.last_views();
 
-    // [DRIFT-DIAG #2 + #3] Compare the pose we're about to submit as the
-    // projection-layer pose (snap = sampled at begin_frame from
-    // xrLocateViews(predictedDisplayTime)) against a fresh xrLocateViews()
-    // taken right now, just before xrEndFrame. If snap drifts in stage_space
-    // while head is held still, or differs significantly from the fresh
-    // locate, we know the layer is being placed at a stale eye pose — that's
-    // the "2D plane drifts then snaps back" symptom.
-    {
-        static uint64_t last_log_ns = 0;
-        const uint64_t t_now_ns = now_ns_steady();
-        if (t_now_ns - last_log_ns > 1'000'000'000ull) {
-            last_log_ns = t_now_ns;
-            XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
-            vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-            vli.displayTime = xr.predicted_display_time();
-            vli.space = xr.stage_space();
-            XrViewState vs{XR_TYPE_VIEW_STATE};
-            uint32_t out_count = 0;
-            XrView fresh[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-            XrResult lr = xrLocateViews(xr.session(), &vli, &vs, 2,
-                                         &out_count, fresh);
-            const auto& sp = snap[0].pose;
-            const float dpx = (lr == XR_SUCCESS && out_count == 2)
-                ? (fresh[0].pose.position.x - sp.position.x) : 0.0f;
-            const float dpy = (lr == XR_SUCCESS && out_count == 2)
-                ? (fresh[0].pose.position.y - sp.position.y) : 0.0f;
-            const float dpz = (lr == XR_SUCCESS && out_count == 2)
-                ? (fresh[0].pose.position.z - sp.position.z) : 0.0f;
-            const float dq_dot = (lr == XR_SUCCESS && out_count == 2)
-                ? (fresh[0].pose.orientation.x * sp.orientation.x +
-                   fresh[0].pose.orientation.y * sp.orientation.y +
-                   fresh[0].pose.orientation.z * sp.orientation.z +
-                   fresh[0].pose.orientation.w * sp.orientation.w)
-                : 1.0f;
-            float dq_abs = dq_dot < 0 ? -dq_dot : dq_dot;
-            if (dq_abs > 1.0f) dq_abs = 1.0f;
-            const float dq_deg = 2.0f * std::acos(dq_abs) * 57.2957795f;
-            // #2: layer pose we're about to submit (raw stage_space coords)
-            // #3: delta vs fresh xrLocateViews at the same predictedDisplayTime
-            LOGI("[DRIFT #2/#3] layer_pose eye0 stage=(%.3f,%.3f,%.3f) "
-                 "ornW=%.3f | fresh-vs-snap dpos=(%.4f,%.4f,%.4f)m "
-                 "dorn=%.3f° lr=%d viewFlags=0x%x",
-                 sp.position.x, sp.position.y, sp.position.z, sp.orientation.w,
-                 dpx, dpy, dpz, dq_deg, (int)lr, (unsigned)vs.viewStateFlags);
-        }
-    }
-
-    // World-locked projection layer in stage_space. The Meta Horizon OS
-    // compositor automatically applies vsync timewarp to projection layers,
-    // re-projecting per-pixel to the current head pose at scan-out time.
-    // Combined with the always-submit policy above (no `!has_frame_` skip),
-    // the user no longer sees any void during head rotation: even if no
-    // fresh remote frame has arrived, the previous texture is reprojected
-    // and remains visible. The stereo perspective is preserved naturally
-    // because we use XrCompositionLayerProjection (not synthetic quads).
     for (int i = 0; i < 2; ++i) {
+        const PlainViewState& rv = (i == 0) ? rendered_left_ : rendered_right_;
+        // Use the render-time pose if it's valid; otherwise fall back to the
+        // current-frame xrLocateViews pose so the very first frames before
+        // a Mac frame arrives still place the layer somewhere reasonable.
+        const bool render_pose_valid = (rv.pose.ow != 1.0f) || (rv.pose.ox != 0.0f) ||
+                                       (rv.pose.oy != 0.0f) || (rv.pose.oz != 0.0f);
+        const bool render_fov_valid = (rv.fov.angleLeft != 0.0f) || (rv.fov.angleRight != 0.0f);
+
         views[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-        views[i].pose = snap[i].pose;
-        views[i].fov  = snap[i].fov;
+        if (render_pose_valid) {
+            views[i].pose.position = { rv.pose.px, rv.pose.py, rv.pose.pz };
+            views[i].pose.orientation = { rv.pose.ox, rv.pose.oy, rv.pose.oz, rv.pose.ow };
+        } else {
+            views[i].pose = snap[i].pose;
+        }
+        if (render_fov_valid) {
+            views[i].fov.angleLeft  = rv.fov.angleLeft;
+            views[i].fov.angleRight = rv.fov.angleRight;
+            views[i].fov.angleUp    = rv.fov.angleUp;
+            views[i].fov.angleDown  = rv.fov.angleDown;
+        } else {
+            views[i].fov = snap[i].fov;
+        }
         views[i].subImage.swapchain = eyes_[i].handle;
         views[i].subImage.imageRect.offset = {0, 0};
         views[i].subImage.imageRect.extent.width = eyes_[i].width;
@@ -451,31 +294,28 @@ bool Compositor::build_projection_layer(OpenXrSession& xr,
 
 bool Compositor::build_head_locked_quads(OpenXrSession& xr,
                                          std::array<XrCompositionLayerQuad, 2>& quads) {
-    // Why: Meta Quest's compositor does not respect XR_REFERENCE_SPACE_TYPE_VIEW
-    // on projection layers (verified via [HEAD-LOCK] diagnostics). Quad layers,
-    // however, are correctly rigidly attached when their space is view_space.
-    // We render the same ATW-corrected per-eye textures into the existing
-    // per-eye swapchains, then expose each one as a head-locked quad.
+    // Why: anchoring the per-eye quads in view_space delegates head-locking
+    // to the OpenXR runtime — the layer pose is evaluated against view_space
+    // (the live head-tracked frame) at scan-out, so the rectangle stays
+    // rigidly glued to the lenses regardless of whether new video frames
+    // are arriving from the Mac. The texture is blitted 1:1 by render_eye
+    // (identity warp); the in-rectangle scene rotates with the head with
+    // ~pipeline-latency lag, which the user accepts as the lesser evil
+    // versus rectangle drift.
+    //
+    // Per-eye geometry (matches the asymmetric Quest FOV exactly):
+    //   eye_pos_in_view = (±IPD/2, 0, 0)             (xrLocateViews(view_space))
+    //   quad_center     = eye_pos + (cx, cy, -depth)
+    //   cx              = depth * (tan(R) + tan(L)) / 2
+    //   cy              = depth * (tan(U) + tan(D)) / 2
+    //   quad_w          = depth * (tan(R) - tan(L))
+    //   quad_h          = depth * (tan(U) - tan(D))
     if (eyes_[0].handle == XR_NULL_HANDLE || eyes_[1].handle == XR_NULL_HANDLE)
         return false;
     if (current_texture_ == 0) return false;
 
     if (!render_eye(0) || !render_eye(1)) return false;
 
-    // Quad geometry. The Mac rendered each eye texture from a virtual camera
-    // offset by IPD/2 from the head center, looking forward, with the eye's
-    // intrinsic (asymmetric) FOV. To preserve correct stereo when displaying
-    // these textures as quads, each quad must be placed DIRECTLY IN FRONT of
-    // the corresponding eye (not at the head center) and sized/centered to
-    // match the per-eye FOV exactly. Otherwise the brain receives mismatched
-    // disparities and the eyes diverge / cross.
-    //
-    //   eye_pos_in_view = (±IPD/2, 0, 0)            (from xrLocateViews(view_space))
-    //   quad_center     = eye_pos + (offset_x, offset_y, -depth)
-    //   offset_x        = depth * (tan(R) + tan(L)) / 2     (asymmetric center)
-    //   offset_y        = depth * (tan(U) + tan(D)) / 2
-    //   quad_w          = depth * (tan(R) - tan(L))
-    //   quad_h          = depth * (tan(U) - tan(D))
     constexpr float kDepth = 1.0f;
     const auto& snap = xr.last_views();
     const auto& snap_view = xr.last_views_view();
@@ -491,7 +331,6 @@ bool Compositor::build_head_locked_quads(OpenXrSession& xr,
         const float cx = kDepth * (tanR + tanL) * 0.5f;
         const float cy = kDepth * (tanU + tanD) * 0.5f;
 
-        // Eye position in view_space (IPD offset, identity rotation).
         const float eye_x = snap_view[i].pose.position.x;
         const float eye_y = snap_view[i].pose.position.y;
         const float eye_z = snap_view[i].pose.position.z;
@@ -508,19 +347,6 @@ bool Compositor::build_head_locked_quads(OpenXrSession& xr,
         quads[i].subImage.imageRect.extent.width  = eyes_[i].width;
         quads[i].subImage.imageRect.extent.height = eyes_[i].height;
         quads[i].subImage.imageArrayIndex = 0;
-    }
-    {
-        static uint64_t last_log_ns3 = 0;
-        const uint64_t t_now_ns = now_ns_steady();
-        if (t_now_ns - last_log_ns3 > 1'000'000'000ull) {
-            last_log_ns3 = t_now_ns;
-            LOGI("[QUAD-GEOM] L pos=(%.3f,%.3f,%.3f) size=(%.3f,%.3f) | "
-                 "R pos=(%.3f,%.3f,%.3f) size=(%.3f,%.3f)",
-                 quads[0].pose.position.x, quads[0].pose.position.y,
-                 quads[0].pose.position.z, quads[0].size.width, quads[0].size.height,
-                 quads[1].pose.position.x, quads[1].pose.position.y,
-                 quads[1].pose.position.z, quads[1].size.width, quads[1].size.height);
-        }
     }
     return true;
 }

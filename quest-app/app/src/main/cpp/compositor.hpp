@@ -42,19 +42,19 @@ public:
     // Bind decoded AHardwareBuffer as GL texture for the next frame.
     void submit_frame(const DecodedFrame& frame);
 
-    // Acquire/render/release per-eye swapchain images and fill projection
-    // views referencing them. Returns false if no decoded frame is ready.
+    // Acquire/render/release per-eye swapchain images and fill a stereo
+    // projection layer in stage_space. Kept as a fallback path / future
+    // option; the active end_frame submits head-locked quads instead.
     bool build_projection_layer(OpenXrSession& xr,
                                 XrCompositionLayerProjection& out,
                                 std::array<XrCompositionLayerProjectionView, 2>& views);
 
-    // Head-locked dual-quad path. Meta Quest's compositor ignores
-    // `space = view_space` on XrCompositionLayerProjection (the projection
-    // layer behaves as if world-locked, with the well-known "plane stays in
-    // world then snaps to eyes" symptom during head rotation). For quad
-    // layers, view_space IS honored — so we render the same ATW-corrected
-    // per-eye textures and submit them as two quads (eyeVisibility LEFT/RIGHT)
-    // anchored to view_space. Returns false if no decoded frame is ready.
+    // Head-locked stereo dual-quad path. Two XrCompositionLayerQuad layers
+    // anchored in view_space, one per eye (eyeVisibility LEFT/RIGHT), sized
+    // to each eye's asymmetric FOV at 1m depth. Fills `quads[0]` for the
+    // left eye and `quads[1]` for the right; both reference the matching
+    // per-eye swapchain rendered by render_eye(). Returns false if
+    // swapchains aren't ready or no decoded texture is bound yet.
     bool build_head_locked_quads(OpenXrSession& xr,
                                  std::array<XrCompositionLayerQuad, 2>& quads);
 
@@ -80,27 +80,11 @@ private:
     GLuint current_texture_{0};
     bool has_frame_{false};
 
-    // Pose used by the Mac to render the currently-bound texture. Compositor
-    // pairs this with xrLocateViews now-pose to compute the ATW Δq.
+    // Pose + fov used by the Mac to render the currently-bound texture.
+    // Stamped onto the projection layer so the OS compositor knows where
+    // the swapchain was rasterized from and can timewarp at scan-out.
     PlainViewState rendered_left_{};
     PlainViewState rendered_right_{};
-
-    // Throttled debug logging (FUVR_QUEST_DEBUG).
-    bool debug_atw_{false};
-    uint64_t last_debug_log_ns_{0};
-
-    // QUAT-FIX: previous-frame canonical orientations, kept per eye, used to
-    // pin q_now and q_render onto the same sign sheet across the antipodal
-    // double cover. Initialized to identity (w=1) so first-frame dot >= 0.
-    float prev_q_now_[2][4]{{0,0,0,1},{0,0,0,1}};
-    float prev_q_ren_[2][4]{{0,0,0,1},{0,0,0,1}};
-    uint64_t last_quat_dbg_ns_{0};
-    // Per-1Hz-window minimum dot products (= maximum angular deltas). Reset
-    // each time the QUAT-DEBUG line fires so we capture motion peaks instead
-    // of whatever single frame the throttle happens to hit.
-    float min_d_now_window_{1.0f};
-    float min_d_ren_window_{1.0f};
-    float min_d_pair_window_{1.0f};
 
     EyeBlit blit_;
 };

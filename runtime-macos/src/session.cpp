@@ -546,41 +546,32 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
     out.angleDown = -kVert;
     return out;
   };
-  // Why: Blender renders only what we report through xrLocateViews fov, but
-  // the Quest's ATW must reproject during head motion that happens between
-  // render-time and display-time. If render fov == headset fov, fast turns
-  // make ATW sample outside the rendered region → black wedge ("see the
-  // screen edge"). Overscan: enlarge each angle by ~25% so the rendered
-  // texture has slack on every side. The wider fov gets stamped into the
-  // wire VideoFragmentHeader so the Quest shader knows the real fov_render
-  // and produces a correct, slack-having warp. Tunable via env var.
-  // Overscan disabled by default (1.0) until validated. With the wire-fov
-  // plumbing now active, the Quest's ATW shader uses fov_render correctly,
-  // so the right approach is moderate overscan (1.05-1.10). Aggressive values
-  // (1.25+) blow tan(angleLeft) past sane limits and Blender's projection
-  // becomes degenerate. Tunable via FUVR_RT_FOV_OVERSCAN env var.
-  static const float kOverscan = []() {
-    if (const char* env = std::getenv("FUVR_RT_FOV_OVERSCAN")) {
+  // Why: the Quest now drives a stereo XrCompositionLayerProjection straight
+  // off this rendered swapchain, with views[i].pose = the render-time eye pose
+  // and views[i].fov = this rendered fov. The OS compositor performs scan-out
+  // timewarp using the +margin region; whatever margin we ship here is the
+  // headroom the OS has to reproject during head motion between render-time
+  // and display-time. Add a fixed ~12° on each of the four sides (additive,
+  // not multiplicative — multiplicative blew tan() near the asymmetric
+  // outer edge). Sign convention matches XrFovf: left/down are negative,
+  // right/up positive, so margin pushes left/down more negative and
+  // right/up more positive. Tunable via FUVR_RT_FOV_MARGIN_DEG env var.
+  static const float kMarginRad = []() {
+    float deg = 12.0f;
+    if (const char* env = std::getenv("FUVR_RT_FOV_MARGIN_DEG")) {
       float v = static_cast<float>(std::strtof(env, nullptr));
-      if (v >= 1.0f && v <= 1.5f) return v;
+      if (v >= 0.0f && v <= 30.0f) deg = v;
     }
-    // Phase C iteration 2: with lookahead=50ms Δq peaks dropped from 69° to
-    // ~5-6°, but a persistent ~5° offset during stillness still drove the
-    // rendered viewport's edge into the user's view. 1.30× overscan gives
-    // ATW ~19° headroom on each side — covers any residual pipeline mismatch
-    // plus aggressive head motion (200°/s × 50ms = 10°) without ever showing
-    // the wedge. Marginal Blender rendering cost (30% more pixels per eye)
-    // is acceptable on M3 Pro at 90 Hz.
-    return 1.30f;
+    return deg * 0.017453292519943295f;
   }();
   for (uint32_t i = 0; i < 2; ++i) {
     views[i].type = XR_TYPE_VIEW;
     views[i].next = nullptr;
     XrFovf fov = pickFov(static_cast<int>(i));
-    fov.angleLeft  *= kOverscan;
-    fov.angleRight *= kOverscan;
-    fov.angleUp    *= kOverscan;
-    fov.angleDown  *= kOverscan;
+    fov.angleLeft  -= kMarginRad;
+    fov.angleRight += kMarginRad;
+    fov.angleUp    += kMarginRad;
+    fov.angleDown  -= kMarginRad;
     views[i].fov = fov;
     Fov& cache = (i == 0) ? s->lastRenderedLeftFov : s->lastRenderedRightFov;
     cache.angleLeft  = fov.angleLeft;
