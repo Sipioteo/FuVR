@@ -57,6 +57,25 @@ enum Cmd {
         #[arg(long, default_value_t = 5)]
         timeout: u64,
     },
+    /// Listen on TCP 9943 and stream a pre-encoded HEVC Annex-B file to
+    /// the connected Quest as a debug test pattern. Loops the file forever.
+    FeedQuest {
+        /// Path to the HEVC Annex-B file (e.g. produced by fuvr-encode-synthetic).
+        #[arg(long)]
+        hevc: String,
+        /// Total stereo frame width.
+        #[arg(long, default_value_t = 4128)]
+        width: u32,
+        /// Per-eye frame height.
+        #[arg(long, default_value_t = 2208)]
+        height: u32,
+        /// Refresh rate (fps pacing).
+        #[arg(long, default_value_t = 90)]
+        fps: u32,
+        /// Bitrate to advertise in helloFromMac.
+        #[arg(long, default_value_t = 50_000_000)]
+        bitrate: u32,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -79,7 +98,169 @@ async fn main() -> Result<()> {
         Cmd::ClockSync { mode, pings } => clock_sync(mode, pings).await,
         Cmd::MdnsAdvertise { port, seconds } => mdns_advertise(port, seconds).await,
         Cmd::MdnsBrowse { timeout } => mdns_browse(timeout).await,
+        Cmd::FeedQuest { hevc, width, height, fps, bitrate } => {
+            feed_quest(hevc, width, height, fps, bitrate).await
+        }
     }
+}
+
+async fn feed_quest(
+    hevc_path: String,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+) -> Result<()> {
+    use ::capnp::message::{Builder, HeapAllocator};
+    use ::capnp::serialize_packed;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use transport_core::proto as wire;
+
+    let bytes = std::fs::read(&hevc_path).with_context(|| format!("reading {hevc_path}"))?;
+    let access_units = split_annexb(&bytes);
+    if access_units.is_empty() {
+        anyhow::bail!("no NAL units found in {hevc_path} (expected Annex-B)");
+    }
+    println!(
+        "loaded {} bytes from {hevc_path}, {} access units",
+        bytes.len(),
+        access_units.len()
+    );
+
+    // Why: the Quest connects out via the ADB-reverse tunnel (Quest → 127.0.0.1:9943
+    // → Mac:9943). UsbServer's adb-reverse spawn would conflict if `adb reverse`
+    // was already set up, so we use a raw TCP listener here and assume the user
+    // has already run `adb reverse tcp:9943 tcp:9943`.
+    let listener = TcpListener::bind(("127.0.0.1", DEFAULT_PORT)).await?;
+    println!("listening on 127.0.0.1:{DEFAULT_PORT} (run `adb reverse tcp:9943 tcp:9943` if not already)");
+
+    loop {
+        let (sock, peer) = listener.accept().await?;
+        println!("Quest connected from {peer}");
+        let (mut rd, mut wr) = sock.into_split();
+
+        // Drain anything from the Quest in the background (helloFromQuest, q-metrics, pose).
+        let drain = tokio::spawn(async move {
+            let mut buf = [0u8; 65536];
+            loop {
+                use tokio::io::AsyncReadExt;
+                match rd.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        // Send helloFromMac with negotiated session config.
+        let mut hello = Builder::<HeapAllocator>::new_default();
+        {
+            let mut ctrl = hello.init_root::<wire::control_message::Builder>();
+            let mut sc = ctrl.reborrow().init_hello_from_mac();
+            sc.set_per_eye_width(width / 2);
+            sc.set_per_eye_height(height);
+            sc.set_refresh_rate_hz(fps);
+            sc.set_video_codec(wire::VideoCodec::Hevc);
+            sc.set_video_bitrate_bps(bitrate);
+            sc.set_audio_enabled(false);
+        }
+        let mut hello_bytes = Vec::new();
+        serialize_packed::write_message(&mut hello_bytes, &hello)?;
+        let hello_frame = transport_core::wire::encode_usb_frame(
+            transport_core::channel::Channel::Control as u8,
+            &hello_bytes,
+        );
+        wr.write_all(&hello_frame).await?;
+        println!("sent helloFromMac (codec=HEVC {width}x{height} @ {fps}Hz {} Mbps)",
+                 bitrate / 1_000_000);
+
+        // Stream the access units in a loop, paced at fps.
+        let frame_period = Duration::from_micros(1_000_000 / fps as u64);
+        let mut frame_id: u64 = 0;
+        let mut next_deadline = Instant::now();
+
+        'outer: loop {
+            for au in &access_units {
+                let mut fb = Builder::<HeapAllocator>::new_default();
+                {
+                    let mut hdr = fb.init_root::<wire::video_fragment_header::Builder>();
+                    hdr.set_frame_id(frame_id);
+                    hdr.set_render_start_ns(now_ns());
+                    hdr.set_total_size_bytes(au.len() as u32);
+                    hdr.set_fragment_index(0);
+                    hdr.set_fragment_count(1);
+                    hdr.set_codec(wire::VideoCodec::Hevc);
+                    hdr.set_flags(0x2 | (if frame_id < 4 { 0x1 } else { 0 })); // EndOfFrame, IDR for first few
+                    hdr.set_target_display_time_ns(0);
+                }
+                let mut hdr_bytes = Vec::new();
+                serialize_packed::write_message(&mut hdr_bytes, &fb)?;
+
+                // Payload = [packed VideoFragmentHeader][raw NAL bytes].
+                let mut payload = Vec::with_capacity(hdr_bytes.len() + au.len());
+                payload.extend_from_slice(&hdr_bytes);
+                payload.extend_from_slice(au);
+
+                let frame = transport_core::wire::encode_usb_frame(
+                    transport_core::channel::Channel::Video as u8,
+                    &payload,
+                );
+                if wr.write_all(&frame).await.is_err() {
+                    println!("write failed; peer disconnected");
+                    break 'outer;
+                }
+
+                frame_id += 1;
+                next_deadline += frame_period;
+                let now = Instant::now();
+                if next_deadline > now {
+                    tokio::time::sleep(next_deadline - now).await;
+                } else {
+                    next_deadline = now;
+                }
+
+                if frame_id % (fps as u64) == 0 {
+                    println!("sent {frame_id} frames");
+                }
+            }
+        }
+
+        let _ = drain.await;
+        println!("Quest disconnected; waiting for next connection...");
+    }
+}
+
+fn split_annexb(buf: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let starts = |b: &[u8], i: usize| {
+        (i + 4 <= b.len() && &b[i..i + 4] == [0u8, 0, 0, 1])
+            || (i + 3 <= b.len() && &b[i..i + 3] == [0u8, 0, 1])
+    };
+    while i + 3 <= buf.len() {
+        if starts(buf, i) {
+            if i > start {
+                out.push(&buf[start..i]);
+            }
+            start = i;
+            i += if buf[i + 2] == 1 { 3 } else { 4 };
+        } else {
+            i += 1;
+        }
+    }
+    if start < buf.len() {
+        out.push(&buf[start..]);
+    }
+    out
+}
+
+fn now_ns() -> u64 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 async fn mdns_advertise(port: u16, seconds: u64) -> Result<()> {
