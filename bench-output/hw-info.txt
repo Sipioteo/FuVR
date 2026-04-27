@@ -1,20 +1,17 @@
-Last login: Mon Apr 27 09:39:06 on ttys000
-sipioteo@Mac ~ % adb devices
-List of devices attached
-2G0YC5ZH0G018Z	device
+## Run timestamp: 2026-04-27T08:55:28Z
 
-sipioteo@Mac ~ % system_profiler SPHardwareDataType | grep -E "(Model|Chip|Memory)"
-2026-04-27 10:40:35.201 system_profiler[10295:2666573] hw.cpufamily: 0x5f4dea93
-      Model Name: MacBook Pro
-      Model Identifier: Mac15,6
-      Model Number: Z1AU0045JT/A
-      Chip: Apple M3 Pro
-      Memory: 36 GB
-sipioteo@Mac ~ % adb shell getprop ro.product.model   
-Quest 3
-sipioteo@Mac ~ % adb shell getprop ro.build.version.release 
-14
-sipioteo@Mac ~ % adb shell getprop ro.build.version.incremental
-51154110174900520
-sipioteo@Mac ~ % 
+## Mac
+Model Name: MacBook Pro
+Chip: Apple M3 Pro
+Total Number of Cores: 12 (6 Performance and 6 Efficiency)
+Memory: 36 GB
+System Firmware Version: 18000.101.7
+macOS: 26.4 (25E246)
 
+## Quest
+model:    Quest 3
+device:   eureka
+build:    14
+incr:     51154110174900520
+sdk:      34
+fingerprint: oculus/eureka/eureka:14/UP1A.231005.007.A1/51154110174900520:user/release-keys

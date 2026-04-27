@@ -1,0 +1,6 @@
+## run 1
+encoded 256 frames in 3.79s (67.5 fps), fragments=259 csd=3 key=3
+## run 2
+encoded 256 frames in 3.82s (67.0 fps), fragments=259 csd=3 key=3
+## run 3
+encoded 256 frames in 3.78s (67.7 fps), fragments=259 csd=3 key=3

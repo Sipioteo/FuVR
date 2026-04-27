@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.22.1)
-project(fuvr_quest LANGUAGES CXX)
+project(fuvr_quest LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(ExternalProject)
 
-find_package(openxr_loader REQUIRED CONFIG)
+find_package(OpenXR REQUIRED CONFIG)
 
 # ---------------------------------------------------------------------------
 # Cap'n Proto runtime, built from source for arm64-v8a as part of the build.
@@ -28,6 +28,7 @@ ExternalProject_Add(capnproto_external
     CMAKE_ARGS
         -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
         -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+        -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
         -DANDROID_ABI=${ANDROID_ABI}
         -DANDROID_PLATFORM=${ANDROID_PLATFORM}
         -DANDROID_STL=${ANDROID_STL}
@@ -111,11 +112,15 @@ target_link_libraries(fuvr_quest PRIVATE
     mediandk
 )
 
+set(_FUVR_NDK_ROOT "${ANDROID_NDK}")
+if(NOT _FUVR_NDK_ROOT)
+    set(_FUVR_NDK_ROOT "${CMAKE_ANDROID_NDK}")
+endif()
 add_library(native_app_glue STATIC
-    ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c
+    ${_FUVR_NDK_ROOT}/sources/android/native_app_glue/android_native_app_glue.c
 )
 target_include_directories(fuvr_quest PRIVATE
-    ${ANDROID_NDK}/sources/android/native_app_glue
+    ${_FUVR_NDK_ROOT}/sources/android/native_app_glue
 )
 target_link_libraries(fuvr_quest PRIVATE native_app_glue)
 

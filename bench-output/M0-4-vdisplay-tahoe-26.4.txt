@@ -1,0 +1,15 @@
+# M0 spike #4 — CGVirtualDisplay on macOS 26.4
+
+## Hardware
+MacBook Pro M3 Pro, macOS 26.4 (Tahoe) build 25E246
+
+## Test
+Before spawn: `fuvr-vdisplay-helper --list` → 1 active display (built-in).
+Spawn 2064×2208 @ 90Hz: helper printed `display_id=6`.
+While helper alive: `--list` → 2 active displays (built-in + #6).
+After kill: `--list` → 1 active display.
+
+## Verdict
+PASS — CGVirtualDisplay private API still works on macOS Tahoe 26.4.
+SPEC §6 risk "Apple breaks CGVirtualDisplay in macOS 27+" not yet realised.
+M4/M5 6720-pixel pipe-0 quirk not exercised here (M3 Pro).
