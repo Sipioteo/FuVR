@@ -1,63 +1,146 @@
-# FuVR — Open-Source PCVR Streaming for macOS
+<div align="center">
+  <img src="docs/cover.png" alt="FuVR" width="100%">
 
-Stream VR content from an Apple Silicon Mac to a Meta Quest headset over USB-C
-or Wi-Fi, with bidirectional pose, controller and (optionally) hand-tracking
-data flowing back. Designed from the ground up for macOS — no SteamVR, no
-Quest Link, no reverse engineering of Meta's proprietary protocol.
+  <br/>
 
-> **Status:** Pre-alpha. Active scaffolding. Nothing works end-to-end yet.
-> See [`SPEC.md`](SPEC.md) for the full architectural specification.
+  <h1>FuVR</h1>
+  <p><strong>Open-source PCVR streaming from Apple Silicon to Meta Quest.</strong><br/>
+  No SteamVR. No Quest Link. No reverse engineering.</p>
+
+  <p>
+    <img src="https://img.shields.io/badge/platform-macOS%2014%2B-black?style=flat-square&logo=apple" alt="macOS 14+"/>
+    <img src="https://img.shields.io/badge/headset-Quest%202%20%7C%203%20%7C%20Pro-5c5cff?style=flat-square" alt="Quest"/>
+    <img src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square" alt="Status"/>
+    <img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square" alt="License"/>
+  </p>
+</div>
+
+---
+
+FuVR lets an Apple Silicon Mac render VR content and stream it to a Meta Quest headset over USB-C or Wi-Fi, with head pose, controller input, and optional hand tracking flowing back in real time. The entire stack — OpenXR runtime, encoder, transport, and Quest client — is built from scratch for macOS, where neither SteamVR nor Quest Link exist.
+
+> **Current state:** Pre-alpha. The build system, wire protocol, and component skeletons are in place and all tests pass. Nothing streams a frame to a headset yet. See [`docs/STATUS.md`](docs/STATUS.md) for the detailed picture.
+
+---
+
+## How it works
+
+```
+  Apple Silicon Mac
+  ┌─────────────────────────────────────────────────────────┐
+  │                                                         │
+  │   XR App  ──▶  OpenXR Runtime  ──▶  VideoToolbox       │
+  │  (Blender,     (custom dylib)        HEVC / H.264       │
+  │   Godot,            │                    │              │
+  │   Unity…)           │ pose + input        │ encoded frames│
+  │                     ▼                    ▼              │
+  │              fuvrd daemon  ◀────────────────────────    │
+  │              (Cap'n Proto RPC)                          │
+  │                     │                                   │
+  │              Rust transport  ──▶  USB-C / Wi-Fi 6       │
+  └─────────────────────────────────────────────────────────┘
+                              │
+  ┌─────────────────────────────────────────────────────────┐
+  │  Meta Quest                                             │
+  │                                                         │
+  │   Transport receiver  ──▶  MediaCodec  ──▶  OpenXR     │
+  │                                            compositor   │
+  │   Pose forwarder (1 kHz)  ──────────────────────────▶  │
+  └─────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Repository layout
 
-| Path | Component | Language |
+| Path | What it does | Language |
 |---|---|---|
-| `proto/` | Cap'n Proto schemas, the source of truth for the wire format | Cap'n Proto |
-| `runtime-macos/` | OpenXR 1.1 runtime for macOS (registers as `active_runtime.json`) | C++20 |
-| `encoder-macos/` | VideoToolbox HEVC/H.264 low-latency encoder wrapper | C++ / Obj-C++ |
-| `transport/` | Reusable transport layer (USB/ADB tunnel + UDP + FEC) | Rust |
-| `virtual-display-helper/` | Subprocess helper for `CGVirtualDisplay` (phase 2) | Obj-C++ |
-| `mac-app/` | SwiftUI control surface, settings, status, log viewer | Swift |
-| `quest-app/` | Android NDK client: receiver, decoder, OpenXR compositor | C++ NDK + Kotlin |
-| `docs/` | Architecture notes, ADRs, build instructions | Markdown |
-| `scripts/` | Build / dev / packaging scripts | Bash |
+| `proto/` | Cap'n Proto wire schemas — the frozen source of truth | Cap'n Proto |
+| `runtime-macos/` | OpenXR 1.1 runtime, registered as `active_runtime.json` | C++20 |
+| `encoder-macos/` | VideoToolbox HEVC / H.264 low-latency encoder wrapper | C++ / Obj-C++ |
+| `transport/` | USB (ADB tunnel) + UDP + Reed-Solomon FEC transport | Rust |
+| `daemon/` | Host-side coordinator: encoder + transport bridge, pose router, metrics | C++ |
+| `quest-app/` | Android NDK client — receiver, MediaCodec decoder, OpenXR compositor | C++ NDK |
+| `mac-app/` | SwiftUI control surface — settings, status, log viewer | Swift |
+| `virtual-display-helper/` | `CGVirtualDisplay` subprocess for phase 2 extended-display mode | Obj-C++ |
+| `docs/` | Architecture, ADRs, status | Markdown |
 
-## Build prerequisites
+---
 
-- macOS 14+ on Apple Silicon (M1 or newer; M2 Pro recommended)
-- Xcode 15+ command line tools
-- CMake 3.27+
-- Cap'n Proto compiler (`brew install capnp`)
-- Rust stable (`rustup default stable`)
-- Android NDK r26+ and Android SDK with API 33+ (for `quest-app`)
-- Cap'n Proto Java/Kotlin runtime is pulled by Gradle for the Quest side
+## Prerequisites
 
-## Building (current scaffolding)
+| Tool | Version |
+|---|---|
+| macOS | 14+ (Apple Silicon — M1 or newer) |
+| Xcode command line tools | 15+ |
+| CMake | 3.27+ |
+| Cap'n Proto | `brew install capnp` |
+| Rust | stable (`rustup default stable`) |
+| Android NDK | r26+ with API 33+ (for Quest app) |
+
+---
+
+## Build
 
 ```bash
-# generate protocol code for all targets
+# 1. Generate protocol bindings for all targets
 ./scripts/gen-proto.sh
 
-# build the macOS-side components
+# 2. macOS components (runtime, encoder, daemon)
 cmake -S . -B build -G Ninja
 cmake --build build
+ctest --test-dir build          # 11/11 tests expected to pass
 
-# build the Rust transport crate
+# 3. Rust transport layer
 cargo build --manifest-path transport/Cargo.toml
+cargo test --workspace
 
-# build the Quest app
-(cd quest-app && ./gradlew assembleDebug)
+# 4. SwiftUI control app
+swift build --package-path mac-app
+swift test --package-path mac-app
+
+# 5. Quest client (requires Android SDK + NDK)
+cd quest-app && ./gradlew assembleDebug
 ```
+
+---
+
+## Roadmap
+
+| Milestone | Description | State |
+|---|---|---|
+| **M0 — Spike** | Validate the four critical unknowns: ADB throughput, VideoToolbox latency, Quest 90 Hz decode, `CGVirtualDisplay` on macOS 14/15 | Tools ready, hardware runs pending |
+| **M1 — First Frame** | Full pipeline: Mac renders → encodes → transmits → Quest decodes and displays | Not started |
+| **M2 — Interactive** | Round-trip pose loop at <20 ms, controller input, stable 90 Hz | Not started |
+| **M3 — Usable** | App packaging, auto-discovery, bitrate adaptation, hand tracking | Not started |
+
+See [`SPEC.md`](SPEC.md) for the full architectural specification and milestone definitions.
+
+---
+
+## Architecture decisions
+
+Short ADR index — full documents in [`docs/adr/`](docs/adr/):
+
+| # | Decision |
+|---|---|
+| 0002 | OpenXR runtime runs in-process; a separate daemon owns the encoder and transport |
+| 0003 | Cap'n Proto for the Mac↔Quest wire; JSON for the local control plane |
+| 0004 | `CGVirtualDisplay` runs in a dedicated subprocess to isolate TCC interactions |
+| 0005 | Reed-Solomon FEC (10, 4), no ARQ — latency budget is too tight for retransmit |
+| 0006 | USB transport uses `adb reverse` over the ADB TCP tunnel |
+| 0007 | IOSurface handoff uses a parallel Mach service, not `SCM_RIGHTS` (fd-only on macOS) |
+
+---
+
+## Contributing
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request. The patent grant in the Apache 2.0 license is intentional and non-negotiable. By contributing you agree to the Apache ICLA.
+
+Issues, hardware test reports, and ADR proposals are all welcome — especially results from running the M0 spike tools on real Quest hardware.
+
+---
 
 ## License
 
-Apache License 2.0 — see [`LICENSE`](LICENSE). Contributions are accepted under
-the Apache ICLA. The patent grant is intentional and non-negotiable.
-
-## Status & roadmap
-
-See [`SPEC.md`](SPEC.md) §5 for the milestone plan. The current state of the
-tree corresponds to the very beginning of **M0 — Spike Plan**: scaffolding,
-build wiring, and protocol schema only. Nothing in this tree streams a frame
-yet, and most files are deliberately minimal stubs that compile but do not
-implement runtime behavior.
+Apache License 2.0 — see [`LICENSE`](LICENSE).
