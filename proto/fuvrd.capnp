@@ -143,6 +143,76 @@ struct PoseSnapshot {
   angVelX @20 :Float32;
   angVelY @21 :Float32;
   angVelZ @22 :Float32;
+
+  # Controller poses, added in pass 4. Cap'n Proto allows additive fields
+  # without rotating the schema id; older readers see the new fields as
+  # default zero, so daemon and runtime can be deployed independently.
+  leftControllerActive @23 :Bool;
+  leftControllerPosX  @24 :Float32;
+  leftControllerPosY  @25 :Float32;
+  leftControllerPosZ  @26 :Float32;
+  leftControllerRotX  @27 :Float32;
+  leftControllerRotY  @28 :Float32;
+  leftControllerRotZ  @29 :Float32;
+  leftControllerRotW  @30 :Float32;
+  leftControllerLinVelX @31 :Float32;
+  leftControllerLinVelY @32 :Float32;
+  leftControllerLinVelZ @33 :Float32;
+  leftControllerAngVelX @34 :Float32;
+  leftControllerAngVelY @35 :Float32;
+  leftControllerAngVelZ @36 :Float32;
+
+  rightControllerActive @37 :Bool;
+  rightControllerPosX  @38 :Float32;
+  rightControllerPosY  @39 :Float32;
+  rightControllerPosZ  @40 :Float32;
+  rightControllerRotX  @41 :Float32;
+  rightControllerRotY  @42 :Float32;
+  rightControllerRotZ  @43 :Float32;
+  rightControllerRotW  @44 :Float32;
+  rightControllerLinVelX @45 :Float32;
+  rightControllerLinVelY @46 :Float32;
+  rightControllerLinVelZ @47 :Float32;
+  rightControllerAngVelX @48 :Float32;
+  rightControllerAngVelY @49 :Float32;
+  rightControllerAngVelZ @50 :Float32;
+}
+
+# ---------------------------------------------------------------------------
+# Input snapshot delivery (daemon -> runtime), pass 4.
+#
+# The daemon parses `proto::TouchInputState` from each `UpstreamFrame.inputs`,
+# converts to this schema-friendly shape, and fans it out to subscribers of
+# the `streamInputs` stream. The runtime caches the latest snapshot and
+# answers `xrGetActionState{Boolean,Float,Vector2f}` from it.
+# ---------------------------------------------------------------------------
+
+struct StreamInputsRequest {
+  sessionId @0 :UInt64;
+}
+
+struct ControllerInput {
+  active           @0 :Bool;
+  trigger          @1 :Float32;
+  squeeze          @2 :Float32;
+  thumbstickX      @3 :Float32;
+  thumbstickY      @4 :Float32;
+  thumbstickClick  @5 :Bool;
+  thumbstickTouch  @6 :Bool;
+  triggerTouch     @7 :Bool;
+  buttonAClick     @8 :Bool;
+  buttonATouch     @9 :Bool;
+  buttonBClick    @10 :Bool;
+  buttonBTouch    @11 :Bool;
+  systemClick     @12 :Bool;
+  thumbrest       @13 :Float32;
+}
+
+struct InputSnapshot {
+  receivedAtNs   @0 :UInt64;
+  questClockNs   @1 :UInt64;
+  left           @2 :ControllerInput;
+  right          @3 :ControllerInput;
 }
 
 # ---------------------------------------------------------------------------
@@ -199,5 +269,11 @@ struct Envelope {
     pong              @14 :Void;
     ok                @15 :Void;
     error             @16 :Text;
+
+    # Pass 4 additions. Cap'n Proto allows growing a union; old readers
+    # decode unknown arms as `Envelope.Body.Which.UNKNOWN_` and skip.
+    streamInputs      @17 :StreamInputsRequest;
+    inputSnapshot     @18 :InputSnapshot;
+    streamEncodeStats @19 :Void;       # dedicated subscription, decoupled from streamMetrics
   }
 }
