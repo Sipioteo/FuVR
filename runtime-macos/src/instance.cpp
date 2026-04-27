@@ -336,10 +336,30 @@ XrResult xrEnumerateViewConfigurationViews_impl(
   // (2064x2208), Quest Pro, etc. Falls back to Quest 3 defaults if the
   // daemon hasn't seen a Quest yet.
   const auto& caps = tryRefreshDeviceCaps();
-  const uint32_t recW = (caps.valid && caps.perEyeWidth != 0)
+  uint32_t recW = (caps.valid && caps.perEyeWidth != 0)
                             ? caps.perEyeWidth : 2064u;
-  const uint32_t recH = (caps.valid && caps.perEyeHeight != 0)
+  uint32_t recH = (caps.valid && caps.perEyeHeight != 0)
                             ? caps.perEyeHeight : 2208u;
+  // FUVR_RT_RENDER_SCALE: optionally scale the per-eye render resolution
+  // Blender will use. Same env var read in session.cpp at session-start
+  // time; both call sites must agree so encoder dims match what Blender
+  // actually renders into. Default 1.0; clamp [0.25, 1.0]; round to
+  // even (HEVC/H.264 requirement).
+  const float renderScale = []() {
+    const char* env = std::getenv("FUVR_RT_RENDER_SCALE");
+    if (env == nullptr || *env == '\0') return 1.0f;
+    const float v = std::strtof(env, nullptr);
+    if (v < 0.25f || v > 1.0f) return 1.0f;
+    return v;
+  }();
+  if (renderScale < 0.999f) {
+    auto scaleEven = [renderScale](uint32_t v) {
+      uint32_t out = static_cast<uint32_t>(v * renderScale);
+      return (out + 1u) & ~1u;
+    };
+    recW = scaleEven(recW);
+    recH = scaleEven(recH);
+  }
   // TODO: Quest reports max separately via XrViewConfigurationView; thread
   // that through helloFromQuest. For now we expose recommended as max too.
   for (uint32_t i = 0; i < 2; ++i) {

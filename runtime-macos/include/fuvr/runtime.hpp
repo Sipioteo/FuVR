@@ -138,6 +138,17 @@ struct Session {
   // background renders or multi-frame queueing).
   Fov pendingLocateLeftFov{};
   Fov pendingLocateRightFov{};
+  // Same idea for pose: cache the per-eye pose xrLocateViews_impl just
+  // returned to Blender so xrEndFrame_impl can stamp the *exact* same
+  // pose into VideoFragmentHeader. Calling predictor.latest() a second
+  // time at end-frame would pick up samples that arrived during the
+  // render and stamp a newer pose than what Blender actually rendered
+  // with — the Quest's OS scan-out timewarp would then compute Δq
+  // against that newer pose, partially undoing the user's motion and
+  // making the streamed image trail the head visibly.
+  Pose pendingLocateLeftPose{};
+  Pose pendingLocateRightPose{};
+  bool pendingLocatePoseValid{false};
   void* metalDevice{nullptr};  // id<MTLDevice>, retained
   void* metalCommandQueue{nullptr};  // id<MTLCommandQueue> from KHR binding (NOT retained — owned by app)
   std::vector<std::unique_ptr<Space>> spaces;

@@ -172,6 +172,49 @@ std::optional<PoseSample> PosePredictor::latest() const noexcept {
   return at(size_ - 1);
 }
 
+std::optional<PoseSample> PosePredictor::smoothedLatest(
+    std::size_t window) const noexcept {
+  if (size_ == 0) return std::nullopt;
+  if (window == 0) window = 1;
+  if (window > size_) window = size_;
+  if (window == 1) return at(size_ - 1);
+
+  PoseSample out = at(size_ - 1);  // start from latest (keeps ts/fov/etc.)
+  // Quaternion mean by sign-aligned arithmetic average + renormalise.
+  // Within ~1e-4 of the true Karcher mean for nearby orientations —
+  // orders of magnitude below human-perceptible head jitter.
+  const Quat refL = out.leftEye.orientation;
+  const Quat refR = out.rightEye.orientation;
+  float lx = 0, ly = 0, lz = 0, lw = 0;
+  float rx = 0, ry = 0, rz = 0, rw = 0;
+  Vec3 lp{}, rp{};
+  for (std::size_t i = 0; i < window; ++i) {
+    const PoseSample& s = at(size_ - 1 - i);
+    lp.x += s.leftEye.position.x;
+    lp.y += s.leftEye.position.y;
+    lp.z += s.leftEye.position.z;
+    rp.x += s.rightEye.position.x;
+    rp.y += s.rightEye.position.y;
+    rp.z += s.rightEye.position.z;
+    const Quat& ql = s.leftEye.orientation;
+    const float dotL = ql.x*refL.x + ql.y*refL.y + ql.z*refL.z + ql.w*refL.w;
+    const float sl = (dotL < 0.0f) ? -1.0f : 1.0f;
+    lx += sl * ql.x; ly += sl * ql.y; lz += sl * ql.z; lw += sl * ql.w;
+    const Quat& qr = s.rightEye.orientation;
+    const float dotR = qr.x*refR.x + qr.y*refR.y + qr.z*refR.z + qr.w*refR.w;
+    const float sr = (dotR < 0.0f) ? -1.0f : 1.0f;
+    rx += sr * qr.x; ry += sr * qr.y; rz += sr * qr.z; rw += sr * qr.w;
+  }
+  const float inv = 1.0f / static_cast<float>(window);
+  out.leftEye.position  = {lp.x * inv, lp.y * inv, lp.z * inv};
+  out.rightEye.position = {rp.x * inv, rp.y * inv, rp.z * inv};
+  const float nl = std::sqrt(lx*lx + ly*ly + lz*lz + lw*lw);
+  if (nl > 1e-6f) out.leftEye.orientation  = {lx/nl, ly/nl, lz/nl, lw/nl};
+  const float nr = std::sqrt(rx*rx + ry*ry + rz*rz + rw*rw);
+  if (nr > 1e-6f) out.rightEye.orientation = {rx/nr, ry/nr, rz/nr, rw/nr};
+  return out;
+}
+
 std::optional<PoseSample> PosePredictor::predict(
     uint64_t displayTimeNs) const noexcept {
   if (size_ == 0) {

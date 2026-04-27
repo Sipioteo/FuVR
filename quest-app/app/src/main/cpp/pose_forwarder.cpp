@@ -83,28 +83,55 @@ void PoseForwarder::run() {
             // CLOCK_MONOTONIC sample-time path coupled into Δq, and gives
             // the Quest — which owns the IMU and the display clock —
             // ownership of the lookahead term end-to-end.
-            // No RTT lookahead. Earlier we biased t by an EWMA of the
-            // round-trip; in practice that double-predicts (xrWaitFrame's
-            // predictedDisplayTime is already a forward-extrapolated time
-            // from the Quest SDK) and the extra IMU integration just
-            // injects gyro noise into the rendered pose. With
-            // FUVR_RT_FOV_MARGIN_DEG=0 there is no OS scan-out overscan
-            // to hide that noise, so the user sees micro-shake at rest
-            // and judder during motion. Sample at t_predicted only and
-            // let the Quest OS compositor's scan-out timewarp absorb the
-            // pipeline lag using the rendered_pose echoed back in
-            // VideoFragmentHeader.
+            // Quest-side lookahead: sample at t_predicted + RTT so the
+            // pose Blender renders with corresponds to the time the
+            // frame will actually be displayed on the Quest after the
+            // pipeline round-trip. Without this the image visibly
+            // trails the head by the full pipeline latency (no margin =
+            // no OS scan-out reprojection headroom).
+            //
+            // Deadband: when the user holds still, the IMU still emits
+            // residual gyro noise; extrapolating that 30 ms forward
+            // turns it into micro-shake. Pre-locate at t_predicted to
+            // read |ω|; if below ~5 °/s, drop the lookahead and use
+            // t_predicted directly. (Mac no longer re-extrapolates —
+            // session.cpp uses predictor.latest() — so this is the
+            // only extrapolation in the chain and we can govern it
+            // tightly.)
             xr_.sync_actions();
             xr_.capture_local_origin_if_needed(t_predicted);
-            const XrTime t_target = t_predicted;
-            const XrTime t = t_target;
-            last_t_predicted = t_predicted;
-            last_t_target = t_target;
 
             XrSpaceVelocity head_vel{XR_TYPE_SPACE_VELOCITY};
             XrSpaceLocation head_loc{XR_TYPE_SPACE_LOCATION, &head_vel};
             if (xr_.view_space() != XR_NULL_HANDLE && xr_.stage_space() != XR_NULL_HANDLE) {
-                xrLocateSpace(xr_.view_space(), xr_.stage_space(), t, &head_loc);
+                xrLocateSpace(xr_.view_space(), xr_.stage_space(), t_predicted,
+                              &head_loc);
+            }
+            const bool head_ang_valid_pre =
+                (head_vel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) != 0;
+            constexpr float kStationaryAngSqr = 0.0076f;  // (5 °/s)² rad²/s²
+            const float ang_sqr = head_ang_valid_pre
+                ? (head_vel.angularVelocity.x * head_vel.angularVelocity.x +
+                   head_vel.angularVelocity.y * head_vel.angularVelocity.y +
+                   head_vel.angularVelocity.z * head_vel.angularVelocity.z)
+                : 0.0f;
+            const bool stationary = head_ang_valid_pre && ang_sqr < kStationaryAngSqr;
+            const int64_t rtt_ns = RoundTripEstimator::current_ns();
+            const XrTime t_target = stationary
+                ? t_predicted
+                : t_predicted + static_cast<XrTime>(rtt_ns);
+            const XrTime t = t_target;
+            last_t_predicted = t_predicted;
+            last_t_target = t_target;
+
+            if (!stationary) {
+                head_vel = {XR_TYPE_SPACE_VELOCITY};
+                head_loc = {XR_TYPE_SPACE_LOCATION, &head_vel};
+                if (xr_.view_space() != XR_NULL_HANDLE &&
+                    xr_.stage_space() != XR_NULL_HANDLE) {
+                    xrLocateSpace(xr_.view_space(), xr_.stage_space(), t,
+                                  &head_loc);
+                }
             }
 
             // Hand poses with velocity. ALVR / Carmack: the headset runtime

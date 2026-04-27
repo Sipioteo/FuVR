@@ -83,17 +83,34 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
     // has connected yet (daemon-without-headset case, e.g. CI smoke tests).
     StartSessionParams params{};
     DeviceCapabilities caps{};
+    // FUVR_RT_RENDER_SCALE: scales the per-eye render resolution Blender
+    // uses (and the encoder/decoder are configured at) to lift the
+    // Mac-side render-rate ceiling. Default 1.0 = full Quest 3 dims
+    // (2064x2208 per eye, ~9.1 MP SBS, ~30 fps in Eevee on M-series).
+    // 0.5 → ~2.3 MP SBS, comfortably 90 fps in Eevee. The Quest decoder
+    // reconfigures from session-start config (set_output_size in
+    // protocol_router.cpp) and the eye_blit shader scales whatever
+    // decoded texture into the 2064x2208 eye swapchain via UVs, so the
+    // visible image stays correct.
+    const float renderScale = []() {
+      const char* env = std::getenv("FUVR_RT_RENDER_SCALE");
+      if (env == nullptr || *env == '\0') return 1.0f;
+      const float v = std::strtof(env, nullptr);
+      if (v < 0.25f || v > 1.0f) return 1.0f;
+      return v;
+    }();
+    auto scaleEven = [renderScale](uint32_t v) {
+      uint32_t out = static_cast<uint32_t>(v * renderScale);
+      // H.264/HEVC require even dims; round up to even.
+      return (out + 1u) & ~1u;
+    };
     if (daemon->getDeviceCapabilities(&caps) && caps.valid) {
-      // Why: the Quest decoder is currently created at fixed 4128x2208
-      // (decoder_pipeline.hpp default) and never reconfigured — the daemon
-      // doesn't send helloFromMac with the negotiated session config. Until
-      // we wire that handshake, pin encoder dims to perEye=2064x2208 so the
-      // SBS output stays 4128x2208 and matches the Quest decoder. The Quest
-      // GL compositor scales into its actual swapchain (1680x1760 on Quest 3)
-      // via eye_blit, so the visible image is correct either way.
-      // TODO: send helloFromMac post-startSession so we can use caps.perEye*.
-      params.perEyeWidth = 2064;
-      params.perEyeHeight = 2208;
+      // Encoder/decoder dims are negotiated via session-start config
+      // (Quest reads perEyeWidth/Height and reconfigures decoder), so we
+      // can scale freely — Quest swapchain stays 2064x2208, eye_blit
+      // samples the smaller decoded texture via UVs.
+      params.perEyeWidth = scaleEven(2064);
+      params.perEyeHeight = scaleEven(2208);
       (void)caps.perEyeWidth;
       (void)caps.perEyeHeight;
       // Pick the highest advertised rate <= 120; Quest 3 reports 120 but PCVR
@@ -121,8 +138,8 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
       // TODO: surface this via the connection UI; today we silently fall
       // back. Hardcoded Quest 3 defaults; the daemon will negotiate down
       // when the Quest finally connects.
-      params.perEyeWidth = 2064;
-      params.perEyeHeight = 2208;
+      params.perEyeWidth = scaleEven(2064);
+      params.perEyeHeight = scaleEven(2208);
       params.refreshRateHz = 90;
       if (std::getenv("FUVR_RT_DEBUG"))
         std::fprintf(stderr,
@@ -466,22 +483,19 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
       }
     }
 
-    // Why: the Quest's projection-layer scan-out timewarp uses this pose
-    // as q_render. We must hand back exactly the pose Blender rendered
-    // with — same call as xrLocateViews_impl below — so q_render and
-    // q_now can be compared on the Quest with no drift between "what
-    // Blender saw" and "what the compositor was told". With Quest now
-    // owning the lookahead (sample stamp = predicted_display_time, no
-    // RTT bias) the predictor is a near-identity passthrough; we
-    // intentionally avoid re-extrapolating against info->displayTime
-    // because that dt mixes Quest XrTime (sample stamp) with Mac XrTime
-    // (Blender's displayTime) and produces a noisy bogus rotation that
-    // shows up as micro-shake in the rendered image. predictor.latest()
-    // returns the most recent forward-stamped sample verbatim.
-    auto rendered = s->predictor.latest();
-    if (rendered.has_value()) {
-      f.renderedLeft = rendered->leftEye;
-      f.renderedRight = rendered->rightEye;
+    // Why: stamp the *exact same* per-eye pose Blender just rendered
+    // with into VideoFragmentHeader so the Quest's OS scan-out timewarp
+    // computes Δq = q_now * q_render⁻¹ against the right baseline.
+    // Calling predictor.latest() again here would pick up the ~10–15
+    // upstream samples that arrived during the Blender render (Quest
+    // pushes pose at 1 kHz, Blender renders at ~90 Hz), stamping a
+    // newer pose than what Blender actually used. The compositor would
+    // then "rewind" part of the user's motion via Δq, dragging the
+    // streamed image behind the head. The pose was cached in
+    // pendingLocateLeft/RightPose at xrLocateViews_impl time.
+    if (s->pendingLocatePoseValid) {
+      f.renderedLeft = s->pendingLocateLeftPose;
+      f.renderedRight = s->pendingLocateRightPose;
     }
     // Carry the same (overscan-applied) FOV that xrLocateViews returned, so
     // the Quest ATW shader gets fov_render right and doesn't fall back to
@@ -524,13 +538,20 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
                             XR_VIEW_STATE_ORIENTATION_TRACKED_BIT |
                             XR_VIEW_STATE_POSITION_TRACKED_BIT;
   }
-  // Use the latest forward-stamped sample verbatim. The Quest now samples
-  // at its own predictedDisplayTime and stamps timestampNs accordingly;
-  // Mac-side extrapolation against info->displayTime would mix clock
-  // domains (Quest vs Mac XrTime) and inject noise into Blender's render
-  // pose. xrEndFrame_impl uses the same .latest() call so q_render and
-  // the pose Blender rendered with stay byte-identical.
-  auto predicted = s->predictor.latest();
+  // Smooth the most recent forward-stamped samples instead of using a
+  // single sample verbatim. At the Quest's 1 kHz upstream rate every
+  // Blender frame would otherwise pick a single millisecond-old IMU
+  // sample as q_render — the per-sample orientation noise (~10⁻⁴ rad)
+  // shows up as a visible micro-wobble overlaid on real motion, and
+  // the OS scan-out timewarp can't fix it because q_render is
+  // *defined* by what we ship. An 8-sample window (~8 ms) tracks real
+  // head motion (it lags steady angular velocity by ~4 ms) but kills
+  // the per-frame jitter, making streamed motion read as fluid even
+  // when Blender's render rate is lower than the Quest display rate.
+  // Cross-clock dt is still avoided by not re-extrapolating; the pose
+  // is cached in pendingLocate*Pose so xrEndFrame_impl stamps the
+  // identical pose Blender just rendered with.
+  auto predicted = s->predictor.smoothedLatest(8);
   // [LATENCY-DEBUG] At 1Hz, log how far ahead xrLocateViews is asking the
   // predictor to extrapolate (dt_ms), whether the predictor's 60ms cap
   // (pose_predictor.cpp:223) is firing, and how stale the latest sample is
@@ -595,19 +616,24 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
   // and views[i].fov = this rendered fov. The OS compositor performs scan-out
   // timewarp using the +margin region; whatever margin we ship here is the
   // headroom the OS has to reproject during head motion between render-time
-  // and display-time. Add a fixed ~18° on each of the four sides (additive,
-  // not multiplicative — multiplicative blew tan() near the asymmetric
-  // outer edge). Sign convention matches XrFovf: left/down are negative,
-  // right/up positive, so margin pushes left/down more negative and
-  // right/up more positive. Tunable via FUVR_RT_FOV_MARGIN_DEG env var.
-  // Default raised from 12° → 18° after observing edge-stretch artefacts
-  // on the bottom row when the user pitches up faster than the lookahead
-  // can compensate: the OS scan-out timewarp ran out of overscan in the
-  // -angleDown direction and clamped to the rendered bottom edge. 18°
-  // gives ~50 % more headroom in every direction with negligible Blender
-  // render cost.
+  // and display-time. Add a fixed margin on each of the four sides
+  // (additive, not multiplicative — multiplicative blew tan() near the
+  // asymmetric outer edge). Sign convention matches XrFovf: left/down
+  // are negative, right/up positive, so margin pushes left/down more
+  // negative and right/up more positive. Tunable via
+  // FUVR_RT_FOV_MARGIN_DEG env var.
+  //
+  // Default 6°: just enough overscan for the Quest's OS scan-out
+  // timewarp to keep motion fluid (it can rotate the rendered image at
+  // 90 Hz against the current head pose and pull from the margin to
+  // fill the rotated viewport). Earlier 12–18° defaults caused visible
+  // bottom-edge warping that turned out to be cross-clock predictor
+  // noise — that's now fixed (Mac uses predictor.latest() and pose is
+  // cached at xrLocateViews) so a small honest margin is enough.
+  // Set to 0 to disable reprojection headroom entirely (rotational
+  // motion will visibly judder).
   static const float kMarginRad = []() {
-    float deg = 18.0f;
+    float deg = 6.0f;
     if (const char* env = std::getenv("FUVR_RT_FOV_MARGIN_DEG")) {
       float v = static_cast<float>(std::strtof(env, nullptr));
       if (v >= 0.0f && v <= 30.0f) deg = v;
@@ -638,11 +664,15 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
       views[i].pose.position = {p.position.x, p.position.y, p.position.z};
       views[i].pose.orientation = {p.orientation.x, p.orientation.y,
                                     p.orientation.z, p.orientation.w};
+      Pose& pcache = (i == 0) ? s->pendingLocateLeftPose
+                              : s->pendingLocateRightPose;
+      pcache = p;
     } else {
       views[i].pose.position = {0.0f, 0.0f, 0.0f};
       views[i].pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
     }
   }
+  s->pendingLocatePoseValid = predicted.has_value();
   *countOutput = 2;
   return XR_SUCCESS;
 }

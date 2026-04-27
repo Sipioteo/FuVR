@@ -68,6 +68,17 @@ class PosePredictor {
 
   std::optional<PoseSample> latest() const noexcept;
 
+  // Average the most recent N samples (orientation via quaternion mean
+  // with sign alignment, position/velocity via arithmetic mean). Used by
+  // xrLocateViews_impl / xrEndFrame_impl to feed Blender a pose that is
+  // free of per-sample IMU jitter — at 1 kHz upstream every Mac frame
+  // would otherwise pick a single noisy sample as q_render, making the
+  // streamed image visibly wobble even when the head is moving smoothly.
+  // N is clamped to [1, size()]. The most recent sample's timestamp,
+  // FOV, and controller-active flags are kept verbatim (smoothing those
+  // would erase real edge transitions).
+  std::optional<PoseSample> smoothedLatest(std::size_t window) const noexcept;
+
  private:
   std::array<PoseSample, kCapacity> buffer_{};
   std::size_t head_{0};
