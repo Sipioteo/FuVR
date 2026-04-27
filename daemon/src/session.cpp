@@ -12,6 +12,7 @@
 #include "fuvr.capnp.h"
 #include "fuvr_transport.h"
 #include "fuvr_vdisplay_control.h"
+#include "fuvr/daemon/audio/audio_session.hpp"
 
 namespace fuvr::daemon {
 
@@ -112,9 +113,14 @@ Session::Session(uint64_t id, const SessionConfig& cfg, FuvrTransport* transport
                                         cfg_.refreshRateHz);
         if (vdisplay_) virtualDisplayId_ = fuvr_vdisplay_id(vdisplay_);
     }
+
+    if (cfg_.audioEnabled) {
+        fuvr::daemon::audio::startAudioFor(*this, transport);
+    }
 }
 
 Session::~Session() {
+    fuvr::daemon::audio::stopAudioFor(*this);
     if (encoder_) encoder_->flush();
     encoder_.reset();
     sink_.reset();

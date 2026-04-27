@@ -12,6 +12,7 @@ path = "src/main.rs"
 transport-core = { path = "../transport-core" }
 transport-usb = { path = "../transport-usb" }
 transport-udp = { path = "../transport-udp" }
+transport-mdns = { path = "../transport-mdns" }
 anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true

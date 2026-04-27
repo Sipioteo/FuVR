@@ -29,7 +29,7 @@ fn round_trip_10k_frames_with_5pct_loss() {
         rng.fill_bytes(&mut payload);
 
         let shards = enc.encode(&payload).unwrap();
-        let total = shards.len();
+        let _total = shards.len();
 
         let mut received: Vec<Option<Vec<u8>>> =
             shards.into_iter().map(Some).collect();

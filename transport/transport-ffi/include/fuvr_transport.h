@@ -28,11 +28,28 @@ typedef enum FuvrChannel {
 
 typedef struct FuvrTransport FuvrTransport;
 
+typedef struct FuvrTransportStats {
+    double rtt_ms;
+    double loss_pct;
+    uint64_t sent_bytes;
+    uint64_t recv_bytes;
+} FuvrTransportStats;
+
 typedef void (*FuvrRecvCallback)(void *user, uint8_t channel, const uint8_t *data, size_t len);
 
 FuvrTransport *fuvr_transport_create(FuvrTransportKind kind, const char *endpoint);
 int32_t fuvr_transport_send(FuvrTransport *handle, FuvrChannel channel, const uint8_t *data, size_t len);
 void fuvr_transport_set_recv_callback(FuvrTransport *handle, FuvrRecvCallback cb, void *user);
+
+/* Fill *out with a snapshot of transport diagnostics.
+ * Returns 0 on success, -1 if either handle or out is NULL. */
+int32_t fuvr_transport_stats(FuvrTransport *handle, FuvrTransportStats *out);
+
+/* Record a single round-trip latency sample in microseconds, and a packet
+ * loss fraction in [0.0, 1.0]. Both feed fuvr_transport_stats. */
+void fuvr_transport_record_rtt_us(FuvrTransport *handle, uint64_t sample_us);
+void fuvr_transport_record_loss(FuvrTransport *handle, double fraction);
+
 void fuvr_transport_destroy(FuvrTransport *handle);
 
 #ifdef __cplusplus

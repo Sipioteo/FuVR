@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include "fuvr/clock_sync.hpp"
+#include "fuvr/input_router.hpp"
 #include "fuvr/iosurface_xpc_service.hpp"
 #include "fuvr/metrics.hpp"
 #include "fuvr/pose_router.hpp"
@@ -19,15 +20,6 @@ struct FuvrTransport;
 
 namespace fuvr::daemon {
 
-// Top-level fuvrd state.
-//
-// Threading model:
-//   - One accept thread (in RpcServer) + one reader thread per client.
-//   - One metrics ticker thread fires at 10 Hz to push Metrics envelopes.
-//   - Encoder fragment callbacks run on VideoToolbox's own threads.
-//   - Transport recv callback runs on the Rust transport's thread.
-// Why std::mutex everywhere: callers come from heterogeneous threads and the
-// hot paths are short; finer-grained sync would not pay off at this scope.
 class Daemon {
 public:
     Daemon();
@@ -36,8 +28,8 @@ public:
     bool start(const std::string& socketPath = {});
     void stop();
 
-    // Test-only access.
     PoseRouter& poseRouter() { return poseRouter_; }
+    InputRouter& inputRouter() { return inputRouter_; }
     MetricsAggregator& globalMetrics() { return globalMetrics_; }
     ClockSync& clockSync() { return clockSync_; }
 
@@ -52,6 +44,7 @@ private:
 
     RpcServer rpc_;
     PoseRouter poseRouter_;
+    InputRouter inputRouter_;
     MetricsAggregator globalMetrics_;
 
     std::mutex sessionsMu_;
@@ -61,6 +54,20 @@ private:
     struct MetricsSubscriber { int fd; uint64_t streamId; };
     std::mutex metricsSubsMu_;
     std::vector<MetricsSubscriber> metricsSubs_;
+
+    struct EncodeStatsSubscriber { int fd; uint64_t streamId; };
+    std::mutex encodeStatsSubsMu_;
+    std::vector<EncodeStatsSubscriber> encodeStatsSubs_;
+    std::atomic<bool> piggybackWarnLogged_{false};
+
+    struct LogSubscriber { int fd; uint64_t streamId; };
+    std::mutex logSubsMu_;
+    std::vector<LogSubscriber> logSubs_;
+
+    // Q-side metrics, fed from `q-metrics:` lines on the control channel.
+    std::mutex qMetricsMu_;
+    float qDecoderFps_         = 0.0f;
+    float qDecoderDecodeMsP95_ = 0.0f;
 
     FuvrTransport* transport_ = nullptr;
     std::unique_ptr<IOSurfaceXpcService> xpcService_;

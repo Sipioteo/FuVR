@@ -9,8 +9,10 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
+#include "fuvr/action_state.hpp"
 #include "fuvr/event_queue.hpp"
 #include "fuvr/frame_sink.hpp"
 #include "fuvr/iosurface_swapchain.hpp"
@@ -64,6 +66,16 @@ struct Action {
   XrAction handle{XR_NULL_HANDLE};
   ActionSet* parent{nullptr};
   XrActionType type{XR_ACTION_TYPE_BOOLEAN_INPUT};
+  std::vector<XrPath> subactionPaths;
+  std::string name;
+  // Suggested binding paths supplied via xrSuggestInteractionProfileBindings.
+  std::vector<XrPath> suggestedBindings;
+};
+
+struct HandTracker {
+  uint64_t handle{0};
+  Hand hand{Hand::Left};
+  Session* session{nullptr};
 };
 
 struct ActionSet {
@@ -100,6 +112,10 @@ struct Session {
   std::vector<std::unique_ptr<Space>> spaces;
   Pose localOriginPose{};
   EncoderStats encoderStats{};
+  ActionStateCache actionState{};
+  std::vector<std::unique_ptr<HandTracker>> handTrackers;
+  std::atomic<bool> daemonAlive{false};
+  std::atomic<uint32_t> reconnectCount{0};
   bool beginSessionSent{false};
   bool interactionProfileEmitted{false};
   std::mutex mutex;

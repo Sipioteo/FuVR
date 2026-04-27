@@ -6,6 +6,7 @@
 #include <thread>
 
 #include "fuvr/daemon.hpp"
+#include "fuvr/logger.hpp"
 
 namespace {
 std::atomic<bool> g_quit{false};
@@ -28,10 +29,10 @@ int main(int argc, char** argv) {
 
     fuvr::daemon::Daemon d;
     if (!d.start(socketPath)) {
-        std::fprintf(stderr, "fuvrd: failed to start\n");
+        FUVR_LOG_ERROR("fuvrd", "failed to start");
         return 1;
     }
-    std::fprintf(stderr, "fuvrd: listening\n");
+    FUVR_LOG_INFO("fuvrd", "listening");
 
     while (!g_quit.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));

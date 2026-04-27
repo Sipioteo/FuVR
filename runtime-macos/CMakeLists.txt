@@ -55,6 +55,9 @@ set(FUVR_RUNTIME_SOURCES
   src/diag.cpp
   src/swapchain.cpp
   src/actions.cpp
+  src/action_state.cpp
+  src/path_registry.cpp
+  src/hand_tracking.cpp
   src/loader_export.cpp
   src/pose_predictor.cpp
   src/frame_sink.cpp
@@ -149,6 +152,13 @@ if(FUVR_RUNTIME_TESTS)
     tests/test_event_queue.cpp
     tests/test_encoder_stats.cpp
     tests/test_spaces.cpp
+    tests/test_action_state.cpp
+    tests/test_path_registry.cpp
+    tests/test_swapchain_images.cpp
+    tests/test_hand_tracking.cpp
+    tests/test_eye_gaze.cpp
+    tests/test_endframe_layers.cpp
+    tests/test_session_resilience.cpp
     src/pose_predictor.cpp
     src/daemon_client.cpp
     src/event_queue.cpp
@@ -157,6 +167,9 @@ if(FUVR_RUNTIME_TESTS)
     src/session.cpp
     src/spaces.cpp
     src/actions.cpp
+    src/action_state.cpp
+    src/path_registry.cpp
+    src/hand_tracking.cpp
     src/swapchain.cpp
     src/frame_sink.cpp
     src/iosurface_swapchain.mm

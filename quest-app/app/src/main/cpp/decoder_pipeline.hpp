@@ -24,7 +24,9 @@ struct DecodedFrame {
 struct DecoderMetrics {
     float fps{0.0f};
     float decode_ms_p95{0.0f};
+    float decode_ms_avg{0.0f};
     uint64_t frames_delivered{0};
+    uint64_t dropped_frames{0};
 };
 
 class DecoderPipeline {
@@ -48,6 +50,10 @@ public:
     DecodedFrame pop_latest();
 
     DecoderMetrics snapshot_metrics();
+
+    // Bumped each time a previously-buffered AHardwareBuffer is replaced
+    // before the compositor consumed it (drop-old policy).
+    void note_dropped_frame() { ++dropped_frames_; }
 
 private:
     static void on_image_available_thunk(void* ctx, AImageReader* reader);
@@ -73,6 +79,7 @@ private:
     std::deque<uint64_t> decode_latency_ns_;
     uint64_t last_arrival_ns_{0};
     uint64_t total_frames_{0};
+    std::atomic<uint64_t> dropped_frames_{0};
 };
 
 }

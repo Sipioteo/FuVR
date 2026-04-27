@@ -83,6 +83,12 @@ extern XrResult xrStringToPath_impl(XrInstance, const char*, XrPath*) noexcept;
 extern XrResult xrGetCurrentInteractionProfile_impl(
     XrSession, XrPath, XrInteractionProfileState*) noexcept;
 
+extern XrResult xrCreateHandTrackerEXT_impl(XrSession, const void*,
+                                             uint64_t*) noexcept;
+extern XrResult xrDestroyHandTrackerEXT_impl(uint64_t) noexcept;
+extern XrResult xrLocateHandJointsEXT_impl(uint64_t, const void*,
+                                            void*) noexcept;
+
 namespace {
 
 template <typename Fn>
@@ -162,6 +168,9 @@ XrResult getInstanceProcAddr(XrInstance instance, const char* name,
       {"xrStringToPath", toPfn(xrStringToPath_impl)},
       {"xrGetCurrentInteractionProfile",
        toPfn(xrGetCurrentInteractionProfile_impl)},
+      {"xrCreateHandTrackerEXT", toPfn(xrCreateHandTrackerEXT_impl)},
+      {"xrDestroyHandTrackerEXT", toPfn(xrDestroyHandTrackerEXT_impl)},
+      {"xrLocateHandJointsEXT", toPfn(xrLocateHandJointsEXT_impl)},
   };
 
   for (const auto& e : kTable) {

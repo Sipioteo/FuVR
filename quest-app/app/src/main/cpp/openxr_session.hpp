@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "input_packer.hpp"
+
 struct android_app;
 
 namespace fuvr {
@@ -43,6 +45,21 @@ public:
     XrSpace hand_space(int hand) const { return hand_spaces_[hand]; }
     XrTime predicted_display_time() const { return predicted_display_time_; }
 
+    // xrSyncActions on the main action set; safe to call before reading
+    // per-hand action states for the same frame. Returns true if sync ran.
+    bool sync_actions();
+
+    // Read live action state for `hand` (0=left, 1=right) into `out`.
+    // Calls xrGetActionState{Boolean,Float,Vector2f}; assumes sync_actions()
+    // has run for the current frame already. Returns true if the actions
+    // are bound and the state was filled (active flag still reflects the
+    // OpenXR-reported "isActive").
+    bool read_action_state(int hand, ActionStateBundle& out) const;
+
+    // Stage-relative HMD pose support (Task 2). Captured once when the
+    // stage and view spaces are both valid. Returns identity if not yet set.
+    void capture_local_origin_if_needed(XrTime t);
+
     const std::array<ViewSnapshot, 2>& last_views() const { return last_views_; }
     const std::array<XrCompositionLayerProjectionView, 2>& projection_views() const { return projection_views_; }
 
@@ -57,16 +74,34 @@ private:
     XrSystemId system_id_{XR_NULL_SYSTEM_ID};
     XrSession session_{XR_NULL_HANDLE};
     XrSpace stage_space_{XR_NULL_HANDLE};
+    XrSpace local_space_{XR_NULL_HANDLE};
     XrSpace view_space_{XR_NULL_HANDLE};
     std::array<XrSpace, 2> hand_spaces_{XR_NULL_HANDLE, XR_NULL_HANDLE};
+    std::array<XrPath, 2> hand_paths_{XR_NULL_PATH, XR_NULL_PATH};
+
+    XrPosef local_origin_pose_{};
+    bool local_origin_captured_{false};
+
+public:
+    XrSpace local_space() const { return local_space_; }
+    XrPosef local_origin_pose() const { return local_origin_pose_; }
+    bool local_origin_captured() const { return local_origin_captured_; }
+private:
 
     XrActionSet action_set_{XR_NULL_HANDLE};
     XrAction pose_action_{XR_NULL_HANDLE};
     XrAction trigger_action_{XR_NULL_HANDLE};
+    XrAction trigger_touch_action_{XR_NULL_HANDLE};
     XrAction grip_action_{XR_NULL_HANDLE};
     XrAction thumbstick_action_{XR_NULL_HANDLE};
+    XrAction thumbstick_click_action_{XR_NULL_HANDLE};
+    XrAction thumbstick_touch_action_{XR_NULL_HANDLE};
     XrAction button_a_action_{XR_NULL_HANDLE};
+    XrAction button_a_touch_action_{XR_NULL_HANDLE};
     XrAction button_b_action_{XR_NULL_HANDLE};
+    XrAction button_b_touch_action_{XR_NULL_HANDLE};
+    XrAction system_click_action_{XR_NULL_HANDLE};
+    XrAction thumbrest_action_{XR_NULL_HANDLE};
     XrAction haptic_action_{XR_NULL_HANDLE};
 
 public:

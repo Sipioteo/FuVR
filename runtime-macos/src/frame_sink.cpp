@@ -15,22 +15,28 @@ std::atomic<uint64_t> g_nextToken{1};
 
 void DaemonFrameSink::submit(const SubmittedFrame& frame) noexcept {
   if (client_ == nullptr || frame.ioSurface == nullptr) return;
-  const uint64_t token = g_nextToken.fetch_add(1, std::memory_order_relaxed);
 
-  // Order matters per ADR-0007: ship the IOSurface first so the daemon's
-  // index is populated when the matching SubmitFrameRequest lands.
-  if (auto* xpc = client_->xpcClient()) {
-    xpc->sendSurface(token, frame.ioSurface);
+  auto submitOne = [&](IOSurfaceRef surface) {
+    const uint64_t token = g_nextToken.fetch_add(1, std::memory_order_relaxed);
+    // Order matters per ADR-0007: ship the IOSurface first so the daemon's
+    // index is populated when the matching SubmitFrameRequest lands.
+    if (auto* xpc = client_->xpcClient()) {
+      xpc->sendSurface(token, surface);
+    }
+    SubmitFrameArgs args{};
+    args.frameId = frame.frameId;
+    args.renderStartNs = frame.renderStartNs;
+    args.surfaceToken = token;
+    args.forceIdr = frame.forceIdr;
+    args.leftEye = frame.renderedLeft;
+    args.rightEye = frame.renderedRight;
+    client_->submitFrame(frame.sessionId, args);
+  };
+
+  submitOne(frame.ioSurface);
+  for (IOSurfaceRef extra : frame.extraLayers) {
+    if (extra != nullptr) submitOne(extra);
   }
-
-  SubmitFrameArgs args{};
-  args.frameId = frame.frameId;
-  args.renderStartNs = frame.renderStartNs;
-  args.surfaceToken = token;
-  args.forceIdr = frame.forceIdr;
-  args.leftEye = frame.renderedLeft;
-  args.rightEye = frame.renderedRight;
-  client_->submitFrame(frame.sessionId, args);
 }
 
 std::unique_ptr<FrameSink> makeDefaultFrameSink() {

@@ -4,6 +4,8 @@
 //! ADB-reverse tunnel transport. Mac binds 127.0.0.1:9943; Quest connects
 //! through `adb reverse tcp:9943 tcp:9943`.
 
+pub mod aoa;
+
 use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::stream::BoxStream;

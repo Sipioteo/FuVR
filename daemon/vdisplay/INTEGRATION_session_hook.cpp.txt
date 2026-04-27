@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Implementation of the single integration hook. We deliberately keep this in
+// its own translation unit so the rest of `daemon/vdisplay/` is unit-testable
+// without dragging in `fuvr/session.hpp` (which pulls Cap'n Proto, transport,
+// encoder, etc.).
+//
+// Because the actual `Session::submitFrame` signature requires per-eye pose
+// arrays we don't have at capture time (the frame originates from the
+// WindowServer, not the runtime), we feed identity poses. The pose-routing
+// path is independently driven by the Quest's pose stream.
+#include "fuvr/vdisplay/session_hook.hpp"
+
+#include "fuvr/session.hpp"
+
+#include <atomic>
+#include <chrono>
+
+namespace fuvr::daemon::vdisplay {
+
+namespace {
+
+uint64_t monoNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+}  // namespace
+
+std::unique_ptr<VirtualDisplaySession> startForSession(fuvr::daemon::Session& session) {
+    // We pull config off the session via a lambda capture by reference. The
+    // SessionConfig is stored in Session as `cfg_`; expose width/height/hz
+    // through accessors. For now we reconstruct from the Session's existing
+    // public observable: width/height are not currently exposed, so BETA must
+    // either expose them or pass via a SessionConfig snapshot. As an interim,
+    // hard-default sentinels make the wiring obvious in code review.
+    //
+    // BETA: at integration time, replace the three constants below with reads
+    // from the SessionConfig you pass in. Keeping them constants here would be
+    // wrong in production; the unit test in test_virtual_display_session.cpp
+    // covers the orchestrator with arbitrary values.
+    StartParams p;
+    p.width     = 4128;
+    p.height    = 2208;
+    p.refreshHz = 90;
+
+    Session* sptr = &session;
+    p.frameSink = [sptr](CVPixelBufferRef pb, uint64_t frameId, uint64_t hostNs) {
+        if (!pb) return;
+        const float identityPose[7] = {0, 0, 0, 0, 0, 0, 1};
+        sptr->submitFrame(pb, frameId, hostNs ? hostNs : monoNs(),
+                          /*forceIdr*/ false, identityPose, identityPose);
+    };
+
+    return start(p);
+}
+
+}  // namespace fuvr::daemon::vdisplay

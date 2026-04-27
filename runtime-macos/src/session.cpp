@@ -63,19 +63,41 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
     if (daemon->startSession(params, &result)) {
       session->daemonSessionId = result.sessionId;
       daemon->subscribePoses(result.sessionId);
+      daemon->subscribeInputs(result.sessionId);
+      daemon->subscribeEncodeStats();
     }
     Session* sessRaw = session.get();
+    sessRaw->daemonAlive.store(true);
     daemon->setPoseCallback([sessRaw](const PoseSample& s) {
       sessRaw->predictor.push(s);
     });
     daemon->setEncodeStatsCallback([sessRaw](const EncodeStatSample& s) {
       sessRaw->encoderStats.push(s);
     });
+    daemon->setInputCallback([sessRaw](const InputSnapshot& snap) {
+      sessRaw->actionState.update(snap);
+    });
     daemon->setDisconnectCallback([sessRaw]() {
+      sessRaw->daemonAlive.store(false);
       Instance* i = sessRaw->instance;
       if (i != nullptr) {
         i->events.pushSessionStateChanged(sessRaw->handle,
                                           XR_SESSION_STATE_LOSS_PENDING);
+      }
+    });
+    daemon->setReconnectCallback([sessRaw]() {
+      sessRaw->daemonAlive.store(true);
+      sessRaw->reconnectCount.fetch_add(1, std::memory_order_relaxed);
+      // Re-subscribe to streams; the daemon may have lost subscription state.
+      if (sessRaw->daemon && sessRaw->daemonSessionId != 0) {
+        sessRaw->daemon->subscribePoses(sessRaw->daemonSessionId);
+        sessRaw->daemon->subscribeInputs(sessRaw->daemonSessionId);
+        sessRaw->daemon->subscribeEncodeStats();
+      }
+      Instance* i = sessRaw->instance;
+      if (i != nullptr) {
+        i->events.pushSessionStateChanged(sessRaw->handle,
+                                          XR_SESSION_STATE_READY);
       }
     });
   }
@@ -211,14 +233,51 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
     f.frameId = s->frameId.load(std::memory_order_relaxed);
     f.targetDisplayTimeNs = static_cast<uint64_t>(info->displayTime);
     f.sessionId = s->daemonSessionId;
+
+    auto resolveSwapchain = [&](XrSwapchain handle) -> IOSurfaceRef {
+      for (auto& sc : s->swapchains) {
+        if (sc->handle != handle) continue;
+        if (sc->images.empty()) return nullptr;
+        const uint32_t idx = sc->lastReleasedIndex %
+                             static_cast<uint32_t>(sc->images.size());
+        return sc->images[idx]->surface;
+      }
+      return nullptr;
+    };
+
+    std::vector<IOSurfaceRef> layers;
     {
       std::lock_guard<std::mutex> lk(s->mutex);
-      if (!s->swapchains.empty()) {
+      // Walk every composition layer; extract the primary swapchain image
+      // ref. Projection layers (most common) carry per-view subImages; we
+      // pick the first view's swapchain. Non-projection layers (quad, etc.)
+      // expose .subImage directly.
+      for (uint32_t i = 0; i < info->layerCount; ++i) {
+        const XrCompositionLayerBaseHeader* layer = info->layers[i];
+        if (layer == nullptr) continue;
+        IOSurfaceRef surf = nullptr;
+        if (layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+          const auto* proj =
+              reinterpret_cast<const XrCompositionLayerProjection*>(layer);
+          if (proj->viewCount > 0) {
+            surf = resolveSwapchain(proj->views[0].subImage.swapchain);
+          }
+        } else if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+          const auto* quad =
+              reinterpret_cast<const XrCompositionLayerQuad*>(layer);
+          surf = resolveSwapchain(quad->subImage.swapchain);
+        }
+        if (surf != nullptr) layers.push_back(surf);
+      }
+      // Why: legacy code path — if no layers were enumerated (e.g. tests
+      // that don't pass any XrCompositionLayer*), fall back to the first
+      // swapchain so existing M0 spike code keeps working.
+      if (layers.empty() && !s->swapchains.empty()) {
         Swapchain* sc = s->swapchains.front().get();
         if (!sc->images.empty()) {
           const uint32_t idx = sc->lastReleasedIndex %
                                static_cast<uint32_t>(sc->images.size());
-          f.ioSurface = sc->images[idx]->surface;
+          layers.push_back(sc->images[idx]->surface);
           f.leftMetalTexture = sc->images[idx]->mtlTexture;
           f.rightMetalTexture = sc->images[idx]->mtlTexture;
           f.width = sc->width;
@@ -226,6 +285,14 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
         }
       }
     }
+
+    if (!layers.empty()) {
+      f.ioSurface = layers.front();
+      for (size_t i = 1; i < layers.size(); ++i) {
+        f.extraLayers.push_back(layers[i]);
+      }
+    }
+
     auto latest = s->predictor.latest();
     if (latest.has_value()) {
       f.renderedLeft = latest->leftEye;

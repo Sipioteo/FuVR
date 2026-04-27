@@ -74,6 +74,11 @@ add_library(fuvr_quest SHARED
     protocol_router.cpp
     proto_codec.cpp
     clock_sync.cpp
+    input_packer.cpp
+    metrics_format.cpp
+    loss_tracker.cpp
+    hand_encoder.cpp
+    connection_ui.cpp
     ${PROTO_GEN_SOURCES}
 )
 
@@ -115,3 +120,9 @@ target_include_directories(fuvr_quest PRIVATE
 target_link_libraries(fuvr_quest PRIVATE native_app_glue)
 
 target_link_options(fuvr_quest PRIVATE "-u" "ANativeActivity_onCreate")
+
+# Audio subsystem (EPSILON-owned). Append-only: presence is optional, the
+# top-level build must succeed whether or not the subdir exists yet.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/audio/CMakeLists.txt")
+    add_subdirectory(audio)
+endif()

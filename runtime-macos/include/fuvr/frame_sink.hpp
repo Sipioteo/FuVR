@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "fuvr/pose_predictor.hpp"
 
@@ -20,11 +21,16 @@ struct SubmittedFrame {
   void* rightMetalTexture{nullptr};
   uint32_t width{0};
   uint32_t height{0};
+  // The first composition layer's surface (kept for compatibility / single
+  // layer fast path). Use `extraLayers` for additional layers.
   IOSurfaceRef ioSurface{nullptr};
   uint64_t sessionId{0};
   Pose renderedLeft{};
   Pose renderedRight{};
   bool forceIdr{false};
+  // Extra composition layers beyond the primary (`ioSurface` above). Each
+  // gets its own surface token / SubmitFrameRequest envelope.
+  std::vector<IOSurfaceRef> extraLayers;
 };
 
 class FrameSink {

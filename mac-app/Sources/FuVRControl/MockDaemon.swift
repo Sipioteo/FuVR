@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 import Foundation
 import Network
+import FuVRCapnp
 
+/// In-process mock daemon that speaks the same packed Cap'n Proto envelope
+/// protocol as `fuvrd`. Used for SwiftUI previews and end-to-end tests.
 public final class MockDaemon {
     private let queue = DispatchQueue(label: "fuvr.mock.daemon")
     private var listener: NWListener?
     private var clients: [NWConnection] = []
+    private var clientBuffers: [ObjectIdentifier: Data] = [:]
     private var metricsTimer: DispatchSourceTimer?
+    private var logTimer: DispatchSourceTimer?
     private var running = false
     private var sessionActive = false
-    private var lastConfig: SessionConfig?
+    private var sessionId: UInt64 = 0
+    private var lastConfig: CapnpStartSessionRequest?
+    private var seq: UInt64 = 0
 
     public let socketPath: String
 
@@ -27,104 +34,142 @@ public final class MockDaemon {
         listener.newConnectionHandler = { [weak self] conn in
             self?.accept(conn)
         }
+        listener.stateUpdateHandler = { state in
+            if case .failed(let err) = state {
+                NSLog("MockDaemon listener failed: \(err)")
+            }
+        }
         listener.start(queue: queue)
         self.listener = listener
         self.running = true
-        scheduleMetrics()
+        scheduleStreams()
     }
 
     public func stop() {
         running = false
         metricsTimer?.cancel()
         metricsTimer = nil
+        logTimer?.cancel()
+        logTimer = nil
         listener?.cancel()
         listener = nil
         clients.forEach { $0.cancel() }
         clients.removeAll()
+        clientBuffers.removeAll()
         try? FileManager.default.removeItem(atPath: socketPath)
     }
 
     private func accept(_ conn: NWConnection) {
         clients.append(conn)
-        let buffer = Data()
+        clientBuffers[ObjectIdentifier(conn)] = Data()
         conn.stateUpdateHandler = { [weak self] state in
-            if case .ready = state {
-                let caps = DeviceCapabilities(
-                    deviceModel: "Quest 3 (mock)",
-                    systemVersion: "v74.0",
-                    perEyeWidth: 2064, perEyeHeight: 2208,
-                    refreshRatesHz: [72, 90, 120],
-                    supportedCodecs: [.hevc, .h264],
-                    hasHandTracking: true, hasEyeTracking: false
-                )
-                self?.send(.helloFromQuest(caps), to: conn)
-            }
             if case .failed = state { conn.cancel() }
+            if case .cancelled = state {
+                self?.clientBuffers.removeValue(forKey: ObjectIdentifier(conn))
+                self?.clients.removeAll { $0 === conn }
+            }
         }
-        receive(conn, buffer: buffer)
+        receive(conn)
         conn.start(queue: queue)
     }
 
-    private func receive(_ conn: NWConnection, buffer: Data) {
-        var buf = buffer
+    private func receive(_ conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, complete, _ in
             guard let self else { return }
-            if let data { buf.append(data) }
-            while let nl = buf.firstIndex(of: 0x0A) {
-                let line = buf.subdata(in: buf.startIndex..<nl)
-                buf.removeSubrange(buf.startIndex...nl)
-                if let payload = (try? ControlCodec.decode(line)) ?? nil {
-                    self.handle(payload, from: conn)
+            if let data, !data.isEmpty {
+                var buf = self.clientBuffers[ObjectIdentifier(conn)] ?? Data()
+                buf.append(data)
+                while let packed = CapnpFrame.extract(from: &buf) {
+                    if let env = try? CapnpCodec.decode(packed) {
+                        self.handle(env, from: conn)
+                    }
                 }
+                self.clientBuffers[ObjectIdentifier(conn)] = buf
             }
             if complete { conn.cancel(); return }
-            self.receive(conn, buffer: buf)
+            self.receive(conn)
         }
     }
 
-    private func handle(_ payload: ControlPayload, from conn: NWConnection) {
-        switch payload {
-        case .helloFromMac(let cfg):
-            lastConfig = cfg
+    private func handle(_ env: CapnpFramedEnvelope, from conn: NWConnection) {
+        switch env.body {
+        case .startSession(let r):
+            lastConfig = r
             sessionActive = true
-            send(.sessionStart, to: conn)
-            send(.log(LogLine(timestampMs: now(), level: .info, source: "mock",
-                              message: "session start codec=\(cfg.videoCodec.rawValue) \(cfg.refreshRateHz)Hz")), to: conn)
-        case .sessionStop:
+            sessionId &+= 1
+            send(.startSessionAck(.init(
+                sessionId: sessionId,
+                clockOffsetNs: 250_000,
+                oneWayDelayNs: 5_000_000,
+                virtualDisplayId: 0
+            )), to: conn)
+            send(.log(.init(
+                timestampNs: nowNs(),
+                level: .info,
+                module: "mock",
+                message: "session start codec=\(r.videoCodec == .h264 ? "h264" : "hevc") \(r.refreshRateHz)Hz"
+            )), to: conn)
+        case .stopSession:
             sessionActive = false
-            send(.log(LogLine(timestampMs: now(), level: .info, source: "mock", message: "session stop")), to: conn)
+            send(.log(.init(timestampNs: nowNs(), level: .info,
+                            module: "mock", message: "session stop")), to: conn)
+            send(.ok, to: conn)
+        case .ping:
+            send(.pong, to: conn)
+        case .streamMetrics, .streamLogs, .streamInputs:
+            send(.ok, to: conn)
         default:
             break
         }
     }
 
-    private func scheduleMetrics() {
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100))
-        timer.setEventHandler { [weak self] in self?.tick() }
-        timer.resume()
-        metricsTimer = timer
+    private func scheduleStreams() {
+        let mt = DispatchSource.makeTimerSource(queue: queue)
+        mt.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100))
+        mt.setEventHandler { [weak self] in self?.tickMetrics() }
+        mt.resume()
+        metricsTimer = mt
+
+        let lt = DispatchSource.makeTimerSource(queue: queue)
+        lt.schedule(deadline: .now() + .seconds(2), repeating: .seconds(3))
+        lt.setEventHandler { [weak self] in self?.tickLog() }
+        lt.resume()
+        logTimer = lt
     }
 
-    private func tick() {
+    private func tickMetrics() {
         guard sessionActive, !clients.isEmpty else { return }
-        let m = MetricsSample(
-            timestampMs: now(),
-            rttMs: 8 + Double.random(in: -2...4),
-            jitterMs: 0.6 + Double.random(in: 0...1.2),
-            packetLossPct: max(0, Double.random(in: -0.2...0.4)),
-            encodeMs: 4.5 + Double.random(in: -1...2),
-            decodeMs: 3.2 + Double.random(in: -0.8...1.5),
-            fps: Double(lastConfig?.refreshRateHz ?? 90) + Double.random(in: -0.5...0.5),
-            bitrateMbps: 140 + Double.random(in: -8...8)
+        let cfg = lastConfig
+        let m = CapnpMetrics(
+            capturedAtNs: nowNs(),
+            encoderFps: Float(cfg?.refreshRateHz ?? 90) + Float.random(in: -0.5...0.5),
+            encoderEncodeMsAvg: 4.5 + Float.random(in: -0.6...1.2),
+            encoderEncodeMsP95: 8.2 + Float.random(in: -0.5...2.0),
+            transportRttMs: 8.3 + Float.random(in: -1.5...3.0),
+            transportLossPct: max(0, Float.random(in: -0.2...0.4)),
+            decoderFps: Float(cfg?.refreshRateHz ?? 90) + Float.random(in: -0.7...0.4),
+            decoderDecodeMsP95: 6.0 + Float.random(in: -0.8...1.5),
+            videoBitrateMbps: Float((cfg?.videoBitrateBps ?? 150_000_000)) / 1_000_000.0
         )
         for c in clients { send(.metrics(m), to: c) }
     }
 
-    private func send(_ p: ControlPayload, to conn: NWConnection) {
-        guard let data = try? ControlCodec.encode(p) else { return }
+    private func tickLog() {
+        guard sessionActive, !clients.isEmpty else { return }
+        let l = CapnpLogLine(timestampNs: nowNs(), level: .info,
+                             module: "mock-encoder",
+                             message: "frame \(Int.random(in: 1000...9999)) keyframe")
+        for c in clients { send(.log(l), to: c) }
+    }
+
+    private func send(_ body: CapnpEnvelope, to conn: NWConnection) {
+        seq &+= 1
+        let env = CapnpFramedEnvelope(seq: seq, body: body)
+        let data = CapnpCodec.encode(env)
         conn.send(content: data, completion: .contentProcessed { _ in })
     }
 
-    private func now() -> UInt64 { UInt64(Date().timeIntervalSince1970 * 1000) }
+    private func nowNs() -> UInt64 {
+        UInt64(Date().timeIntervalSince1970 * 1_000_000_000)
+    }
 }

@@ -4,6 +4,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "fuvr/path_registry.hpp"
 #include "fuvr/runtime.hpp"
 
 namespace fuvr::runtime {
@@ -103,6 +104,34 @@ XrResult xrCreateActionSpace_impl(XrSession sessionHandle,
   sp->kind = SpaceKind::Action;
   sp->action = lookupActionLocal(info->action);
   sp->subactionPath = info->subactionPath;
+  // Why: derive hand from the subactionPath string. If absent, fall back to
+  // the action's first subactionPath. /eyes_ext/ marks the eye gaze space.
+  auto resolveHand = [](XrPath p) -> ActionHand {
+    if (p == XR_NULL_PATH) return ActionHand::Unknown;
+    auto* str = pathRegistry().lookup(p);
+    if (str == nullptr) return ActionHand::Unknown;
+    if (str->find("/user/hand/left") != std::string::npos)
+      return ActionHand::Left;
+    if (str->find("/user/hand/right") != std::string::npos)
+      return ActionHand::Right;
+    return ActionHand::Unknown;
+  };
+  sp->actionHand = resolveHand(info->subactionPath);
+  if (sp->actionHand == ActionHand::Unknown && sp->action != nullptr) {
+    for (XrPath p : sp->action->subactionPaths) {
+      ActionHand h = resolveHand(p);
+      if (h != ActionHand::Unknown) {
+        sp->actionHand = h;
+        break;
+      }
+    }
+  }
+  if (info->subactionPath != XR_NULL_PATH) {
+    auto* str = pathRegistry().lookup(info->subactionPath);
+    if (str != nullptr && str->find("/user/eyes_ext") != std::string::npos) {
+      sp->isEyeGaze = true;
+    }
+  }
   Pose base{};
   sp->poseInRef = composePoseInRef(base, info->poseInActionSpace);
   const uint64_t h = detail::nextHandleAlloc();
@@ -153,17 +182,75 @@ XrResult xrLocateSpace_impl(XrSpace spaceHandle, XrSpace baseHandle, XrTime time
   loc->pose.position = {0.0f, 0.0f, 0.0f};
   loc->pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
 
-  if (sp->kind == SpaceKind::Action) {
-    // Why: PoseSnapshot only carries HMD pose today; controller pose
-    // forwarding is a pass 4 item. Return success with invalid bits.
-    return XR_SUCCESS;
-  }
-  if (base->kind == SpaceKind::Action) {
+  Session* s = sp->session;
+  if (s == nullptr) return XR_ERROR_HANDLE_INVALID;
+
+  // Eye gaze: data source not yet wired; return invalid bits per spec.
+  if (sp->isEyeGaze || (base->kind == SpaceKind::Action && base->isEyeGaze)) {
     return XR_SUCCESS;
   }
 
-  Session* s = sp->session;
-  if (s == nullptr) return XR_ERROR_HANDLE_INVALID;
+  auto controllerPoseFromSample = [&](const Space* a, Pose& out, bool& tracked) {
+    auto latest = s->predictor.latest();
+    if (!latest.has_value()) {
+      tracked = false;
+      return false;
+    }
+    if (a->actionHand == ActionHand::Left) {
+      tracked = latest->leftControllerActive;
+      out = latest->leftController;
+      return tracked;
+    }
+    if (a->actionHand == ActionHand::Right) {
+      tracked = latest->rightControllerActive;
+      out = latest->rightController;
+      return tracked;
+    }
+    tracked = false;
+    return false;
+  };
+
+  // Action-space subject or base: blend controller pose with reference space.
+  if (sp->kind == SpaceKind::Action || base->kind == SpaceKind::Action) {
+    Pose subject{};
+    Pose ref{};
+    bool subjectTracked = true;
+    bool baseTracked = true;
+    if (sp->kind == SpaceKind::Action) {
+      if (!controllerPoseFromSample(sp, subject, subjectTracked)) {
+        return XR_SUCCESS;
+      }
+    }
+    if (base->kind == SpaceKind::Action) {
+      if (!controllerPoseFromSample(base, ref, baseTracked)) {
+        return XR_SUCCESS;
+      }
+    }
+    if (sp->kind != SpaceKind::Action) {
+      if (sp->kind == SpaceKind::ReferenceLocal) subject = s->localOriginPose;
+    }
+    if (base->kind != SpaceKind::Action) {
+      if (base->kind == SpaceKind::ReferenceLocal) ref = s->localOriginPose;
+    }
+    loc->pose.position = {subject.position.x - ref.position.x +
+                              sp->poseInRef.position.x -
+                              base->poseInRef.position.x,
+                          subject.position.y - ref.position.y +
+                              sp->poseInRef.position.y -
+                              base->poseInRef.position.y,
+                          subject.position.z - ref.position.z +
+                              sp->poseInRef.position.z -
+                              base->poseInRef.position.z};
+    loc->pose.orientation = {subject.orientation.x, subject.orientation.y,
+                             subject.orientation.z, subject.orientation.w};
+    loc->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                         XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if (subjectTracked && baseTracked) {
+      loc->locationFlags |= XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                            XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+    }
+    return XR_SUCCESS;
+  }
 
   Pose subjectPose{};
   Pose basePose{};

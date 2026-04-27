@@ -12,41 +12,33 @@ private struct Point: Identifiable {
 struct DiagnosticsView: View {
     @EnvironmentObject var state: AppState
 
+    /// Rolling window: 30 seconds at the daemon's current 10 Hz cadence.
+    private let windowSamples = 300
+
+    private var windowed: [MetricsSample] {
+        let s = state.metrics.samples
+        if s.count <= windowSamples { return s }
+        return Array(s.suffix(windowSamples))
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 Text("Diagnostics").font(.largeTitle).bold()
 
-                let samples = state.metrics.samples
+                if let info = state.sessionInfo {
+                    activeSessionCard(info)
+                }
+
+                let samples = windowed
                 if samples.isEmpty {
                     ContentUnavailableView("No live data",
                                            systemImage: "waveform",
-                                           description: Text("Start a session to see live RTT, jitter, encode/decode timings."))
+                                           description: Text("Start a session to see live encoder, decoder, and transport metrics."))
                         .frame(minHeight: 360)
                 } else {
-                    let rtt = state.metrics.stats(\.rttMs)
-                    let jitter = state.metrics.stats(\.jitterMs)
-                    let enc = state.metrics.stats(\.encodeMs)
-                    let dec = state.metrics.stats(\.decodeMs)
-
-                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 16) {
-                        statCard("RTT", "ms", rtt, samples, \.rttMs, .blue)
-                        statCard("Jitter", "ms", jitter, samples, \.jitterMs, .purple)
-                        statCard("Encode", "ms", enc, samples, \.encodeMs, .orange)
-                        statCard("Decode", "ms", dec, samples, \.decodeMs, .teal)
-                    }
-
-                    GroupBox("Loss & throughput") {
-                        HStack(spacing: 24) {
-                            metricCell("Packet loss",
-                                       String(format: "%.2f%%", state.latestMetrics?.packetLossPct ?? 0))
-                            metricCell("Bitrate",
-                                       String(format: "%.0f Mb/s", state.latestMetrics?.bitrateMbps ?? 0))
-                            metricCell("FPS",
-                                       String(format: "%.0f", state.latestMetrics?.fps ?? 0))
-                            Spacer()
-                        }.padding(8)
-                    }
+                    encoderRow(samples)
+                    decoderRow(samples)
                 }
                 Spacer(minLength: 0)
             }
@@ -54,11 +46,65 @@ struct DiagnosticsView: View {
         }
     }
 
+    // MARK: Encoder row
+
     @ViewBuilder
-    private func statCard(_ title: String, _ unit: String, _ s: RollingStats,
-                          _ samples: [MetricsSample],
-                          _ key: KeyPath<MetricsSample, Double>,
-                          _ color: Color) -> some View {
+    private func encoderRow(_ samples: [MetricsSample]) -> some View {
+        let fps   = MetricsBuffer.computeStats(samples.map(\.encoderFps))
+        let p95   = MetricsBuffer.computeStats(samples.map(\.encoderEncodeMsP95))
+        let rtt   = MetricsBuffer.computeStats(samples.map(\.rttMs))
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 16) {
+            sparkCard("Encoder fps", "fps", fps, samples, \.encoderFps, .green)
+            sparkCard("Encode p95", "ms", p95, samples, \.encoderEncodeMsP95, .orange)
+            sparkCard("RTT", "ms", rtt, samples, \.rttMs, .blue)
+        }
+    }
+
+    @ViewBuilder
+    private func decoderRow(_ samples: [MetricsSample]) -> some View {
+        let dfps  = MetricsBuffer.computeStats(samples.map(\.decoderFps))
+        let dp95  = MetricsBuffer.computeStats(samples.map(\.decoderDecodeMsP95))
+        let loss  = MetricsBuffer.computeStats(samples.map(\.packetLossPct))
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 16) {
+            sparkCard("Decoder fps", "fps", dfps, samples, \.decoderFps, .teal)
+            sparkCard("Decode p95", "ms", dp95, samples, \.decoderDecodeMsP95, .purple)
+            sparkCard("Packet loss", "%", loss, samples, \.packetLossPct, .red)
+        }
+    }
+
+    // MARK: Active session card
+
+    @ViewBuilder
+    private func activeSessionCard(_ info: SessionInfo) -> some View {
+        GroupBox {
+            HStack(spacing: 24) {
+                fact("Session", String(format: "0x%llx", info.sessionId))
+                fact("Codec", info.codec.rawValue.uppercased())
+                fact("Bitrate", "\(info.videoBitrateMbps) Mb/s")
+                fact("Display id", info.virtualDisplayId == 0 ? "—" : "\(info.virtualDisplayId)")
+                fact("Clock offset", String(format: "%+.3f ms", Double(info.clockOffsetNs) / 1_000_000.0))
+                Spacer(minLength: 0)
+            }
+            .padding(8)
+        } label: {
+            Label("Active session", systemImage: "dot.radiowaves.left.and.right")
+        }
+    }
+
+    private func fact(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.callout).monospacedDigit()
+        }
+    }
+
+    // MARK: Sparkline cards
+
+    @ViewBuilder
+    private func sparkCard(_ title: String, _ unit: String, _ s: RollingStats,
+                           _ samples: [MetricsSample],
+                           _ key: KeyPath<MetricsSample, Double>,
+                           _ color: Color) -> some View {
         let points = samples.enumerated().map { Point(id: $0.offset, x: Double($0.offset), y: $0.element[keyPath: key]) }
         GroupBox {
             VStack(alignment: .leading, spacing: 6) {
@@ -80,24 +126,16 @@ struct DiagnosticsView: View {
                 .chartXAxis(.hidden)
                 .frame(height: 80)
                 HStack(spacing: 14) {
-                    legend("min", String(format: "%.1f", s.min))
-                    legend("mean", String(format: "%.1f", s.mean))
-                    legend("p95", String(format: "%.1f", s.p95))
-                    legend("max", String(format: "%.1f", s.max))
+                    badge("min", String(format: "%.1f", s.min))
+                    badge("avg", String(format: "%.1f", s.mean))
+                    badge("max", String(format: "%.1f", s.max))
                 }.font(.caption).foregroundStyle(.secondary)
             }
             .padding(8)
         }
     }
 
-    private func legend(_ k: String, _ v: String) -> some View {
+    private func badge(_ k: String, _ v: String) -> some View {
         HStack(spacing: 3) { Text(k); Text(v).monospacedDigit().foregroundStyle(.primary) }
-    }
-
-    private func metricCell(_ label: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption).foregroundStyle(.secondary)
-            Text(value).font(.title3).monospacedDigit()
-        }
     }
 }

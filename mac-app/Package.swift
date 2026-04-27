@@ -8,6 +8,7 @@ let package = Package(
     products: [
         .executable(name: "FuVR", targets: ["FuVRApp"]),
         .library(name: "FuVRControl", targets: ["FuVRControl"]),
+        .library(name: "FuVRCapnp", targets: ["FuVRCapnp"]),
     ],
     targets: [
         .executableTarget(
@@ -19,12 +20,22 @@ let package = Package(
         ),
         .target(
             name: "FuVRControl",
+            dependencies: ["FuVRCapnp"],
             path: "Sources/FuVRControl"
+        ),
+        .target(
+            name: "FuVRCapnp",
+            path: "Sources/FuVRCapnp"
         ),
         .testTarget(
             name: "FuVRControlTests",
-            dependencies: ["FuVRControl"],
+            dependencies: ["FuVRControl", "FuVRCapnp"],
             path: "Tests/FuVRControlTests"
+        ),
+        .testTarget(
+            name: "FuVRCapnpTests",
+            dependencies: ["FuVRCapnp"],
+            path: "Tests/FuVRCapnpTests"
         ),
     ]
 )

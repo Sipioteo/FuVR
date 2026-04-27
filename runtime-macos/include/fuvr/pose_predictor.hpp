@@ -32,6 +32,16 @@ struct PoseSample {
   Pose rightEye{};
   Vec3 linearVelocity{};
   Vec3 angularVelocity{};
+
+  bool leftControllerActive{false};
+  Pose leftController{};
+  Vec3 leftControllerLinVel{};
+  Vec3 leftControllerAngVel{};
+
+  bool rightControllerActive{false};
+  Pose rightController{};
+  Vec3 rightControllerLinVel{};
+  Vec3 rightControllerAngVel{};
 };
 
 class PosePredictor {

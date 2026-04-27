@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 
+#include "fuvr/action_state.hpp"
 #include "fuvr/iosurface_xpc_client.hpp"
 #include "fuvr/pose_predictor.hpp"
 
@@ -53,6 +54,8 @@ class DaemonClient {
   using PoseCallback = std::function<void(const PoseSample&)>;
   using EncodeStatsCallback = std::function<void(const EncodeStatSample&)>;
   using DisconnectCallback = std::function<void()>;
+  using InputCallback = std::function<void(const InputSnapshot&)>;
+  using ReconnectCallback = std::function<void()>;
 
   DaemonClient();
   ~DaemonClient();
@@ -67,6 +70,14 @@ class DaemonClient {
   void setPoseCallback(PoseCallback cb) noexcept;
   void setEncodeStatsCallback(EncodeStatsCallback cb) noexcept;
   void setDisconnectCallback(DisconnectCallback cb) noexcept;
+  void setInputCallback(InputCallback cb) noexcept;
+  void setReconnectCallback(ReconnectCallback cb) noexcept;
+
+  // Cap on the per-attempt sleep before reconnect.
+  void setMaxBackoffMs(uint32_t ms) noexcept { maxBackoffMs_ = ms; }
+
+  // Total elapsed reconnect attempts since last successful connect.
+  uint32_t reconnectAttempts() const noexcept { return reconnectAttempts_.load(); }
 
   // Lazily connect (idempotent). Returns true if connected (or already was).
   bool ensureConnected() noexcept;
@@ -78,6 +89,10 @@ class DaemonClient {
 
   // Subscribe to the pose stream. Idempotent.
   bool subscribePoses(uint64_t sessionId) noexcept;
+
+  // Subscribe to the input stream and the encode-stats stream.
+  bool subscribeInputs(uint64_t sessionId) noexcept;
+  bool subscribeEncodeStats() noexcept;
 
   // Fire-and-forget frame submission. The IOSurface itself is shipped over
   // the parallel XPC mach service ahead of this call; this carries only the
@@ -116,9 +131,13 @@ class DaemonClient {
   PoseCallback poseCb_;
   EncodeStatsCallback statsCb_;
   DisconnectCallback disconnectCb_;
+  InputCallback inputCb_;
+  ReconnectCallback reconnectCb_;
   bool disconnectFired_{false};
 
   uint32_t backoffMs_{20};
+  uint32_t maxBackoffMs_{5000};
+  std::atomic<uint32_t> reconnectAttempts_{0};
   IOSurfaceXpcClient* xpc_{nullptr};
 };
 

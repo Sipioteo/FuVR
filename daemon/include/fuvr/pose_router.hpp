@@ -12,22 +12,27 @@
 
 namespace fuvr::daemon {
 
-// Subscriber receives raw bytes representing a packed Envelope carrying a
-// PoseSnapshot. The router fans out one envelope per inbound UpstreamFrame.
 using PoseSubscriber = std::function<void(const uint8_t*, std::size_t)>;
+
+// Per-controller sample fed into the snapshot dispatch path. `active=false`
+// means no tracking signal — the daemon still forwards zeroed pose bits so
+// the runtime can answer xrLocateSpace with INVALID location flags.
+struct ControllerSampleIn {
+    bool  active = false;
+    float pos[3]      = {0, 0, 0};
+    float rot[4]      = {0, 0, 0, 1};
+    float linVel[3]   = {0, 0, 0};
+    float angVel[3]   = {0, 0, 0};
+};
 
 class PoseRouter {
 public:
     uint64_t addSubscriber(uint64_t sessionId, PoseSubscriber cb);
     void removeSubscriber(uint64_t streamId);
 
-    // Parse an inbound packed proto::UpstreamFrame and dispatch to all
-    // subscribers. Returns true on successful parse.
     bool ingestPackedUpstreamFrame(const uint8_t* data, std::size_t len,
                                    uint64_t sessionId, uint64_t receivedAtNs);
 
-    // Test hook: build a PoseSnapshot envelope from a Cap'n Proto Reader of
-    // proto::UpstreamFrame and dispatch.
     void dispatchSnapshot(uint64_t sessionId,
                           uint64_t receivedAtNs,
                           uint64_t questTimestampNs,
@@ -35,7 +40,9 @@ public:
                           const float left[7],
                           const float right[7],
                           const float linVel[3],
-                          const float angVel[3]);
+                          const float angVel[3],
+                          const ControllerSampleIn& leftCtrl,
+                          const ControllerSampleIn& rightCtrl);
 
 private:
     struct Entry {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import Foundation
 import Network
+import FuVRCapnp
 
 public enum ControlClientState: Equatable, Sendable {
     case idle
@@ -14,11 +15,18 @@ public protocol ControlClientDelegate: AnyObject {
     func controlClient(_ client: ControlClient, didReceive payload: ControlPayload)
 }
 
+/// Pass-4 Cap'n Proto control client. The wire format is length-prefixed
+/// packed Cap'n Proto envelopes from `proto/fuvrd.capnp`. The public Swift
+/// API is unchanged from pass 1 — `connect`/`disconnect`/`send` plus a
+/// delegate; the delegate sees the same `ControlPayload` enum it always saw.
 public final class ControlClient {
     public weak var delegate: ControlClientDelegate?
     private let queue = DispatchQueue(label: "fuvr.control.client")
     private var connection: NWConnection?
     private var receiveBuffer = Data()
+    private var seq: UInt64 = 0
+    private var lastSentConfig: SessionConfig?
+
     private(set) public var state: ControlClientState = .idle {
         didSet { delegate?.controlClient(self, didChangeState: state) }
     }
@@ -37,6 +45,9 @@ public final class ControlClient {
             switch s {
             case .ready:
                 self.state = .connected
+                // Subscribe to streams immediately on connect.
+                self.sendEnvelope(.streamMetrics)
+                self.sendEnvelope(.streamLogs)
                 self.scheduleReceive()
             case .failed(let err):
                 self.state = .failed(err.localizedDescription)
@@ -56,17 +67,30 @@ public final class ControlClient {
     }
 
     public func send(_ payload: ControlPayload) {
-        guard let conn = connection else { return }
-        do {
-            let data = try ControlCodec.encode(payload)
-            conn.send(content: data, completion: .contentProcessed { [weak self] err in
-                if let err, let self {
-                    self.state = .failed("send: \(err.localizedDescription)")
-                }
-            })
-        } catch {
-            state = .failed("encode: \(error.localizedDescription)")
+        if case .helloFromMac(let cfg) = payload {
+            lastSentConfig = cfg
         }
+        guard let env = ControlBridge.encodeOutgoing(payload, seq: nextSeq()) else { return }
+        sendFrame(env)
+    }
+
+    private func sendEnvelope(_ body: CapnpEnvelope) {
+        sendFrame(CapnpFramedEnvelope(seq: nextSeq(), body: body))
+    }
+
+    private func sendFrame(_ env: CapnpFramedEnvelope) {
+        guard let conn = connection else { return }
+        let data = CapnpCodec.encode(env)
+        conn.send(content: data, completion: .contentProcessed { [weak self] err in
+            if let err, let self {
+                self.state = .failed("send: \(err.localizedDescription)")
+            }
+        })
+    }
+
+    private func nextSeq() -> UInt64 {
+        seq &+= 1
+        return seq
     }
 
     private func scheduleReceive() {
@@ -89,16 +113,14 @@ public final class ControlClient {
     }
 
     private func drainBuffer() {
-        while let nl = receiveBuffer.firstIndex(of: 0x0A) {
-            let line = receiveBuffer.subdata(in: receiveBuffer.startIndex..<nl)
-            receiveBuffer.removeSubrange(receiveBuffer.startIndex...nl)
-            guard !line.isEmpty else { continue }
+        while let packed = CapnpFrame.extract(from: &receiveBuffer) {
             do {
-                if let payload = try ControlCodec.decode(line) {
+                let env = try CapnpCodec.decode(packed)
+                if let payload = ControlBridge.decodeIncoming(env, sessionConfig: lastSentConfig) {
                     delegate?.controlClient(self, didReceive: payload)
                 }
             } catch {
-                delegate?.controlClient(self, didReceive: .error("decode: \(error.localizedDescription)"))
+                delegate?.controlClient(self, didReceive: .error("decode: \(error)"))
             }
         }
     }

@@ -40,7 +40,10 @@ if(FUVR_VDISPLAY_TESTS)
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
 
-  add_executable(fuvr_vdisplay_tests tests/test_vdisplay_spawn.cpp)
+  add_executable(fuvr_vdisplay_tests
+    tests/test_vdisplay_spawn.cpp
+    tests/test_cli_args.cpp
+  )
   target_link_libraries(fuvr_vdisplay_tests PRIVATE
     fuvr_vdisplay_control
     GTest::gtest_main

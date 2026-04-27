@@ -20,3 +20,44 @@ add_executable(test_clock_sync
     ../clock_sync.cpp
 )
 target_include_directories(test_clock_sync PRIVATE ..)
+
+# Pure-logic input packer (Task 1).
+add_executable(test_input_packing
+    test_input_packing.cpp
+    ../input_packer.cpp
+)
+target_include_directories(test_input_packing PRIVATE ..)
+
+# Metrics line formatter (Task 5).
+add_executable(test_metrics_format
+    test_metrics_format.cpp
+    ../metrics_format.cpp
+)
+target_include_directories(test_metrics_format PRIVATE ..)
+
+# Adaptive bitrate / keyframe request tracker (Task 6).
+add_executable(test_loss_tracker
+    test_loss_tracker.cpp
+    ../loss_tracker.cpp
+)
+target_include_directories(test_loss_tracker PRIVATE ..)
+
+# Hand-tracking joint encoder (Task 4).
+add_executable(test_hand_encoder
+    test_hand_encoder.cpp
+    ../hand_encoder.cpp
+)
+target_include_directories(test_hand_encoder PRIVATE ..)
+
+# Connection-UI rasterizer (Task 3).
+add_executable(test_connection_ui
+    test_connection_ui.cpp
+    ../connection_ui.cpp
+)
+target_include_directories(test_connection_ui PRIVATE ..)
+
+# Stage-offset math used by Task 2.
+add_executable(test_local_origin_math
+    test_local_origin_math.cpp
+)
+target_include_directories(test_local_origin_math PRIVATE ..)

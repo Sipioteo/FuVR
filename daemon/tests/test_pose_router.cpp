@@ -46,6 +46,24 @@ TEST(PoseRouter, RoutesUpstreamFrameToSubscriber) {
     hmd.initLinearVelocity().setX(0.5f);
     hmd.initAngularVelocity().setY(0.25f);
 
+    auto ctrls = frame.initControllers(2);
+    auto cl = ctrls[0];
+    cl.setHand(fuvr::proto::ControllerHand::LEFT);
+    cl.setIsActive(true);
+    cl.initPose().initPosition().setX(7.0f);
+    cl.getPose().getPosition().setY(8.0f);
+    cl.getPose().getPosition().setZ(9.0f);
+    cl.getPose().initOrientation().setW(1.0f);
+    cl.initLinearVelocity().setX(1.5f);
+    cl.initAngularVelocity().setZ(2.5f);
+    auto cr = ctrls[1];
+    cr.setHand(fuvr::proto::ControllerHand::RIGHT);
+    cr.setIsActive(true);
+    cr.initPose().initPosition().setX(-1.0f);
+    cr.getPose().getPosition().setY(-2.0f);
+    cr.getPose().getPosition().setZ(-3.0f);
+    cr.getPose().initOrientation().setW(1.0f);
+
     kj::VectorOutputStream os;
     capnp::writePackedMessage(os, mb);
     auto bytes = os.getArray();
@@ -66,6 +84,15 @@ TEST(PoseRouter, RoutesUpstreamFrameToSubscriber) {
     EXPECT_FLOAT_EQ(snap.getRightPosZ(), 6.0f);
     EXPECT_FLOAT_EQ(snap.getLinVelX(), 0.5f);
     EXPECT_FLOAT_EQ(snap.getAngVelY(), 0.25f);
+    EXPECT_TRUE(snap.getLeftControllerActive());
+    EXPECT_FLOAT_EQ(snap.getLeftControllerPosX(), 7.0f);
+    EXPECT_FLOAT_EQ(snap.getLeftControllerPosY(), 8.0f);
+    EXPECT_FLOAT_EQ(snap.getLeftControllerPosZ(), 9.0f);
+    EXPECT_FLOAT_EQ(snap.getLeftControllerLinVelX(), 1.5f);
+    EXPECT_FLOAT_EQ(snap.getLeftControllerAngVelZ(), 2.5f);
+    EXPECT_TRUE(snap.getRightControllerActive());
+    EXPECT_FLOAT_EQ(snap.getRightControllerPosX(), -1.0f);
+    EXPECT_FLOAT_EQ(snap.getRightControllerPosZ(), -3.0f);
 
     router.removeSubscriber(streamId);
     ASSERT_TRUE(router.ingestPackedUpstreamFrame(bytes.begin(), bytes.size(), 7, 2000));

@@ -1,5 +1,14 @@
 # fuvrd — outstanding work
 
+## Pass 5 — vdisplay full integration
+
+THETA shipped `daemon/vdisplay/VirtualDisplaySession` (ScreenCaptureKit
+against `CGVirtualDisplay`, ready to feed the encoder directly). Pass 4
+left the pass-1 `fuvr_vdisplay_spawn` path in `Session::Session` for
+backwards compatibility — it spawns the display but does not yet pipe
+captured frames to the encoder. Apply the 3-line patch documented in
+`daemon/vdisplay/INTEGRATION.md` when extended-display mode is wanted live.
+
 ## Stubbed
 - Transport FFI: `FUVR_DAEMON_NO_TRANSPORT` provides weak C stubs so the
   daemon links without the Rust dylib. Once `cargo build --release` produces

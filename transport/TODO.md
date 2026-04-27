@@ -16,3 +16,11 @@
   encoder thread never stalls on transport.
 - Add Cap'n Proto helpers (encode/decode VideoFragmentHeader) in
   transport-core::wire to match the documented wire format.
+- Pass 4 piggy-backs `BitrateAdjustRequest` and `KeyframeRequest` on
+  `ControlMessage.error` (`bitrate-req:<kbps>` / `keyframe-req:`).
+  Replace with proper union arms at the next major schema bump.
+- transport-usb/aoa.rs is a stub (escalation per SPEC §3.1.4); replace
+  with a real libusb (`rusb`) implementation when ADB is unavailable.
+- transport-ffi: feed `fuvr_transport_record_rtt_us` /
+  `fuvr_transport_record_loss` from the daemon's clock-sync and
+  reassembly stats so `transportRttMs` / `transportLossPct` aren't zero.

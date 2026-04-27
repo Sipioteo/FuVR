@@ -5,6 +5,7 @@
 #include "openxr_session.hpp"
 #include "transport_client.hpp"
 #include "proto_codec.hpp"
+#include "input_packer.hpp"
 
 #include <android/log.h>
 #include <chrono>
@@ -58,6 +59,10 @@ void PoseForwarder::run() {
         if (xr_.is_running() && xr_.session() != XR_NULL_HANDLE) {
             const XrTime t = xr_.predicted_display_time();
 
+            // Single sync per tick: shared by pose locate + action read.
+            xr_.sync_actions();
+            xr_.capture_local_origin_if_needed(t);
+
             XrSpaceLocation hand_loc[2] = {{XR_TYPE_SPACE_LOCATION}, {XR_TYPE_SPACE_LOCATION}};
             for (int i = 0; i < 2; ++i) {
                 if (xr_.hand_space(i) != XR_NULL_HANDLE) {
@@ -79,7 +84,13 @@ void PoseForwarder::run() {
                 f.controllers[i].isActive =
                     (hand_loc[i].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
                 f.controllers[i].pose = to_plain(hand_loc[i].pose);
-                f.inputs[i].hand = i;
+
+                ActionStateBundle bundle;
+                if (xr_.read_action_state(i, bundle)) {
+                    f.inputs[i] = InputPacker::pack(bundle);
+                } else {
+                    f.inputs[i].hand = i;
+                }
             }
 
             auto bytes = encode_upstream_frame(f);

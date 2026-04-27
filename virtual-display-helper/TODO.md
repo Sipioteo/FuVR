@@ -16,3 +16,14 @@
 
 - **DriverKit display extension.** Apple does not document display extensions in DriverKit; only USB/HID/Audio guides exist. Will not pursue.
 - **Legacy kext.** Requires Reduced Security on Apple Silicon, breaks distribution. Will not pursue.
+
+## Deferred
+
+- **Passthrough cursor.** Forwarding the macOS hardware cursor onto the virtual
+  display's framebuffer so the Quest preview shows it. The current path renders
+  the cursor only when an app draws it explicitly; the OS cursor layer is
+  composited by WindowServer above the captured framebuffer and is invisible
+  to ScreenCaptureKit. Likely solution: read `CGCursorIsVisible` /
+  `CGSCursorPosition` (private SkyLight API) and overlay a sprite at the
+  encoder stage. Defer until a user complaint surfaces — most VR-extended-display
+  use cases (a media-watching second monitor) don't need the cursor.

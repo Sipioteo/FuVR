@@ -17,6 +17,12 @@ enum class SpaceKind : uint8_t {
   Action = 3,
 };
 
+enum class ActionHand : uint8_t {
+  Unknown = 0,
+  Left = 1,
+  Right = 2,
+};
+
 struct Space {
   XrSpace handle{XR_NULL_HANDLE};
   Session* session{nullptr};
@@ -24,6 +30,8 @@ struct Space {
   Pose poseInRef{};
   Action* action{nullptr};
   XrPath subactionPath{XR_NULL_PATH};
+  ActionHand actionHand{ActionHand::Unknown};
+  bool isEyeGaze{false};
 };
 
 Space* lookupSpace(XrSpace handle) noexcept;

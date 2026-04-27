@@ -4,6 +4,7 @@
 //! FuVR transport-core: codec-agnostic types, traits, and wire helpers.
 
 pub mod channel;
+pub mod control;
 pub mod fec;
 pub mod pacing;
 pub mod fuvr_capnp;

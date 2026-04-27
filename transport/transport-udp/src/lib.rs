@@ -4,6 +4,8 @@
 //! UDP datagram transport with MTU-aware fragmentation, FEC, and
 //! timeout-based reassembly. ARQ-free.
 
+pub mod jitter;
+
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::stream::BoxStream;

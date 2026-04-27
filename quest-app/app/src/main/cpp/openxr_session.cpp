@@ -50,6 +50,7 @@ bool OpenXrSession::create_instance() {
         XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
         XR_FB_COLOR_SPACE_EXTENSION_NAME,
         XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME,
+        XR_EXT_HAND_TRACKING_EXTENSION_NAME,
     };
 
     XrInstanceCreateInfoAndroidKHR android_info{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -94,13 +95,60 @@ bool OpenXrSession::create_spaces() {
     XrReferenceSpaceCreateInfo ref{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
     ref.poseInReferenceSpace.orientation.w = 1.0f;
 
+    // Why: pose_forwarder reports both local-relative and stage-relative
+    // poses. STAGE may be unavailable (guardian not configured); we fall
+    // back to LOCAL but still keep a separate local_space_ handle so the
+    // ATW path always has a working reference.
+    ref.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    if (!xr_check(xrCreateReferenceSpace(session_, &ref, &local_space_), "local")) return false;
+
     ref.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
     if (!xr_check(xrCreateReferenceSpace(session_, &ref, &stage_space_), "stage")) {
-        ref.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
-        if (!xr_check(xrCreateReferenceSpace(session_, &ref, &stage_space_), "local")) return false;
+        // Stage unavailable — alias stage_space_ to local_space_ so callers
+        // that locate against stage_space_ still get a valid result.
+        stage_space_ = local_space_;
     }
     ref.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     return xr_check(xrCreateReferenceSpace(session_, &ref, &view_space_), "view");
+}
+
+namespace {
+// stageOffset = stagePose⁻¹ × hmdPose, captured once and applied each frame.
+// Quaternion inverse for unit q is conjugate.
+XrPosef pose_inverse(const XrPosef& p) {
+    XrPosef inv{};
+    inv.orientation.x = -p.orientation.x;
+    inv.orientation.y = -p.orientation.y;
+    inv.orientation.z = -p.orientation.z;
+    inv.orientation.w =  p.orientation.w;
+    // -inv.orientation * p.position
+    const float qx = inv.orientation.x;
+    const float qy = inv.orientation.y;
+    const float qz = inv.orientation.z;
+    const float qw = inv.orientation.w;
+    const float vx = -p.position.x, vy = -p.position.y, vz = -p.position.z;
+    const float tx = 2.0f * (qy * vz - qz * vy);
+    const float ty = 2.0f * (qz * vx - qx * vz);
+    const float tz = 2.0f * (qx * vy - qy * vx);
+    inv.position.x = vx + qw * tx + (qy * tz - qz * ty);
+    inv.position.y = vy + qw * ty + (qz * tx - qx * tz);
+    inv.position.z = vz + qw * tz + (qx * ty - qy * tx);
+    return inv;
+}
+}
+
+void OpenXrSession::capture_local_origin_if_needed(XrTime t) {
+    if (local_origin_captured_) return;
+    if (stage_space_ == XR_NULL_HANDLE || stage_space_ == local_space_) return;
+    if (local_space_ == XR_NULL_HANDLE) return;
+    XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+    if (xrLocateSpace(local_space_, stage_space_, t, &loc) != XR_SUCCESS) return;
+    constexpr XrSpaceLocationFlags kValid =
+        XR_SPACE_LOCATION_POSITION_VALID_BIT |
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if ((loc.locationFlags & kValid) != kValid) return;
+    local_origin_pose_ = pose_inverse(loc.pose);
+    local_origin_captured_ = true;
 }
 
 bool OpenXrSession::create_action_set() {
@@ -110,9 +158,8 @@ bool OpenXrSession::create_action_set() {
     as.priority = 0;
     if (!xr_check(xrCreateActionSet(instance_, &as, &action_set_), "xrCreateActionSet")) return false;
 
-    XrPath hand_paths[2];
-    xrStringToPath(instance_, "/user/hand/left", &hand_paths[0]);
-    xrStringToPath(instance_, "/user/hand/right", &hand_paths[1]);
+    xrStringToPath(instance_, "/user/hand/left", &hand_paths_[0]);
+    xrStringToPath(instance_, "/user/hand/right", &hand_paths_[1]);
 
     auto make_action = [&](const char* name, const char* loc, XrActionType type, XrAction* out) {
         XrActionCreateInfo ai{XR_TYPE_ACTION_CREATE_INFO};
@@ -120,16 +167,23 @@ bool OpenXrSession::create_action_set() {
         std::strcpy(ai.localizedActionName, loc);
         ai.actionType = type;
         ai.countSubactionPaths = 2;
-        ai.subactionPaths = hand_paths;
+        ai.subactionPaths = hand_paths_.data();
         return xr_check(xrCreateAction(action_set_, &ai, out), name);
     };
 
     make_action("hand_pose", "Hand Pose", XR_ACTION_TYPE_POSE_INPUT, &pose_action_);
     make_action("trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT, &trigger_action_);
+    make_action("trigger_touch", "Trigger Touch", XR_ACTION_TYPE_BOOLEAN_INPUT, &trigger_touch_action_);
     make_action("grip", "Grip", XR_ACTION_TYPE_FLOAT_INPUT, &grip_action_);
     make_action("thumbstick", "Thumbstick", XR_ACTION_TYPE_VECTOR2F_INPUT, &thumbstick_action_);
+    make_action("thumbstick_click", "Thumbstick Click", XR_ACTION_TYPE_BOOLEAN_INPUT, &thumbstick_click_action_);
+    make_action("thumbstick_touch", "Thumbstick Touch", XR_ACTION_TYPE_BOOLEAN_INPUT, &thumbstick_touch_action_);
     make_action("button_a", "Button A/X", XR_ACTION_TYPE_BOOLEAN_INPUT, &button_a_action_);
+    make_action("button_a_touch", "Button A/X Touch", XR_ACTION_TYPE_BOOLEAN_INPUT, &button_a_touch_action_);
     make_action("button_b", "Button B/Y", XR_ACTION_TYPE_BOOLEAN_INPUT, &button_b_action_);
+    make_action("button_b_touch", "Button B/Y Touch", XR_ACTION_TYPE_BOOLEAN_INPUT, &button_b_touch_action_);
+    make_action("system_click", "System Click", XR_ACTION_TYPE_BOOLEAN_INPUT, &system_click_action_);
+    make_action("thumbrest", "Thumbrest", XR_ACTION_TYPE_FLOAT_INPUT, &thumbrest_action_);
     make_action("haptic", "Haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT, &haptic_action_);
 
     XrPath profile_path;
@@ -137,20 +191,33 @@ bool OpenXrSession::create_action_set() {
 
     auto p = [&](const char* s) { XrPath o; xrStringToPath(instance_, s, &o); return o; };
     XrActionSuggestedBinding bindings[] = {
-        {pose_action_,       p("/user/hand/left/input/grip/pose")},
-        {pose_action_,       p("/user/hand/right/input/grip/pose")},
-        {trigger_action_,    p("/user/hand/left/input/trigger/value")},
-        {trigger_action_,    p("/user/hand/right/input/trigger/value")},
-        {grip_action_,       p("/user/hand/left/input/squeeze/value")},
-        {grip_action_,       p("/user/hand/right/input/squeeze/value")},
-        {thumbstick_action_, p("/user/hand/left/input/thumbstick")},
-        {thumbstick_action_, p("/user/hand/right/input/thumbstick")},
-        {button_a_action_,   p("/user/hand/left/input/x/click")},
-        {button_a_action_,   p("/user/hand/right/input/a/click")},
-        {button_b_action_,   p("/user/hand/left/input/y/click")},
-        {button_b_action_,   p("/user/hand/right/input/b/click")},
-        {haptic_action_,     p("/user/hand/left/output/haptic")},
-        {haptic_action_,     p("/user/hand/right/output/haptic")},
+        {pose_action_,             p("/user/hand/left/input/grip/pose")},
+        {pose_action_,             p("/user/hand/right/input/grip/pose")},
+        {trigger_action_,          p("/user/hand/left/input/trigger/value")},
+        {trigger_action_,          p("/user/hand/right/input/trigger/value")},
+        {trigger_touch_action_,    p("/user/hand/left/input/trigger/touch")},
+        {trigger_touch_action_,    p("/user/hand/right/input/trigger/touch")},
+        {grip_action_,             p("/user/hand/left/input/squeeze/value")},
+        {grip_action_,             p("/user/hand/right/input/squeeze/value")},
+        {thumbstick_action_,       p("/user/hand/left/input/thumbstick")},
+        {thumbstick_action_,       p("/user/hand/right/input/thumbstick")},
+        {thumbstick_click_action_, p("/user/hand/left/input/thumbstick/click")},
+        {thumbstick_click_action_, p("/user/hand/right/input/thumbstick/click")},
+        {thumbstick_touch_action_, p("/user/hand/left/input/thumbstick/touch")},
+        {thumbstick_touch_action_, p("/user/hand/right/input/thumbstick/touch")},
+        {button_a_action_,         p("/user/hand/left/input/x/click")},
+        {button_a_action_,         p("/user/hand/right/input/a/click")},
+        {button_a_touch_action_,   p("/user/hand/left/input/x/touch")},
+        {button_a_touch_action_,   p("/user/hand/right/input/a/touch")},
+        {button_b_action_,         p("/user/hand/left/input/y/click")},
+        {button_b_action_,         p("/user/hand/right/input/b/click")},
+        {button_b_touch_action_,   p("/user/hand/left/input/y/touch")},
+        {button_b_touch_action_,   p("/user/hand/right/input/b/touch")},
+        {system_click_action_,     p("/user/hand/left/input/system/click")},
+        {thumbrest_action_,        p("/user/hand/left/input/thumbrest/force")},
+        {thumbrest_action_,        p("/user/hand/right/input/thumbrest/force")},
+        {haptic_action_,           p("/user/hand/left/output/haptic")},
+        {haptic_action_,           p("/user/hand/right/output/haptic")},
     };
     XrInteractionProfileSuggestedBinding suggest{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
     suggest.interactionProfile = profile_path;
@@ -161,7 +228,7 @@ bool OpenXrSession::create_action_set() {
     for (int hand = 0; hand < 2; ++hand) {
         XrActionSpaceCreateInfo sci{XR_TYPE_ACTION_SPACE_CREATE_INFO};
         sci.action = pose_action_;
-        sci.subactionPath = hand_paths[hand];
+        sci.subactionPath = hand_paths_[hand];
         sci.poseInActionSpace.orientation.w = 1.0f;
         xr_check(xrCreateActionSpace(session_, &sci, &hand_spaces_[hand]), "xrCreateActionSpace");
     }
@@ -191,13 +258,75 @@ void OpenXrSession::poll_events() {
         ev = {XR_TYPE_EVENT_DATA_BUFFER};
     }
 
-    if (running_) {
-        const XrActiveActionSet active{action_set_, XR_NULL_PATH};
-        XrActionsSyncInfo si{XR_TYPE_ACTIONS_SYNC_INFO};
-        si.countActiveActionSets = 1;
-        si.activeActionSets = &active;
-        xrSyncActions(session_, &si);
+    // Why: pose_forwarder runs at 1 kHz on its own thread and must call
+    // sync_actions() itself before reading per-hand state for that tick.
+    // We no longer call xrSyncActions in poll_events, to avoid double-sync
+    // racing the forwarder's read.
+}
+
+bool OpenXrSession::sync_actions() {
+    if (!running_ || session_ == XR_NULL_HANDLE || action_set_ == XR_NULL_HANDLE) return false;
+    const XrActiveActionSet active{action_set_, XR_NULL_PATH};
+    XrActionsSyncInfo si{XR_TYPE_ACTIONS_SYNC_INFO};
+    si.countActiveActionSets = 1;
+    si.activeActionSets = &active;
+    return xrSyncActions(session_, &si) == XR_SUCCESS;
+}
+
+bool OpenXrSession::read_action_state(int hand, ActionStateBundle& out) const {
+    if (hand < 0 || hand > 1) return false;
+    if (session_ == XR_NULL_HANDLE) return false;
+    const XrPath sub = hand_paths_[hand];
+
+    auto get_bool = [&](XrAction a, bool& dst, bool& any_active) {
+        if (a == XR_NULL_HANDLE) return;
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = a; gi.subactionPath = sub;
+        XrActionStateBoolean s{XR_TYPE_ACTION_STATE_BOOLEAN};
+        if (xrGetActionStateBoolean(session_, &gi, &s) == XR_SUCCESS) {
+            dst = s.currentState;
+            any_active = any_active || s.isActive;
+        }
+    };
+    auto get_float = [&](XrAction a, float& dst, bool& any_active) {
+        if (a == XR_NULL_HANDLE) return;
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = a; gi.subactionPath = sub;
+        XrActionStateFloat s{XR_TYPE_ACTION_STATE_FLOAT};
+        if (xrGetActionStateFloat(session_, &gi, &s) == XR_SUCCESS) {
+            dst = s.currentState;
+            any_active = any_active || s.isActive;
+        }
+    };
+
+    out = ActionStateBundle{};
+    out.hand = hand;
+    bool active = false;
+
+    get_float(trigger_action_,        out.trigger,         active);
+    get_bool (trigger_touch_action_,  out.triggerTouch,    active);
+    get_float(grip_action_,           out.squeeze,         active);
+    get_bool (thumbstick_click_action_, out.thumbstickClick, active);
+    get_bool (thumbstick_touch_action_, out.thumbstickTouch, active);
+    get_bool (button_a_action_,       out.buttonAClick,    active);
+    get_bool (button_a_touch_action_, out.buttonATouch,    active);
+    get_bool (button_b_action_,       out.buttonBClick,    active);
+    get_bool (button_b_touch_action_, out.buttonBTouch,    active);
+    get_float(thumbrest_action_,      out.thumbrest,       active);
+    if (hand == 0) get_bool(system_click_action_, out.systemClick, active);
+
+    if (thumbstick_action_ != XR_NULL_HANDLE) {
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = thumbstick_action_; gi.subactionPath = sub;
+        XrActionStateVector2f s{XR_TYPE_ACTION_STATE_VECTOR2F};
+        if (xrGetActionStateVector2f(session_, &gi, &s) == XR_SUCCESS) {
+            out.thumbstickX = s.currentState.x;
+            out.thumbstickY = s.currentState.y;
+            active = active || s.isActive;
+        }
     }
+    out.active = active;
+    return true;
 }
 
 void OpenXrSession::begin_frame() {
@@ -257,7 +386,8 @@ void OpenXrSession::destroy() {
     if (action_set_) xrDestroyActionSet(action_set_);
     for (auto& s : hand_spaces_) if (s) xrDestroySpace(s);
     if (view_space_) xrDestroySpace(view_space_);
-    if (stage_space_) xrDestroySpace(stage_space_);
+    if (stage_space_ && stage_space_ != local_space_) xrDestroySpace(stage_space_);
+    if (local_space_) xrDestroySpace(local_space_);
     if (session_) xrDestroySession(session_);
     if (instance_) xrDestroyInstance(instance_);
     instance_ = XR_NULL_HANDLE;

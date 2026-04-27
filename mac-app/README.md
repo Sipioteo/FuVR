@@ -8,8 +8,12 @@ sibling directories.
 
 - `Sources/FuVRApp/` — SwiftUI app target (`@main`)
 - `Sources/FuVRControl/` — pure-Swift library: control protocol, metrics buffer,
-  Network.framework UDS client, in-process mock daemon
-- `Tests/FuVRControlTests/` — XCTest coverage for protocol round-trip and rolling stats
+  Network.framework UDS client, in-process mock daemon, settings migration
+- `Sources/FuVRCapnp/` — hand-rolled Cap'n Proto encoder/decoder for the
+  envelope subset exchanged with `fuvrd`
+- `Tests/FuVRControlTests/` — XCTest coverage for the bridge, settings
+  migration, and metrics math
+- `Tests/FuVRCapnpTests/` — XCTest coverage for the Cap'n Proto wire format
 
 ## Build & run
 
@@ -39,38 +43,57 @@ The app ships with an in-process mock daemon (`MockDaemon` in
 `FuVRControl`). When the **Run mock daemon in-process** toggle in the Session
 view is on, hitting **Connect** spins up the mock listener on the configured
 socket path and the same SwiftUI state machine drives end-to-end without any
-external dependency. The mock advertises a Quest 3 capability set, accepts a
-`helloFromMac`, and streams synthetic `metrics` samples at 10 Hz.
+external dependency. The mock now speaks packed Cap'n Proto envelopes
+identical to those produced by the real daemon and emits metrics + log
+streams at 10 Hz / 0.33 Hz respectively.
 
-## Control protocol (v0)
+## Control protocol (v1, pass 4)
 
-The control plane is **JSON, line-delimited, over a Unix domain socket**.
-Default path resolves to `~/Library/Caches/fuvr/control.sock`, falling back
-to `/tmp/fuvr.sock`.
+Pass 4 migrated the wire from line-delimited JSON to **packed Cap'n Proto**
+envelopes over a Unix domain socket, matching `proto/fuvrd.capnp`. Each
+frame on the socket is a 4-byte little-endian length prefix followed by
+that many bytes of packed Cap'n Proto for an `Envelope` struct.
 
-Envelope:
+### Cap'n Proto strategy
 
-```json
-{ "v": 1, "type": "helloFromMac", "payload": { ... } }
-```
+The `FuVRCapnp` module is a **hand-rolled** encoder/decoder for the
+envelope subset the mac-app actually exchanges (`startSession`,
+`stopSession`, `streamMetrics`, `streamLogs`, `streamInputs`, `ping`,
+`pong`, `ok`, `error`, `startSessionAck`, `metrics`, `log`). We chose
+hand-rolling over a third-party Swift Cap'n Proto library because:
 
-The Swift types in `ControlMessage.swift` mirror the Cap'n Proto schema in
-`proto/fuvr.capnp` exactly for the relevant union arms (`helloFromQuest`,
-`helloFromMac`, `sessionStart`, `sessionStop`, `error`) and add two
-control-surface-only event types — `metrics` and `log` — for the diagnostics
-and log views. Once the daemon side stabilises, this layer will be replaced
-by Cap'n Proto without changing the SwiftUI surface.
+1. The available Swift Cap'n Proto packages are unmaintained.
+2. The subset we exchange is small and stable; the schema is frozen at
+   `@0xc8a4f30f6df21a7b`.
+3. A subprocess bridge would add a build dependency on libcapnp and a
+   second binary to ship; `FuVRCapnp` keeps the app a single SPM target.
+
+The slot layout for each struct is documented inline in
+`Sources/FuVRCapnp/CapnpCodec.swift`. The unit tests in
+`Tests/FuVRCapnpTests/` round-trip every supported arm and assert
+hand-computed reference bytes for a sentinel `ping` envelope so any
+divergence from libcapnp's slot allocator is caught immediately.
+
+## Settings migration (v2)
+
+Pass 1 used `@AppStorage` per setting. Pass 4 introduces `SettingsBundle`,
+a versioned Codable struct persisted as a single JSON blob under the
+`fuvr.settings.v2` key. `SettingsMigration.load()` is invoked once at app
+startup. It:
+
+1. Returns the v2 blob if present.
+2. Otherwise migrates by reading each legacy `fuvr.*` key, populating a
+   v2 record, and persisting it.
+
+Existing views still read legacy keys via `@AppStorage` so the migration
+is non-destructive. A future pass will move the views to read directly
+from the bundle. Unit-tested in `SettingsMigrationTests`.
 
 ## Design rationale
 
 - **Network.framework over SwiftNIO** — `NWConnection.unix(path:)` is a single
   Apple framework with full async support, zero deps, and a tiny binary
-  footprint. SwiftNIO would add ~MB of binary size for no benefit on a
-  control plane that handles tens of messages per second.
-- **JSON over UDS for v0** — keeps daemon iteration unblocked. The Cap'n
-  Proto schema is the long-term wire contract for the data plane (video
-  fragments, pose at 1 kHz); the control plane has no throughput budget that
-  JSON cannot meet.
+  footprint.
 - **No third-party SPM packages** — everything depends on Foundation, Network,
   SwiftUI, and Swift Charts. This keeps the app trivially Xcode-buildable
   and signable.
@@ -78,12 +101,14 @@ by Cap'n Proto without changing the SwiftUI surface.
   backgrounds throughout; `.glassEffect()` is only invoked under
   `if #available(macOS 26.0, *)` so the app renders cleanly on macOS 14+.
 
-## Screenshots
-
-_Placeholder — populate after first internal build._
-
 ## Status surfaces
 
-The Diagnostics view tracks the metrics flagged as risk-bearing in `SPEC.md` §6:
-encode latency (VideoToolbox HEVC RealTime), RTT and packet loss (ADB / Wi-Fi
-fallback). The Log view pipes daemon log lines verbatim with level filtering.
+- **Diagnostics**: six sparkline cards (encoder fps / encode p95 / RTT,
+  decoder fps / decode p95 / packet loss) over a 30-second rolling window,
+  plus an "Active session" card with session id, codec, bitrate, virtual
+  display id, and clock offset.
+- **Log**: chip-style level filters (debug/info/warn/error), search box,
+  pause toggle, sticky-bottom auto-scroll, color-coded levels. In-memory
+  ring of the last 1000 lines; nothing written to disk.
+- **Onboarding**: three-step wizard (install daemon, pair Quest, test
+  session) shown on first launch and re-launchable from the About panel.

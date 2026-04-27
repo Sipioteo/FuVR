@@ -38,6 +38,33 @@ PoseSample poseFromSnapshot(const fuvr::daemon::PoseSnapshot::Reader& s) noexcep
            s.getRightRotW()};
   out.linearVelocity = Vec3{s.getLinVelX(), s.getLinVelY(), s.getLinVelZ()};
   out.angularVelocity = Vec3{s.getAngVelX(), s.getAngVelY(), s.getAngVelZ()};
+
+  out.leftControllerActive = s.getLeftControllerActive();
+  out.leftController.position = Vec3{s.getLeftControllerPosX(),
+                                     s.getLeftControllerPosY(),
+                                     s.getLeftControllerPosZ()};
+  out.leftController.orientation = Quat{
+      s.getLeftControllerRotX(), s.getLeftControllerRotY(),
+      s.getLeftControllerRotZ(), s.getLeftControllerRotW()};
+  out.leftControllerLinVel = Vec3{s.getLeftControllerLinVelX(),
+                                  s.getLeftControllerLinVelY(),
+                                  s.getLeftControllerLinVelZ()};
+  out.leftControllerAngVel = Vec3{s.getLeftControllerAngVelX(),
+                                  s.getLeftControllerAngVelY(),
+                                  s.getLeftControllerAngVelZ()};
+  out.rightControllerActive = s.getRightControllerActive();
+  out.rightController.position = Vec3{s.getRightControllerPosX(),
+                                      s.getRightControllerPosY(),
+                                      s.getRightControllerPosZ()};
+  out.rightController.orientation = Quat{
+      s.getRightControllerRotX(), s.getRightControllerRotY(),
+      s.getRightControllerRotZ(), s.getRightControllerRotW()};
+  out.rightControllerLinVel = Vec3{s.getRightControllerLinVelX(),
+                                   s.getRightControllerLinVelY(),
+                                   s.getRightControllerLinVelZ()};
+  out.rightControllerAngVel = Vec3{s.getRightControllerAngVelX(),
+                                   s.getRightControllerAngVelY(),
+                                   s.getRightControllerAngVelZ()};
   return out;
 }
 
@@ -129,6 +156,16 @@ void DaemonClient::setDisconnectCallback(DisconnectCallback cb) noexcept {
   disconnectFired_ = false;
 }
 
+void DaemonClient::setInputCallback(InputCallback cb) noexcept {
+  std::lock_guard<std::mutex> lk(cbMutex_);
+  inputCb_ = std::move(cb);
+}
+
+void DaemonClient::setReconnectCallback(ReconnectCallback cb) noexcept {
+  std::lock_guard<std::mutex> lk(cbMutex_);
+  reconnectCb_ = std::move(cb);
+}
+
 bool DaemonClient::connectLocked() noexcept {
   int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) return false;
@@ -159,7 +196,12 @@ bool DaemonClient::ensureConnected() noexcept {
 
 void DaemonClient::scheduleReconnect() noexcept {
   std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs_));
-  backoffMs_ = backoffMs_ < 500 ? backoffMs_ * 2 : 1000;
+  // Why: 5s cap matches the spec for session-loss resilience; capped exponential
+  // backoff avoids a thundering reconnect storm against a daemon under restart.
+  uint32_t cap = maxBackoffMs_;
+  if (cap == 0) cap = 5000;
+  backoffMs_ = backoffMs_ < cap / 2 ? backoffMs_ * 2 : cap;
+  reconnectAttempts_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void DaemonClient::readerLoop() noexcept {
@@ -175,6 +217,13 @@ void DaemonClient::readerLoop() noexcept {
       if (!ensureConnected()) continue;
       fd = fd_.load();
       if (fd < 0) continue;
+      ReconnectCallback rc;
+      {
+        std::lock_guard<std::mutex> lk(cbMutex_);
+        rc = reconnectCb_;
+        disconnectFired_ = false;
+      }
+      if (rc) rc();
     }
     ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
     if (n <= 0) {
@@ -251,6 +300,38 @@ void DaemonClient::readerLoop() noexcept {
           if (cb) cb(sample);
           break;
         }
+        case fuvr::daemon::Envelope::Body::INPUT_SNAPSHOT: {
+          auto in = body.getInputSnapshot();
+          InputSnapshot snap{};
+          snap.receivedAtNs = in.getReceivedAtNs();
+          snap.questClockNs = in.getQuestClockNs();
+          auto fillCtl = [](const fuvr::daemon::ControllerInput::Reader& r,
+                            ControllerInputState& out) {
+            out.active = r.getActive();
+            out.trigger = r.getTrigger();
+            out.squeeze = r.getSqueeze();
+            out.thumbstickX = r.getThumbstickX();
+            out.thumbstickY = r.getThumbstickY();
+            out.thumbstickClick = r.getThumbstickClick();
+            out.thumbstickTouch = r.getThumbstickTouch();
+            out.triggerTouch = r.getTriggerTouch();
+            out.buttonAClick = r.getButtonAClick();
+            out.buttonATouch = r.getButtonATouch();
+            out.buttonBClick = r.getButtonBClick();
+            out.buttonBTouch = r.getButtonBTouch();
+            out.systemClick = r.getSystemClick();
+            out.thumbrest = r.getThumbrest();
+          };
+          fillCtl(in.getLeft(), snap.left);
+          fillCtl(in.getRight(), snap.right);
+          InputCallback cb;
+          {
+            std::lock_guard<std::mutex> lk(cbMutex_);
+            cb = inputCb_;
+          }
+          if (cb) cb(snap);
+          break;
+        }
         case fuvr::daemon::Envelope::Body::METRICS:
         case fuvr::daemon::Envelope::Body::LOG:
         case fuvr::daemon::Envelope::Body::PONG:
@@ -307,6 +388,27 @@ bool DaemonClient::subscribePoses(uint64_t sessionId) noexcept {
   env.setStreamId(1);
   auto req = env.getBody().initStreamPoses();
   req.setSessionId(sessionId);
+  return sendEnvelope(fd_.load(), mb, 0, sendMutex_);
+}
+
+bool DaemonClient::subscribeInputs(uint64_t sessionId) noexcept {
+  if (!ensureConnected()) return false;
+  capnp::MallocMessageBuilder mb;
+  auto env = mb.initRoot<fuvr::daemon::Envelope>();
+  env.setSeq(nextSeq_.fetch_add(1));
+  env.setStreamId(2);
+  auto req = env.getBody().initStreamInputs();
+  req.setSessionId(sessionId);
+  return sendEnvelope(fd_.load(), mb, 0, sendMutex_);
+}
+
+bool DaemonClient::subscribeEncodeStats() noexcept {
+  if (!ensureConnected()) return false;
+  capnp::MallocMessageBuilder mb;
+  auto env = mb.initRoot<fuvr::daemon::Envelope>();
+  env.setSeq(nextSeq_.fetch_add(1));
+  env.setStreamId(3);
+  env.getBody().setStreamEncodeStats();
   return sendEnvelope(fd_.load(), mb, 0, sendMutex_);
 }
 

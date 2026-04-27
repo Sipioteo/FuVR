@@ -188,7 +188,10 @@ void DecoderPipeline::on_image_available(AImageReader* reader) {
     // Why: drop-old replacement releases the previously-buffered frame's
     // ref that pop_latest never picked up; failing this leaks AHardwareBuffer
     // pages until the AImageReader hits its max-images limit and stalls.
-    if (prev) AHardwareBuffer_release(prev);
+    if (prev) {
+        AHardwareBuffer_release(prev);
+        ++dropped_frames_;
+    }
 
     const uint64_t arrival_ns = now_ns();
     uint64_t latency_ns = 0;
@@ -227,6 +230,7 @@ DecoderMetrics DecoderPipeline::snapshot_metrics() {
     std::lock_guard<std::mutex> lk(metrics_mutex_);
     DecoderMetrics m;
     m.frames_delivered = total_frames_;
+    m.dropped_frames = dropped_frames_.load();
     if (!arrival_intervals_ns_.empty()) {
         uint64_t sum = 0;
         for (uint64_t v : arrival_intervals_ns_) sum += v;
@@ -238,6 +242,9 @@ DecoderMetrics DecoderPipeline::snapshot_metrics() {
         std::sort(sorted.begin(), sorted.end());
         const size_t idx = (size_t)((double)(sorted.size() - 1) * 0.95);
         m.decode_ms_p95 = (float)((double)sorted[idx] / 1.0e6);
+        uint64_t sum = 0;
+        for (uint64_t v : decode_latency_ns_) sum += v;
+        m.decode_ms_avg = (float)((double)sum / (double)decode_latency_ns_.size() / 1.0e6);
     }
     return m;
 }

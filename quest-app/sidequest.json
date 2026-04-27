@@ -1,0 +1,31 @@
+{
+  "$schema": "https://sidequestvr.com/schemas/app-manifest-v1.json",
+  "app_id": "com.fuvr.client",
+  "name": "FuVR",
+  "summary": "Stream PCVR from your Mac over USB or Wi-Fi.",
+  "description": "FuVR is an open-source PCVR streaming client for Meta Quest. It pairs with the FuVR daemon on Apple Silicon Macs and renders OpenXR-rendered frames produced on the Mac. No SteamVR, no Quest Link, no reverse engineering — the wire format and OpenXR runtime are documented in the open-source repository.\n\nUse the matching macOS build for a working pair; mismatched versions are rejected at the control-channel handshake.",
+  "packageName": "com.fuvr.client",
+  "category": "Utilities",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/luminos-srl/FuVR",
+  "source_url": "https://github.com/luminos-srl/FuVR",
+  "image_url": "https://raw.githubusercontent.com/luminos-srl/FuVR/main/docs/cover.png",
+  "icon_url": "https://raw.githubusercontent.com/luminos-srl/FuVR/main/quest-app/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png",
+  "version": {
+    "source": "gradle",
+    "file": "app/build.gradle.kts",
+    "field": "versionName"
+  },
+  "min_sdk": 29,
+  "target_sdk": 32,
+  "supported_devices": ["quest_2", "quest_3", "quest_pro"],
+  "permissions": [
+    "android.permission.INTERNET",
+    "android.permission.ACCESS_NETWORK_STATE"
+  ],
+  "tags": ["pcvr", "streaming", "macos", "openxr", "open-source"],
+  "maintainer": {
+    "name": "Luminos SRL",
+    "email": "fuvr@luminosfilm.com"
+  }
+}

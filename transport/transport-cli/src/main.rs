@@ -44,6 +44,19 @@ enum Cmd {
         #[arg(long, default_value_t = 100)]
         pings: u32,
     },
+    /// Advertise this host on the LAN as a fuvrd via mDNS (ADR-0009).
+    MdnsAdvertise {
+        #[arg(long, default_value_t = 9943)]
+        port: u16,
+        /// Seconds to keep the registration alive (0 = forever).
+        #[arg(long, default_value_t = 0)]
+        seconds: u64,
+    },
+    /// Browse the LAN for fuvrd advertisements via mDNS (ADR-0009).
+    MdnsBrowse {
+        #[arg(long, default_value_t = 5)]
+        timeout: u64,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -64,7 +77,46 @@ async fn main() -> Result<()> {
         }
         Cmd::Dump { mode, server } => dump(mode, server).await,
         Cmd::ClockSync { mode, pings } => clock_sync(mode, pings).await,
+        Cmd::MdnsAdvertise { port, seconds } => mdns_advertise(port, seconds).await,
+        Cmd::MdnsBrowse { timeout } => mdns_browse(timeout).await,
     }
+}
+
+async fn mdns_advertise(port: u16, seconds: u64) -> Result<()> {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "fuvr-host".to_string());
+    let name = format!("{host}-fuvr");
+    let mut adv = transport_mdns::Advertiser::register(&name, port)
+        .map_err(|e| anyhow::anyhow!("mdns register failed: {e}"))?;
+    println!("advertising {name} on port {port} (Ctrl+C to stop)");
+    if seconds == 0 {
+        std::future::pending::<()>().await;
+    } else {
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+    }
+    let _ = adv.deregister();
+    Ok(())
+}
+
+async fn mdns_browse(timeout_secs: u64) -> Result<()> {
+    let timeout = Duration::from_secs(timeout_secs);
+    let found = tokio::task::spawn_blocking(move || transport_mdns::Browser::discover(timeout))
+        .await
+        .context("browse task")?
+        .map_err(|e| anyhow::anyhow!("mdns browse failed: {e}"))?;
+    if found.is_empty() {
+        println!("no fuvr services discovered in {timeout_secs}s");
+    } else {
+        for d in found {
+            println!(
+                "host={} ip={} port={} txt={:?}",
+                d.hostname, d.ip, d.port, d.txt
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn make_pair(mode: Mode) -> Result<(Arc<dyn Transport>, Arc<dyn Transport>)> {

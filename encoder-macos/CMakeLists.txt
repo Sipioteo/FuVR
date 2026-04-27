@@ -62,3 +62,5 @@ if(FUVR_ENCODER_TESTS)
     enable_testing()
     add_test(NAME fuvr_encoder_smoke COMMAND fuvr_encoder_smoke)
 endif()
+
+add_subdirectory(audio)

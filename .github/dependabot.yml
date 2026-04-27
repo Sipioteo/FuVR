@@ -1,0 +1,55 @@
+version: 2
+updates:
+  # GitHub Actions used by .github/workflows/*.yml
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"
+
+  # Rust transport crate.
+  - package-ecosystem: cargo
+    directory: "/transport"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "rust"]
+    commit-message:
+      prefix: "deps(rust)"
+    groups:
+      rust-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Quest companion app (Android/Gradle).
+  - package-ecosystem: gradle
+    directory: "/quest-app"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "android"]
+    commit-message:
+      prefix: "deps(android)"
+    groups:
+      gradle-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Mac control panel (Swift Package Manager).
+  - package-ecosystem: swift
+    directory: "/mac-app"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "swift"]
+    commit-message:
+      prefix: "deps(swift)"

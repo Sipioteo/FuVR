@@ -2,9 +2,11 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
+#include "fuvr/path_registry.hpp"
 #include "fuvr/runtime.hpp"
 
 namespace fuvr::runtime {
@@ -55,6 +57,8 @@ constexpr XrSystemId kSystemId = 1;
 const char* kSupportedExtensions[] = {
     "XR_KHR_vulkan_enable2",
     "XR_FUVR_metal_enable",
+    "XR_EXT_hand_tracking",
+    "XR_EXT_eye_gaze_interaction",
 };
 
 }  // namespace
@@ -274,9 +278,21 @@ XrResult xrStructureTypeToString_impl(XrInstance instance,
   return XR_SUCCESS;
 }
 
-XrResult xrPathToString_impl(XrInstance, XrPath, uint32_t, uint32_t*,
-                              char*) noexcept {
-  return XR_ERROR_FUNCTION_UNSUPPORTED;
+XrResult xrPathToString_impl(XrInstance instance, XrPath path,
+                              uint32_t bufferCapacity, uint32_t* countOutput,
+                              char* buffer) noexcept {
+  if (lookupInstance(instance) == nullptr || countOutput == nullptr) {
+    return XR_ERROR_HANDLE_INVALID;
+  }
+  const std::string* s = pathRegistry().lookup(path);
+  if (s == nullptr) return XR_ERROR_PATH_INVALID;
+  const uint32_t needed = static_cast<uint32_t>(s->size()) + 1;
+  *countOutput = needed;
+  if (buffer == nullptr || bufferCapacity == 0) return XR_SUCCESS;
+  if (bufferCapacity < needed) return XR_ERROR_SIZE_INSUFFICIENT;
+  std::memcpy(buffer, s->data(), s->size());
+  buffer[s->size()] = '\0';
+  return XR_SUCCESS;
 }
 
 XrResult xrStringToPath_impl(XrInstance instance, const char* str,
@@ -284,7 +300,7 @@ XrResult xrStringToPath_impl(XrInstance instance, const char* str,
   if (lookupInstance(instance) == nullptr || str == nullptr || out == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
   }
-  *out = static_cast<XrPath>(std::hash<std::string_view>{}(str));
+  *out = pathRegistry().intern(std::string_view(str));
   return XR_SUCCESS;
 }
 

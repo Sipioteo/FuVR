@@ -1,0 +1,20 @@
+Last login: Mon Apr 27 09:39:06 on ttys000
+sipioteo@Mac ~ % adb devices
+List of devices attached
+2G0YC5ZH0G018Z	device
+
+sipioteo@Mac ~ % system_profiler SPHardwareDataType | grep -E "(Model|Chip|Memory)"
+2026-04-27 10:40:35.201 system_profiler[10295:2666573] hw.cpufamily: 0x5f4dea93
+      Model Name: MacBook Pro
+      Model Identifier: Mac15,6
+      Model Number: Z1AU0045JT/A
+      Chip: Apple M3 Pro
+      Memory: 36 GB
+sipioteo@Mac ~ % adb shell getprop ro.product.model   
+Quest 3
+sipioteo@Mac ~ % adb shell getprop ro.build.version.release 
+14
+sipioteo@Mac ~ % adb shell getprop ro.build.version.incremental
+51154110174900520
+sipioteo@Mac ~ % 
+

@@ -11,6 +11,8 @@
 #include <kj/io.h>
 
 #include "fuvr/iosurface_bridge.hpp"
+#include "fuvr/logger.hpp"
+#include "fuvr/q_metrics_parser.hpp"
 #include "fuvr.capnp.h"
 #include "fuvr_transport.h"
 #include "fuvrd.capnp.h"
@@ -91,18 +93,31 @@ void Daemon::onTransportRecv(void* user, uint8_t channel,
         std::lock_guard lk(d->sessionsMu_);
         if (!d->sessions_.empty()) sid = d->sessions_.begin()->first;
     }
-    d->poseRouter_.ingestPackedUpstreamFrame(data, len, sid, nowNs());
+    uint64_t now = nowNs();
+    d->poseRouter_.ingestPackedUpstreamFrame(data, len, sid, now);
+    d->inputRouter_.ingestPackedUpstreamFrame(data, len, sid, now);
 }
 
 void Daemon::handleControlMessage(const uint8_t* data, std::size_t len) {
     kj::ArrayInputStream is(kj::arrayPtr(data, len));
     ::capnp::PackedMessageReader reader(is);
     auto cm = reader.getRoot<::fuvr::proto::ControlMessage>();
-    if (cm.which() != ::fuvr::proto::ControlMessage::CLOCK_SYNC) return;
-    auto cs = cm.getClockSync();
-    if (cs.which() != ::fuvr::proto::ClockSync::PONG) return;
-    auto p = cs.getPong();
-    clockSync_.onPong(p.getT0(), p.getT1(), p.getT2());
+    if (cm.which() == ::fuvr::proto::ControlMessage::CLOCK_SYNC) {
+        auto cs = cm.getClockSync();
+        if (cs.which() != ::fuvr::proto::ClockSync::PONG) return;
+        auto p = cs.getPong();
+        clockSync_.onPong(p.getT0(), p.getT1(), p.getT2());
+        return;
+    }
+    if (cm.which() == ::fuvr::proto::ControlMessage::ERROR) {
+        auto txt = cm.getError();
+        std::string_view sv(txt.cStr(), txt.size());
+        if (auto qm = parseQMetrics(sv)) {
+            std::lock_guard lk(qMetricsMu_);
+            if (qm->hasFps)       qDecoderFps_         = qm->decoderFps;
+            if (qm->hasDecodeP95) qDecoderDecodeMsP95_ = qm->decoderDecodeMsP95;
+        }
+    }
 }
 
 void Daemon::clockSyncLoop() {
@@ -127,25 +142,48 @@ void Daemon::clockSyncLoop() {
 }
 
 void Daemon::dispatchEncodeStats(const EncodeStatsEvent& ev) {
-    std::vector<MetricsSubscriber> subs;
-    {
-        std::lock_guard lk(metricsSubsMu_);
-        subs = metricsSubs_;
-    }
-    if (subs.empty()) return;
-    for (auto& sub : subs) {
+    auto encodeFor = [&](uint64_t streamId, std::vector<uint8_t>& out) {
         ::capnp::MallocMessageBuilder mb;
         auto e = mb.initRoot<::fuvr::daemon::Envelope>();
         e.setSeq(0);
-        e.setStreamId(sub.streamId);
+        e.setStreamId(streamId);
         auto es = e.getBody().initEncodeStats();
         es.setFrameId(ev.frameId);
         es.setEncodeDurationNs(ev.encodeDurationNs);
         es.setEncodedSizeBytes(ev.encodedSizeBytes);
         es.setWasKeyframe(ev.wasKeyframe);
-        std::vector<uint8_t> out;
         writePacked(mb, out);
+    };
+
+    std::vector<EncodeStatsSubscriber> dedicated;
+    {
+        std::lock_guard lk(encodeStatsSubsMu_);
+        dedicated = encodeStatsSubs_;
+    }
+    for (auto& sub : dedicated) {
+        std::vector<uint8_t> out;
+        encodeFor(sub.streamId, out);
         rpc_.send(sub.fd, out.data(), out.size());
+    }
+
+    std::vector<MetricsSubscriber> piggy;
+    {
+        std::lock_guard lk(metricsSubsMu_);
+        piggy = metricsSubs_;
+    }
+    if (!piggy.empty()) {
+        // Why: legacy subscribers (pre pass 4) consumed encodeStats on the
+        // metrics stream. Keep dual-emitting until those clients move; warn
+        // exactly once per process so the noise stays manageable.
+        if (!piggybackWarnLogged_.exchange(true)) {
+            FUVR_LOG_WARN("daemon",
+                "encodeStats piggy-back on streamMetrics is deprecated; subscribe to streamEncodeStats");
+        }
+        for (auto& sub : piggy) {
+            std::vector<uint8_t> out;
+            encodeFor(sub.streamId, out);
+            rpc_.send(sub.fd, out.data(), out.size());
+        }
     }
 }
 
@@ -169,6 +207,9 @@ void Daemon::onEnvelope(const InboundRpc& rpc) {
     switch (body.which()) {
     case ::fuvr::daemon::Envelope::Body::START_SESSION: {
         auto req = body.getStartSession();
+        FUVR_LOG_INFO("daemon", "session start request: %ux%u @ %u Hz",
+                      req.getPerEyeWidth(), req.getPerEyeHeight(),
+                      req.getRefreshRateHz());
         SessionConfig cfg;
         cfg.perEyeWidth = req.getPerEyeWidth();
         cfg.perEyeHeight = req.getPerEyeHeight();
@@ -286,6 +327,44 @@ void Daemon::onEnvelope(const InboundRpc& rpc) {
         });
         break;
     }
+    case ::fuvr::daemon::Envelope::Body::STREAM_INPUTS: {
+        auto req = body.getStreamInputs();
+        int fd = rpc.clientFd;
+        uint64_t sid = req.getSessionId();
+        uint64_t streamId = inputRouter_.addSubscriber(sid,
+            [this, fd](const uint8_t* d, std::size_t n) { rpc_.send(fd, d, n); });
+        reply([&](auto e) {
+            e.setStreamId(streamId);
+            e.getBody().setOk();
+        });
+        break;
+    }
+    case ::fuvr::daemon::Envelope::Body::STREAM_ENCODE_STATS: {
+        std::lock_guard lk(encodeStatsSubsMu_);
+        uint64_t sid = static_cast<uint64_t>(encodeStatsSubs_.size()) + 1;
+        encodeStatsSubs_.push_back({rpc.clientFd, sid});
+        reply([&](auto e) {
+            e.setStreamId(sid);
+            e.getBody().setOk();
+        });
+        break;
+    }
+    case ::fuvr::daemon::Envelope::Body::STREAM_LOGS: {
+        int fd = rpc.clientFd;
+        uint64_t sid;
+        {
+            std::lock_guard lk(logSubsMu_);
+            sid = static_cast<uint64_t>(logSubs_.size()) + 1;
+            logSubs_.push_back({fd, sid});
+        }
+        Logger::instance().subscribe(sid,
+            [this, fd](const uint8_t* d, std::size_t n) { rpc_.send(fd, d, n); });
+        reply([&](auto e) {
+            e.setStreamId(sid);
+            e.getBody().setOk();
+        });
+        break;
+    }
     case ::fuvr::daemon::Envelope::Body::PING:
         reply([&](auto e) { e.getBody().setPong(); });
         break;
@@ -331,8 +410,14 @@ void Daemon::metricsLoop() {
             m.setEncoderEncodeMsP95(agg.encoderEncodeMsP95);
             m.setTransportRttMs(agg.transportRttMs);
             m.setTransportLossPct(agg.transportLossPct);
-            m.setDecoderFps(0.0f);
-            m.setDecoderDecodeMsP95(0.0f);
+            float qFps, qP95;
+            {
+                std::lock_guard lk(qMetricsMu_);
+                qFps = qDecoderFps_;
+                qP95 = qDecoderDecodeMsP95_;
+            }
+            m.setDecoderFps(qFps);
+            m.setDecoderDecodeMsP95(qP95);
             m.setVideoBitrateMbps(agg.videoBitrateMbps);
             std::vector<uint8_t> out;
             writePacked(mb, out);

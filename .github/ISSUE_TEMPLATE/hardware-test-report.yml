@@ -1,0 +1,98 @@
+name: Hardware test report
+description: Share a successful (or unsuccessful) end-to-end run on real hardware.
+title: "[hw] "
+labels: ["hardware-report", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing FuVR on real silicon. These reports are how we
+        track the M0 → M1 → … milestones across the matrix of supported
+        devices. Please be specific; "it worked" without numbers is hard
+        to act on.
+  - type: input
+    id: mac
+    attributes:
+      label: Mac model
+      description: Exact model + chip (e.g. "MacBook Pro 14" 2024, M3 Pro").
+      placeholder: "MacBook Pro 14, M3 Pro, 36 GB"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "15.4 (24E5238b)"
+    validations:
+      required: true
+  - type: input
+    id: quest
+    attributes:
+      label: Quest model
+      placeholder: "Quest 3, 512 GB"
+    validations:
+      required: true
+  - type: input
+    id: quest_os
+    attributes:
+      label: Quest system version
+      placeholder: "v74 / SQ3A-..."
+    validations:
+      required: true
+  - type: input
+    id: fuvr_version
+    attributes:
+      label: FuVR version / commit
+      description: Output of `fuvrctl --version` or the commit hash you built.
+      placeholder: "0.3.0 / abcdef0"
+    validations:
+      required: true
+  - type: dropdown
+    id: link
+    attributes:
+      label: Connection
+      options:
+        - Wi-Fi 6E (5 GHz, dedicated AP)
+        - Wi-Fi 6 (5 GHz)
+        - Wi-Fi 5 / 2.4 GHz
+        - USB (adb reverse)
+        - Other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: m0_numbers
+    attributes:
+      label: M0 spike numbers
+      description: |
+        Paste the four numbers from the M0 spikes — encoder submit→onEncoded
+        median, transport loopback p50/p95, vdisplay end-to-end, runtime
+        metrics round-trip. The full report from `fuvrctl bench` is even
+        better.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: bench_report
+    attributes:
+      label: fuvrctl bench output
+      description: Attach or paste the contents of `bench-output/M0-report-*.md`.
+      render: markdown
+  - type: textarea
+    id: subjective
+    attributes:
+      label: Subjective experience
+      description: |
+        Motion-to-photon "feel", any visible artifacts, audio drift if you
+        tested it, hand-tracking accuracy, etc.
+  - type: textarea
+    id: issues
+    attributes:
+      label: Issues encountered
+      description: Crashes, disconnects, anything weird — even if it worked overall.
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: I agree to follow this project's Code of Conduct.
+          required: true

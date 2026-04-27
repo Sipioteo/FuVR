@@ -7,6 +7,10 @@
 #include "openxr_session.hpp"
 #include "proto_codec.hpp"
 #include "clock_sync.hpp"
+#include "metrics_format.hpp"
+#ifdef __ANDROID__
+#include "fuvr/audio/router_glue.hpp"
+#endif
 
 #include <android/log.h>
 #include <openxr/openxr.h>
@@ -19,10 +23,19 @@
 namespace fuvr {
 
 void ProtocolRouter::install() {
+#ifdef __ANDROID__
+    // Why: install_audio_handler() touches AAudio + libopus, neither of which
+    // exist on the host build. Host smoke compiles see audio_handler_ as null
+    // and skip the Audio case below.
+    audio_handler_ = fuvr::audio::install_audio_handler();
+#endif
     tx_.set_handler([this](Channel ch, const uint8_t* data, size_t size) {
         switch (ch) {
             case Channel::Video:   on_video(data, size); break;
             case Channel::Control: on_control(data, size); break;
+            case Channel::Audio:
+                if (audio_handler_) audio_handler_(data, size);
+                break;
             default: break;
         }
     });
@@ -35,14 +48,38 @@ void ProtocolRouter::send_metrics_if_due() {
     last_metrics_ns_ = now;
 
     auto m = dec_.snapshot_metrics();
-    char buf[128];
-    int n = std::snprintf(buf, sizeof(buf),
-                          "q-metrics: fps=%.1f, decode_p95_ms=%.2f, frames=%llu",
-                          (double)m.fps, (double)m.decode_ms_p95,
-                          (unsigned long long)m.frames_delivered);
-    if (n <= 0) return;
-    auto bytes = encode_error_message(std::string(buf, (size_t)n));
+    MetricsSample s;
+    s.fps = m.fps;
+    s.decode_p95_ms = m.decode_ms_p95;
+    s.decode_avg_ms = m.decode_ms_avg;
+    s.frames_delivered = m.frames_delivered;
+    s.dropped_frames = m.dropped_frames;
+    s.transport_loss_pct = transport_loss_pct_;
+
+    auto line = MetricsFormatter::format(s);
+    if (line.empty()) return;
+    auto bytes = encode_error_message(line);
     if (!bytes.empty()) tx_.send(Channel::Control, bytes.data(), bytes.size());
+}
+
+void ProtocolRouter::note_loss_frame() {
+    loss_tracker_.note_loss(ClockSyncResponder::now_ns());
+}
+
+void ProtocolRouter::note_decode_failure() {
+    loss_tracker_.note_decode_failure(ClockSyncResponder::now_ns());
+}
+
+void ProtocolRouter::poll_adaptive_signals() {
+    const uint64_t now = ClockSyncResponder::now_ns();
+    if (auto br = loss_tracker_.poll_bitrate_request(now)) {
+        auto bytes = encode_error_message(*br);
+        if (!bytes.empty()) tx_.send(Channel::Control, bytes.data(), bytes.size());
+    }
+    if (auto kf = loss_tracker_.poll_keyframe_request(now)) {
+        auto bytes = encode_error_message(*kf);
+        if (!bytes.empty()) tx_.send(Channel::Control, bytes.data(), bytes.size());
+    }
 }
 
 void ProtocolRouter::send_hello_from_quest() {

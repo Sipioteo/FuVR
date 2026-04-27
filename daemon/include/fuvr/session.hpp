@@ -35,6 +35,7 @@ struct SessionConfig {
     uint32_t bitrateBps = 30'000'000;
     uint32_t forceIdrEveryFrames = 240;
     bool enableVirtualDisplay = false;
+    bool audioEnabled = false;
 };
 
 class Session {

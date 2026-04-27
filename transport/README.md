@@ -3,6 +3,20 @@
 Rust workspace implementing the FuVR transport layer (USB and UDP) plus a C ABI
 shim consumed by the macOS encoder/runtime.
 
+## Pass-4 control workaround (frozen schema)
+
+The Cap'n Proto wire schema (`@0xb1f5d4f7c2a830e5`) is frozen at v1.
+Pass 4 needs two new upstream control signals — `BitrateAdjustRequest`
+and `KeyframeRequest` — that don't fit in the existing `ControlMessage`
+union. Until the next major schema bump we piggy-back on the existing
+`ControlMessage.error` arm using textual prefixes:
+
+- `bitrate-req:<kbps>` — Quest asks Mac to drop video bitrate.
+- `keyframe-req:` — Quest asks Mac to force the next encoded frame as IDR.
+
+See `transport-core/src/control.rs` for the parser/serializer used by
+both ends. Tracked in `TODO.md` for retirement at the next major schema bump.
+
 ## Crates
 
 - `transport-core` — `Channel`, `Direction`, `Transport` async trait, packed
@@ -20,7 +34,12 @@ shim consumed by the macOS encoder/runtime.
   `clock-sync`. Used to answer SPEC §5.M0 question 1.
 - `transport-ffi` — C ABI cdylib (`libtransport_ffi.dylib`) with header at
   `transport-ffi/include/fuvr_transport.h`. The macOS encoder/runtime links
-  against this.
+  against this. Includes `fuvr_transport_stats(out)` for the daemon's
+  `Metrics` envelope (RTT / loss / sent / recv counters).
+- `transport-mdns` — mDNS / Bonjour discovery (ADR-0009). Service type
+  `_fuvr._udp.local.`, TXT `version=1, codecs=hevc,h264, transport=udp,
+  port=N`. macOS uses Apple's dnssd via `astro-dnssd`; non-macOS builds
+  fall back to `mdns-sd` so CI runners still compile.
 
 ## Wire format
 

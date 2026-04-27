@@ -12,6 +12,8 @@ final class AppState: ObservableObject {
     @Published var logs: [LogLine] = []
     @Published var showAbout: Bool = false
     @Published var lastError: String?
+    @Published var sessionInfo: SessionInfo?
+    @Published var showOnboarding: Bool = false
 
     let metrics = MetricsBuffer(capacity: 600)
 
@@ -20,6 +22,12 @@ final class AppState: ObservableObject {
     private var mock: MockDaemon?
 
     init() {
+        // Trigger one-time migration from the legacy `@AppStorage` keys to
+        // the v2 `SettingsBundle` blob. Existing views still bind to the
+        // legacy keys via `@AppStorage`, so the migration is bidirectional:
+        // we read legacy → write v2; legacy keys remain readable. A future
+        // pass will move the views to read directly from the bundle.
+        _ = SettingsMigration.load()
         bridge = ClientBridge(owner: self)
         client.delegate = bridge
     }
@@ -72,7 +80,12 @@ final class AppState: ObservableObject {
         switch payload {
         case .helloFromQuest(let caps): capabilities = caps
         case .sessionStart:             sessionActive = true
-        case .sessionStop:              sessionActive = false
+        case .sessionStarted(let info):
+            sessionActive = true
+            sessionInfo = info
+        case .sessionStop:
+            sessionActive = false
+            sessionInfo = nil
         case .metrics(let m):
             latestMetrics = m
             metrics.append(m)

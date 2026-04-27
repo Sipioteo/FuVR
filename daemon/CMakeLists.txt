@@ -7,10 +7,14 @@ add_library(fuvr_daemon_core STATIC
   src/iosurface_bridge.mm
   src/iosurface_xpc_service.mm
   src/pose_router.cpp
+  src/input_router.cpp
   src/metrics.cpp
   src/transport_ffi_glue.cpp
   src/json_bridge.cpp
   src/clock_sync.cpp
+  src/logger.cpp
+  src/q_metrics_parser.cpp
+  src/reconnect.cpp
 )
 
 target_include_directories(fuvr_daemon_core PUBLIC
@@ -76,6 +80,11 @@ if(FUVR_DAEMON_TESTS)
     tests/test_iosurface_xpc.cpp
     tests/test_clock_sync.cpp
     tests/test_encode_stats_forward.cpp
+    tests/test_input_router.cpp
+    tests/test_q_metrics_parser.cpp
+    tests/test_reconnect.cpp
+    tests/test_logger.cpp
+    tests/test_encode_stats_subscription.cpp
   )
   target_link_libraries(fuvr_daemon_tests PRIVATE
     fuvr_daemon_core
@@ -87,3 +96,12 @@ if(FUVR_DAEMON_TESTS)
   enable_testing()
   add_test(NAME fuvr_daemon_tests COMMAND fuvr_daemon_tests)
 endif()
+
+add_subdirectory(audio)
+# Why: Session ctor/dtor now call fuvr::daemon::audio::start/stopAudioFor
+# (gated on cfg.audioEnabled), so fuvr_daemon_core needs the audio static lib.
+target_link_libraries(fuvr_daemon_core PUBLIC fuvr_daemon_audio)
+
+# Owned by THETA (virtual-display / extended-display flow). Keep this as the
+# very last line of this file — see daemon/vdisplay/INTEGRATION.md.
+add_subdirectory(vdisplay)

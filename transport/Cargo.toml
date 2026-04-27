@@ -6,6 +6,7 @@ members = [
     "transport-udp",
     "transport-cli",
     "transport-ffi",
+    "transport-mdns",
 ]
 
 [workspace.package]

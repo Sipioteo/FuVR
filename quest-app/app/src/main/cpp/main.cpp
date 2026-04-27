@@ -79,6 +79,7 @@ extern "C" void android_main(android_app* app) {
         compositor.submit_frame(buf);
         session.end_frame(compositor);
         router.send_metrics_if_due();
+        router.poll_adaptive_signals();
     }
 
     pose_forwarder.stop();

@@ -45,9 +45,12 @@ int main() {
 
   for (int i = 0; i < 600; ++i) {
     auto s = fr::diag::encoderStatsForSession(sess);
+    auto d = fr::diag::internalDiagState(sess);
     std::printf(
-        "[%4ds] samples=%u meanEnc=%.2fms p95=%.2fms fps=%.1f bitrate=%.1fMbps\n",
-        i, s.sampleCount, s.meanEncodeMs, s.p95EncodeMs, s.fps, s.bitrateMbps);
+        "[%4ds] samples=%u meanEnc=%.2fms p95=%.2fms fps=%.1f bitrate=%.1fMbps "
+        "daemon=%s reconnects=%u attempts=%u\n",
+        i, s.sampleCount, s.meanEncodeMs, s.p95EncodeMs, s.fps, s.bitrateMbps,
+        d.daemonAlive ? "alive" : "down", d.reconnectCount, d.reconnectAttempts);
     std::fflush(stdout);
     std::this_thread::sleep_for(std::chrono::seconds(1));
   }

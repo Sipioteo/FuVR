@@ -124,6 +124,77 @@ Implemented in this pass:
 - Host tests: `tests/test_clock_sync.cpp` covers `build_pong`,
   `build_pong_now`, the `t2 >= t1` clamp, and `now_ns()` monotonicity.
 
+## Pass 4 (input forwarding + stage tracking + adaptive bitrate + connection UI) — landed
+
+Implemented in this pass:
+
+- **Task 1 — real input action state forwarding.** `OpenXrSession` action set
+  expanded with the full Touch Plus binding surface (trigger touch, thumbstick
+  click + touch, button A/B touch, system click, thumbrest force). New
+  `OpenXrSession::sync_actions()` and `read_action_state(hand, ActionStateBundle&)`
+  read live state via `xrGetActionStateBoolean/Float/Vector2f`. `pose_forwarder`
+  now syncs once per 1 kHz tick and uses the pure-logic `InputPacker` to fill
+  `PlainTouchInputState` for both hands; `xrSyncActions` was removed from
+  `poll_events` to avoid double-sync racing the forwarder thread.
+- **Task 2 — STAGE reference space.** Both `XR_REFERENCE_SPACE_TYPE_LOCAL` and
+  `XR_REFERENCE_SPACE_TYPE_STAGE` are created (stage falls back to local when
+  guardian is unconfigured). `OpenXrSession::capture_local_origin_if_needed`
+  computes `stagePose⁻¹ × hmdPose` once at session start using the new pose-
+  inverse helper (covered by `test_local_origin_math`). The pose forwarder
+  stores the offset as `local_origin_pose_` Quest-side; per-frame application
+  is implicit in the existing locate path. **Hardware blocker:** verifying
+  guardian-bounds correctness still requires a real Quest run (no host harness
+  for STAGE).
+- **Task 3 — connection UI.** Head-locked `XrCompositionLayerQuad` text
+  overlay scaffolding via the new `connection_ui` module. State enum covers
+  Discovering/Connecting/Negotiating/WaitingForFrames/Connected.
+  `ConnectionUi::render` produces an RGBA8 buffer (kQuadW × kQuadH) that the
+  compositor uploads as a quad swapchain image. **Asset workaround:** the
+  shipping path expects `app/src/main/assets/font_atlas.png` +
+  `font_atlas.json`; until those are vendored, `connection_ui.cpp` paints a
+  procedural per-character speckle pattern so the quad has non-empty content.
+  Real bitmap atlas is a pure asset task (no code changes), tracked here.
+- **Task 4 — hand tracking forwarding.** `XR_EXT_hand_tracking` advertised in
+  the enabled extension list. `HandEncoder` (`hand_encoder.{hpp,cpp}`) packs
+  2 × 26 × 7 floats as binary16 + base64 with the stable `q-hand: ` prefix on
+  the `ControlMessage.error` arm — workaround pending a wire-schema bump
+  (see ADR-0008). The actual `xrLocateHandJointsEXT` call is **not yet wired
+  into pose_forwarder**: that needs `XrHandTrackerEXT` creation against the
+  KHR loader's runtime function pointers; deferred to follow-up because
+  `XR_EXT_HAND_TRACKING_EXTENSION_NAME` only takes effect after the runtime
+  reports the extension as supported. Round-trip encode/decode covered by
+  `test_hand_encoder`.
+- **Task 5 — `q-metrics` correctness.** `MetricsFormatter` (pure-logic)
+  guarantees every line passes the daemon's parser regex
+  `q-metrics: k=v(?:, k=v)*$`. Sanitizes NaN/Inf/negatives, caps
+  `transport_loss_pct` at 100. `decode_avg_ms`, `dropped_frames`, and
+  `transport_loss_pct` added; `DecoderPipeline` now tracks dropped frames in
+  the existing drop-old replacement and exposes the average decode latency
+  alongside p95. Emission stays at exactly 10 Hz (100 ms period) decoupled
+  from render rate. 100-sample fuzz test covers well-formedness.
+- **Task 6 — adaptive bitrate / keyframe request.** `LossTracker` tracks
+  reassembly losses in a 1 s sliding window and emits `bitrate-req: kbps=N`
+  at most once per second when sustained loss crosses the threshold (default
+  5/sec); `keyframe-req: now` is emitted on a flagged decode failure with a
+  250 ms rate limit. `ProtocolRouter::poll_adaptive_signals()` is called
+  once per render iteration in `main.cpp`. Wiring `note_loss_frame()` into
+  the actual reassembler-detected gaps and `note_decode_failure()` into the
+  MediaCodec error callback is a small follow-up (the entry points exist
+  but the producer side still needs threading through). Exhaustive coverage
+  in `test_loss_tracker`.
+- **CMake.** `add_subdirectory(audio)` appended conditionally on the EPSILON-
+  owned `audio/CMakeLists.txt` existing; the build succeeds either way.
+
+Host tests (all in `app/src/main/cpp/tests`, passing under the existing
+`/tmp/quest-host-tests` setup):
+
+- `test_input_packing` — Task 1, ActionStateBundle → PlainTouchInputState.
+- `test_metrics_format` — Task 5, well-formedness on 100 fuzz samples.
+- `test_loss_tracker` — Task 6, threshold + rate-limit + window pruning.
+- `test_hand_encoder` — Task 4, 364-float round trip via base64+f16.
+- `test_connection_ui` — Task 3, distinct non-empty pixels per state.
+- `test_local_origin_math` — Task 2, pose_inverse ∘ pose ≈ identity.
+
 ## Cross-team coordination items
 
 - The metrics-over-`error`-arm workaround needs a matching parser in the

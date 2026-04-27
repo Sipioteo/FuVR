@@ -1,0 +1,21 @@
+[package]
+name = "transport-mdns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+astro-dnssd = "0.3"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# Linux CI runners do not ship the Bonjour SDK headers required by
+# astro-dnssd. Per ADR-0009 the production registration code is macOS-only;
+# on other platforms the crate compiles to a no-op stub. mdns-sd is pulled
+# in for cross-platform browse so the CLI's `mdns-browse` subcommand still
+# works on the Linux runners during integration tests.
+mdns-sd = "0.11"
