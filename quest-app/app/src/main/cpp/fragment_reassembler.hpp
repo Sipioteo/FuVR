@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "proto_codec.hpp"
+
 namespace fuvr {
 
 // Reassembles VideoFragmentHeader-described fragments into complete access
@@ -21,6 +23,8 @@ public:
         uint64_t targetDisplayTimeNs{0};
         bool isKeyframe{false};
         int codec{0};
+        PlainViewState renderedLeft{};
+        PlainViewState renderedRight{};
         std::vector<uint8_t> payload;
     };
 
@@ -32,6 +36,21 @@ public:
                 uint16_t flags,
                 int codec,
                 uint64_t targetDisplayTimeNs,
+                const uint8_t* data,
+                size_t size) {
+        return submit(frameId, fragmentIndex, fragmentCount, flags, codec,
+                      targetDisplayTimeNs, PlainViewState{}, PlainViewState{},
+                      data, size);
+    }
+
+    bool submit(uint64_t frameId,
+                uint32_t fragmentIndex,
+                uint32_t fragmentCount,
+                uint16_t flags,
+                int codec,
+                uint64_t targetDisplayTimeNs,
+                const PlainViewState& renderedLeft,
+                const PlainViewState& renderedRight,
                 const uint8_t* data,
                 size_t size);
 
@@ -49,6 +68,8 @@ private:
         uint16_t flags{0};
         int codec{0};
         uint64_t targetDisplayTimeNs{0};
+        PlainViewState renderedLeft{};
+        PlainViewState renderedRight{};
         uint32_t received{0};
         std::vector<std::vector<uint8_t>> slices; // sized to fragmentCount
         std::vector<uint8_t> presence; // 0/1 per slice

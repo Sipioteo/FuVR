@@ -12,6 +12,7 @@
 #include <thread>
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "fuvr.pose", __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "fuvr.pose", __VA_ARGS__)
 
 namespace fuvr {
 
@@ -53,10 +54,18 @@ void PoseForwarder::run() {
     const auto period = microseconds(1000); // 1 kHz target
     auto next = steady_clock::now();
 
+    LOGI("[DEBUG-POSE] forwarder thread started");
+    auto last_heartbeat = steady_clock::now();
+    uint64_t ticks_total = 0, ticks_running = 0, sends_ok = 0, sends_fail = 0;
+
     while (running_.load()) {
         next += period;
+        ++ticks_total;
 
-        if (xr_.is_running() && xr_.session() != XR_NULL_HANDLE) {
+        const bool xr_run = xr_.is_running();
+        const bool xr_sess = (xr_.session() != XR_NULL_HANDLE);
+        if (xr_run && xr_sess) {
+            ++ticks_running;
             const XrTime t = xr_.predicted_display_time();
 
             // Single sync per tick: shared by pose locate + action read.
@@ -95,12 +104,27 @@ void PoseForwarder::run() {
 
             auto bytes = encode_upstream_frame(f);
             if (!bytes.empty()) {
-                tx_.send(Channel::Pose, bytes.data(), bytes.size());
+                if (tx_.send(Channel::Pose, bytes.data(), bytes.size())) ++sends_ok;
+                else ++sends_fail;
+            } else {
+                ++sends_fail;
             }
+        }
+
+        auto now_hb = steady_clock::now();
+        if (now_hb - last_heartbeat >= seconds(1)) {
+            LOGI("[DEBUG-POSE] tick: total=%llu running=%llu sends_ok=%llu sends_fail=%llu xr_run=%d xr_sess=%d",
+                 (unsigned long long)ticks_total,
+                 (unsigned long long)ticks_running,
+                 (unsigned long long)sends_ok,
+                 (unsigned long long)sends_fail,
+                 (int)xr_run, (int)xr_sess);
+            last_heartbeat = now_hb;
         }
 
         std::this_thread::sleep_until(next);
     }
+    LOGI("[DEBUG-POSE] forwarder thread exiting");
 }
 
 }

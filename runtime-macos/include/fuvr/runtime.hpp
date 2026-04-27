@@ -110,6 +110,11 @@ struct Session {
   std::shared_ptr<DaemonClient> daemon;
   std::unique_ptr<IOSurfaceXpcClient> xpcClient;
   uint64_t daemonSessionId{0};
+  // Forward offset (ns) added to predictedDisplayTime + pose predict() arg to
+  // mask end-to-end Mac->Quest latency (encode + transport + decode + scanout).
+  // Set at session start from daemon's measured oneWayDelayNs plus a fixed
+  // render-budget; overridable via FUVR_RT_POSE_LOOKAHEAD_MS.
+  uint64_t poseLookaheadNs{70'000'000};
   void* metalDevice{nullptr};  // id<MTLDevice>, retained
   void* metalCommandQueue{nullptr};  // id<MTLCommandQueue> from KHR binding (NOT retained — owned by app)
   std::vector<std::unique_ptr<Space>> spaces;
@@ -121,6 +126,10 @@ struct Session {
   std::atomic<uint32_t> reconnectCount{0};
   bool beginSessionSent{false};
   bool interactionProfileEmitted{false};
+  // STEREO-SPLIT: combines per-eye IOSurfaces into one side-by-side surface
+  // before submitting to the daemon's encoder. Lazily initialized in
+  // xrEndFrame on the first projection layer with viewCount >= 2.
+  std::unique_ptr<StereoBlitter> stereoBlitter;
   std::mutex mutex;
 
   EncoderStatsSnapshot encoderStatsSnapshot() const noexcept {

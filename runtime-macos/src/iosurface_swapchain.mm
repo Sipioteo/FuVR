@@ -129,4 +129,148 @@ uint32_t iosurfaceID(IOSurfaceRef surface) noexcept {
   return IOSurfaceGetID(surface);
 }
 
+// STEREO-SPLIT: stereo blitter implementation.
+namespace {
+
+struct StereoBlitterImpl {
+  id<MTLDevice> device = nil;
+  id<MTLCommandQueue> queue = nil;
+  bool ownsQueue = false;
+  uint32_t perEyeW = 0;
+  uint32_t perEyeH = 0;
+  // Small ring so we don't blit on top of a surface still held by the encoder
+  // pipeline. 3 matches the typical IOSurface swapchain depth.
+  static constexpr int kRing = 3;
+  IOSurfaceRef surfaces[kRing] = {nullptr, nullptr, nullptr};
+  id<MTLTexture> textures[kRing] = {nil, nil, nil};
+  int next = 0;
+};
+
+}  // namespace
+
+StereoBlitter::~StereoBlitter() { shutdown(); }
+
+bool StereoBlitter::init(void* devicePtr, void* commandQueuePtr,
+                          uint32_t perEyeWidth, uint32_t perEyeHeight) noexcept {
+  if (impl_ != nullptr) return true;
+  if (perEyeWidth == 0 || perEyeHeight == 0) return false;
+  id<MTLDevice> device = (__bridge id<MTLDevice>)devicePtr;
+  if (device == nil) return false;
+
+  auto* s = new StereoBlitterImpl();
+  s->device = device;
+  s->perEyeW = perEyeWidth;
+  s->perEyeH = perEyeHeight;
+  if (commandQueuePtr != nullptr) {
+    s->queue = (__bridge id<MTLCommandQueue>)commandQueuePtr;
+    s->ownsQueue = false;
+  } else {
+    s->queue = [device newCommandQueue];
+    s->ownsQueue = true;
+  }
+  if (s->queue == nil) {
+    delete s;
+    return false;
+  }
+
+  const uint32_t W = perEyeWidth * 2;
+  const uint32_t H = perEyeHeight;
+  for (int i = 0; i < StereoBlitterImpl::kRing; ++i) {
+    NSDictionary* props = @{
+      (id)kIOSurfaceWidth : @(W),
+      (id)kIOSurfaceHeight : @(H),
+      (id)kIOSurfaceBytesPerElement : @(4),
+      (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+    };
+    IOSurfaceRef surf = IOSurfaceCreate((CFDictionaryRef)props);
+    if (surf == nullptr) {
+      delete s;
+      return false;
+    }
+    MTLTextureDescriptor* desc = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                     width:W
+                                    height:H
+                                 mipmapped:NO];
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> tex = [device newTextureWithDescriptor:desc
+                                                iosurface:surf
+                                                    plane:0];
+    if (tex == nil) {
+      CFRelease(surf);
+      delete s;
+      return false;
+    }
+    s->surfaces[i] = surf;
+    s->textures[i] = tex;
+  }
+  impl_ = s;
+  return true;
+}
+
+IOSurfaceRef StereoBlitter::blitToCombined(void* leftTexPtr,
+                                            void* rightTexPtr) noexcept {
+  if (impl_ == nullptr) return nullptr;
+  auto* s = static_cast<StereoBlitterImpl*>(impl_);
+  id<MTLTexture> leftTex = (__bridge id<MTLTexture>)leftTexPtr;
+  id<MTLTexture> rightTex = (__bridge id<MTLTexture>)rightTexPtr;
+  if (leftTex == nil) return nullptr;
+
+  const int slot = s->next;
+  s->next = (s->next + 1) % StereoBlitterImpl::kRing;
+  id<MTLTexture> dst = s->textures[slot];
+  IOSurfaceRef dstSurf = s->surfaces[slot];
+  if (dst == nil || dstSurf == nullptr) return nullptr;
+
+  id<MTLCommandBuffer> cb = [s->queue commandBuffer];
+  id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+
+  const uint32_t eyeW = s->perEyeW;
+  const uint32_t eyeH = s->perEyeH;
+
+  auto blitOne = [&](id<MTLTexture> src, uint32_t dstX) {
+    if (src == nil) return;
+    // Why: source might be a different size than perEye if the app over-sized
+    // the swapchain. Clamp to min so we don't sample out-of-bounds.
+    NSUInteger srcW = MIN((NSUInteger)src.width, (NSUInteger)eyeW);
+    NSUInteger srcH = MIN((NSUInteger)src.height, (NSUInteger)eyeH);
+    [enc copyFromTexture:src
+             sourceSlice:0
+             sourceLevel:0
+            sourceOrigin:MTLOriginMake(0, 0, 0)
+              sourceSize:MTLSizeMake(srcW, srcH, 1)
+               toTexture:dst
+        destinationSlice:0
+        destinationLevel:0
+       destinationOrigin:MTLOriginMake(dstX, 0, 0)];
+  };
+
+  blitOne(leftTex, 0);
+  // If right is missing, mirror left into the right half so we still get a
+  // valid 4128-wide surface (degraded mono); avoids encoder-side garbage.
+  blitOne(rightTex != nil ? rightTex : leftTex, eyeW);
+
+  [enc endEncoding];
+  [cb commit];
+  // Why: encoder may pick up the IOSurface synchronously via the XPC token
+  // path. Wait so the blit's GPU writes are visible before the surface ships.
+  [cb waitUntilCompleted];
+  return dstSurf;
+}
+
+void StereoBlitter::shutdown() noexcept {
+  if (impl_ == nullptr) return;
+  auto* s = static_cast<StereoBlitterImpl*>(impl_);
+  for (int i = 0; i < StereoBlitterImpl::kRing; ++i) {
+    s->textures[i] = nil;
+    if (s->surfaces[i]) CFRelease(s->surfaces[i]);
+    s->surfaces[i] = nullptr;
+  }
+  s->queue = nil;
+  s->device = nil;
+  delete s;
+  impl_ = nullptr;
+}
+
 }  // namespace fuvr::runtime

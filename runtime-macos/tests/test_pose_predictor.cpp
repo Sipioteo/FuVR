@@ -63,6 +63,34 @@ TEST(PosePredictor, RingBufferOverflowKeepsLatest) {
   EXPECT_FLOAT_EQ(latest->leftEye.position.x, 49.0f);
 }
 
+TEST(PosePredictor, AntipodalQuatDoesNotGlitch) {
+  // Two near-equal rotations encoded as antipodal quats. Before the fix,
+  // slerp/extrapolation across the buffer treated them as a ~360° jump,
+  // producing a wild predicted orientation.
+  PosePredictor p;
+  // Small rotation about Y: ~2°. Quat ≈ (0, 0.01745, 0, 0.99985).
+  const float a = 0.01745f;
+  const float w = 0.99985f;
+  for (int i = 0; i < 4; ++i) {
+    PoseSample s = makeSample(static_cast<uint64_t>(i) * 10'000'000ull, 0.0f);
+    // Alternate signs to simulate Quest double-cover sign flips.
+    const float sgn = (i % 2 == 0) ? 1.0f : -1.0f;
+    s.leftEye.orientation = Quat{0.0f, sgn * a, 0.0f, sgn * w};
+    s.rightEye.orientation = Quat{0.0f, sgn * a, 0.0f, sgn * w};
+    p.push(s);
+  }
+  auto out = p.predict(35'000'000);
+  ASSERT_TRUE(out.has_value());
+  const auto& q = out->leftEye.orientation;
+  // Predicted orientation must remain near the (canonicalized) sample, NOT
+  // somewhere on the far side of the great circle.
+  // |q.y| should still be near a, |q.w| near w.
+  EXPECT_NEAR(std::fabs(q.y), a, 0.05f);
+  EXPECT_NEAR(std::fabs(q.w), w, 0.05f);
+  const float n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+  EXPECT_NEAR(n, 1.0f, 1e-3f);
+}
+
 TEST(PosePredictor, OrientationStaysNormalized) {
   PosePredictor p;
   for (int i = 0; i < 5; ++i) {

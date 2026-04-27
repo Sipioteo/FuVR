@@ -127,7 +127,9 @@ void DecoderPipeline::stop() {
 }
 
 void DecoderPipeline::push_encoded(const uint8_t* data, size_t size,
-                                   uint64_t pts_ns, bool is_key) {
+                                   uint64_t pts_ns, bool is_key,
+                                   const PlainViewState& rendered_left,
+                                   const PlainViewState& rendered_right) {
     if (!codec_) return;
     ssize_t idx = AMediaCodec_dequeueInputBuffer(codec_, 0);
     if (idx < 0) return;
@@ -146,7 +148,7 @@ void DecoderPipeline::push_encoded(const uint8_t* data, size_t size,
     {
         std::lock_guard<std::mutex> lk(pts_mutex_);
         if (queued_.size() > 64) queued_.pop_front();
-        queued_.emplace_back(pts_us, now_ns());
+        queued_.push_back(InflightPts{pts_us, now_ns(), rendered_left, rendered_right});
     }
 
     AMediaCodecBufferInfo info;
@@ -185,6 +187,23 @@ void DecoderPipeline::on_image_available(AImageReader* reader) {
     f.buffer = buf;
     f.presentation_time_ns = (uint64_t)pts_us;
 
+    // Why: do the pts → rendered-pose lookup *before* publishing latest_ so
+    // ATW always sees the matched render pose for the frame it samples.
+    const uint64_t arrival_ns = now_ns();
+    uint64_t latency_ns = 0;
+    {
+        std::lock_guard<std::mutex> lk(pts_mutex_);
+        for (auto it = queued_.begin(); it != queued_.end(); ++it) {
+            if (it->pts_us == (uint64_t)pts_us) {
+                latency_ns = arrival_ns - it->enqueue_ns;
+                f.rendered_left = it->rendered_left;
+                f.rendered_right = it->rendered_right;
+                queued_.erase(queued_.begin(), it + 1);
+                break;
+            }
+        }
+    }
+
     AHardwareBuffer* prev = nullptr;
     {
         std::lock_guard<std::mutex> lk(frame_mutex_);
@@ -197,19 +216,6 @@ void DecoderPipeline::on_image_available(AImageReader* reader) {
     if (prev) {
         AHardwareBuffer_release(prev);
         ++dropped_frames_;
-    }
-
-    const uint64_t arrival_ns = now_ns();
-    uint64_t latency_ns = 0;
-    {
-        std::lock_guard<std::mutex> lk(pts_mutex_);
-        for (auto it = queued_.begin(); it != queued_.end(); ++it) {
-            if (it->first == (uint64_t)pts_us) {
-                latency_ns = arrival_ns - it->second;
-                queued_.erase(queued_.begin(), it + 1);
-                break;
-            }
-        }
     }
 
     std::lock_guard<std::mutex> lk(metrics_mutex_);

@@ -109,12 +109,14 @@ void ProtocolRouter::on_video(const uint8_t* data, size_t size) {
 
     reassembler_.submit(hdr.frameId, hdr.fragmentIndex, hdr.fragmentCount,
                         hdr.flags, hdr.codec, hdr.targetDisplayTimeNs,
+                        hdr.renderedLeft, hdr.renderedRight,
                         payload, payload_size);
 
     while (reassembler_.has_completed()) {
         auto au = reassembler_.take_completed();
         dec_.push_encoded(au.payload.data(), au.payload.size(),
-                          au.targetDisplayTimeNs, au.isKeyframe);
+                          au.targetDisplayTimeNs, au.isKeyframe,
+                          au.renderedLeft, au.renderedRight);
     }
 }
 

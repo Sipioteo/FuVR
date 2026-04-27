@@ -33,10 +33,15 @@ void DaemonFrameSink::submit(const SubmittedFrame& frame) noexcept {
     client_->submitFrame(frame.sessionId, args);
   };
 
+  // FLICKER-FIX: submit ONLY the primary (stereo SBS) surface. Previously we
+  // also called submitOne for every entry in extraLayers, which caused the
+  // daemon's encoder to receive two SubmitFrame requests per Mac vsync — one
+  // valid SBS frame and one secondary layer (e.g. a HUD quad) sized/formatted
+  // differently. The Quest decoder then alternated valid/garbage output,
+  // producing the "1 frame video / 1 frame black" flicker. Overlay layer
+  // support isn't implemented in the daemon yet; drop them until it is.
   submitOne(frame.ioSurface);
-  for (IOSurfaceRef extra : frame.extraLayers) {
-    if (extra != nullptr) submitOne(extra);
-  }
+  (void)frame.extraLayers;
 }
 
 std::unique_ptr<FrameSink> makeDefaultFrameSink() {

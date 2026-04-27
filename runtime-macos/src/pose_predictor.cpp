@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "fuvr/pose_predictor.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 
 namespace fuvr::runtime {
 
@@ -80,7 +83,57 @@ Pose extrapolatePose(const Pose& base, const Vec3& linVel, const Vec3& angVel,
 }  // namespace
 
 void PosePredictor::push(const PoseSample& sample) noexcept {
-  buffer_[head_] = sample;
+  PoseSample s = sample;
+  // Quaternion double-cover: q and -q represent the same rotation, but the
+  // Quest may emit consecutive samples with opposite signs (OpenXR makes no
+  // continuity guarantee). Without canonicalization, finite-difference and
+  // slerp/lerp on adjacent samples treat a near-zero rotation as ~360°,
+  // producing a transient view spin until a fresh sample lands. Flip any
+  // incoming quaternion that is antipodal to the previous sample so the
+  // history is monotonic in quat space.
+  if (size_ > 0) {
+    const std::size_t prevIdx = (head_ + kCapacity - 1) % kCapacity;
+    const PoseSample& prev = buffer_[prevIdx];
+    auto fixSign = [](const Quat& ref, Quat& q) {
+      if (dot(ref, q) < 0.0f) {
+        q = Quat{-q.x, -q.y, -q.z, -q.w};
+      }
+    };
+    fixSign(prev.leftEye.orientation, s.leftEye.orientation);
+    fixSign(prev.rightEye.orientation, s.rightEye.orientation);
+    if (s.leftControllerActive && prev.leftControllerActive) {
+      fixSign(prev.leftController.orientation, s.leftController.orientation);
+    }
+    if (s.rightControllerActive && prev.rightControllerActive) {
+      fixSign(prev.rightController.orientation, s.rightController.orientation);
+    }
+  }
+  // [QUAT-DEBUG] 1 Hz log of dot(q_n, q_n-1). Post-canonicalization this
+  // should always be >= 0; a print of a near-zero or negative value here
+  // would indicate a bug in the sign-fix above or a violently large rotation
+  // between samples.
+  if (size_ > 0) {
+    static std::atomic<uint64_t> last_log_ns{0};
+    const uint64_t now_ns =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    uint64_t prev_log = last_log_ns.load(std::memory_order_relaxed);
+    if (now_ns - prev_log > 1'000'000'000ull &&
+        last_log_ns.compare_exchange_strong(prev_log, now_ns,
+                                            std::memory_order_relaxed)) {
+      const std::size_t prevIdx = (head_ + kCapacity - 1) % kCapacity;
+      const float dl = dot(buffer_[prevIdx].leftEye.orientation,
+                           s.leftEye.orientation);
+      const float dr = dot(buffer_[prevIdx].rightEye.orientation,
+                           s.rightEye.orientation);
+      std::fprintf(stderr,
+                   "[QUAT-DEBUG] predictor.push dot(q_n,q_n-1) L=%.4f R=%.4f "
+                   "size=%zu\n",
+                   dl, dr, size_);
+    }
+  }
+
+  buffer_[head_] = s;
   head_ = (head_ + 1) % kCapacity;
   if (size_ < kCapacity) {
     ++size_;
@@ -145,6 +198,22 @@ std::optional<PoseSample> PosePredictor::predict(
           slerp(prev.rightEye.orientation, last.rightEye.orientation, 1.0f + t);
       out.leftEye.orientation = normalize(out.leftEye.orientation);
       out.rightEye.orientation = normalize(out.rightEye.orientation);
+      // Slerp with t > 1 (extrapolation) can return a quat antipodal to
+      // `last` even though `last` is canonical w.r.t. the buffer. Pin the
+      // predicted output onto the same sign sheet as `last` so the wire
+      // q_render the Quest receives is monotonic across frames.
+      if (dot(last.leftEye.orientation, out.leftEye.orientation) < 0.0f) {
+        out.leftEye.orientation = Quat{-out.leftEye.orientation.x,
+                                       -out.leftEye.orientation.y,
+                                       -out.leftEye.orientation.z,
+                                       -out.leftEye.orientation.w};
+      }
+      if (dot(last.rightEye.orientation, out.rightEye.orientation) < 0.0f) {
+        out.rightEye.orientation = Quat{-out.rightEye.orientation.x,
+                                        -out.rightEye.orientation.y,
+                                        -out.rightEye.orientation.z,
+                                        -out.rightEye.orientation.w};
+      }
     }
   }
   return out;

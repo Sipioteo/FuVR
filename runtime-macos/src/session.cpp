@@ -88,6 +88,31 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
       daemon->subscribeInputs(result.sessionId);
       daemon->subscribeEncodeStats();
     }
+    // Pose lookahead: render budget (encode 25 + decode 15 + scanout 5 = 45ms)
+    // + measured one-way network delay from daemon's clock-sync handshake.
+    // If oneWayDelay is unknown (no Quest peer yet), fall back to the env var
+    // FUVR_RT_POSE_LOOKAHEAD_MS, else 70ms. This is a one-shot offset, not an
+    // integrator, so it cannot drift.
+    {
+      constexpr uint64_t kRenderBudgetNs = 45'000'000ull;
+      uint64_t lookahead = 0;
+      if (result.oneWayDelayNs != 0) {
+        lookahead = kRenderBudgetNs + result.oneWayDelayNs;
+      } else if (const char* env = std::getenv("FUVR_RT_POSE_LOOKAHEAD_MS")) {
+        lookahead = static_cast<uint64_t>(std::strtoull(env, nullptr, 10)) *
+                    1'000'000ull;
+      } else {
+        lookahead = 70'000'000ull;
+      }
+      session->poseLookaheadNs = lookahead;
+      if (std::getenv("FUVR_RT_DEBUG"))
+        std::fprintf(stderr,
+                     "[fuvr-rt] pose lookahead = %llu ms (oneWayDelay=%llu ns, "
+                     "renderBudget=%llu ns)\n",
+                     (unsigned long long)(lookahead / 1'000'000ull),
+                     (unsigned long long)result.oneWayDelayNs,
+                     (unsigned long long)kRenderBudgetNs);
+    }
     Session* sessRaw = session.get();
     sessRaw->daemonAlive.store(true);
     daemon->setPoseCallback([sessRaw](const PoseSample& s) {
@@ -228,9 +253,14 @@ XrResult xrWaitFrame_impl(XrSession sessionHandle, const XrFrameWaitInfo*,
   }
   using clock = std::chrono::steady_clock;
   const auto now = clock::now().time_since_epoch();
+  // predictedDisplayTime targets the moment this frame will actually be
+  // photons-on-eyes on the Quest. That is now + one frame period (compositor)
+  // + end-to-end pipeline latency (encode + transport + decode + scanout),
+  // which we capture in poseLookaheadNs. xrLocateViews will pass this same
+  // forward time into the predictor so Blender renders for the future pose.
   state->predictedDisplayTime = static_cast<XrTime>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() +
-      11'111'111);
+      11'111'111 + static_cast<int64_t>(s->poseLookaheadNs));
   state->predictedDisplayPeriod = 11'111'111;
   state->shouldRender = XR_TRUE;
   return XR_SUCCESS;
@@ -265,15 +295,22 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
     f.targetDisplayTimeNs = static_cast<uint64_t>(info->displayTime);
     f.sessionId = s->daemonSessionId;
 
-    auto resolveSwapchain = [&](XrSwapchain handle) -> IOSurfaceRef {
+    struct ResolvedImage {
+      IOSurfaceRef surface{nullptr};
+      void* mtlTexture{nullptr};
+      uint32_t width{0};
+      uint32_t height{0};
+    };
+    auto resolveSwapchain = [&](XrSwapchain handle) -> ResolvedImage {
       for (auto& sc : s->swapchains) {
         if (sc->handle != handle) continue;
-        if (sc->images.empty()) return nullptr;
+        if (sc->images.empty()) return {};
         const uint32_t idx = sc->lastReleasedIndex %
                              static_cast<uint32_t>(sc->images.size());
-        return sc->images[idx]->surface;
+        return {sc->images[idx]->surface, sc->images[idx]->mtlTexture,
+                sc->width, sc->height};
       }
-      return nullptr;
+      return {};
     };
 
     std::vector<IOSurfaceRef> layers;
@@ -290,13 +327,46 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
         if (layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
           const auto* proj =
               reinterpret_cast<const XrCompositionLayerProjection*>(layer);
-          if (proj->viewCount > 0) {
-            surf = resolveSwapchain(proj->views[0].subImage.swapchain);
+          // STEREO-SPLIT: when the app provides per-eye views (the spec-
+          // mandated case for PRIMARY_STEREO), combine them into a single
+          // side-by-side IOSurface that the daemon's encoder consumes as one
+          // 2*perEyeWidth x perEyeHeight stream. The Quest GL compositor
+          // splits it back into [0,0.5] / [0.5,1] u-ranges per eye (see
+          // quest-app/.../eye_blit.cpp).
+          if (proj->viewCount >= 2) {
+            ResolvedImage L = resolveSwapchain(proj->views[0].subImage.swapchain);
+            ResolvedImage R = resolveSwapchain(proj->views[1].subImage.swapchain);
+            if (L.mtlTexture != nullptr && R.mtlTexture != nullptr) {
+              if (!s->stereoBlitter) {
+                s->stereoBlitter = std::make_unique<StereoBlitter>();
+                if (!s->stereoBlitter->init(s->metalDevice,
+                                             s->metalCommandQueue,
+                                             L.width, L.height)) {
+                  s->stereoBlitter.reset();
+                }
+              }
+              if (s->stereoBlitter) {
+                surf = s->stereoBlitter->blitToCombined(L.mtlTexture,
+                                                         R.mtlTexture);
+                if (surf != nullptr) {
+                  f.width = L.width * 2;
+                  f.height = L.height;
+                  f.leftMetalTexture = L.mtlTexture;
+                  f.rightMetalTexture = R.mtlTexture;
+                }
+              }
+            }
+            if (surf == nullptr && proj->viewCount > 0) {
+              // Fallback: blitter unavailable or only one eye resolved.
+              surf = resolveSwapchain(proj->views[0].subImage.swapchain).surface;
+            }
+          } else if (proj->viewCount > 0) {
+            surf = resolveSwapchain(proj->views[0].subImage.swapchain).surface;
           }
         } else if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
           const auto* quad =
               reinterpret_cast<const XrCompositionLayerQuad*>(layer);
-          surf = resolveSwapchain(quad->subImage.swapchain);
+          surf = resolveSwapchain(quad->subImage.swapchain).surface;
         }
         if (surf != nullptr) layers.push_back(surf);
       }
@@ -324,10 +394,16 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
       }
     }
 
-    auto latest = s->predictor.latest();
-    if (latest.has_value()) {
-      f.renderedLeft = latest->leftEye;
-      f.renderedRight = latest->rightEye;
+    // Why: the Quest's ATW shader receives this pose as `q_render` and
+    // computes Δq = q_now * q_render⁻¹. The image Blender just rendered
+    // used the *predicted* display-time pose (xrLocateViews → predict()),
+    // not the latest raw sample. Shipping predictor.latest() instead made
+    // Δq carry the full lookahead of head motion, snapping the warp on
+    // every move. Use the same predicted pose Blender rendered with.
+    auto rendered = s->predictor.predict(static_cast<uint64_t>(info->displayTime));
+    if (rendered.has_value()) {
+      f.renderedLeft = rendered->leftEye;
+      f.renderedRight = rendered->rightEye;
     }
     s->frameSink->submit(f);
   }

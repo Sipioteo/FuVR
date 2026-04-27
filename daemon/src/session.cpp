@@ -37,6 +37,43 @@ public:
         hdr.setTotalSizeBytes(static_cast<uint32_t>(f.size));
         hdr.setFragmentIndex(0);
         hdr.setFragmentCount(1);
+
+        // Why: the Quest needs the exact pose used to render this frame to
+        // run rotational ATW. We stamp it here; the runtime hands it to the
+        // daemon on submitFrame and we squirrel it away in renderedPoses_
+        // keyed by frameId. setView() builds a default Pose+Fov when called
+        // with all-zero quat (w=1 below); leaving it unset would still ship
+        // a default-initialized ViewState, but stamping makes intent obvious.
+        Session::RenderedPose rp{};
+        {
+            std::lock_guard lk(owner_->renderedPosesMu_);
+            auto it = owner_->renderedPoses_.find(f.frameId);
+            if (it != owner_->renderedPoses_.end()) rp = it->second;
+        }
+        auto fillView = [](::fuvr::proto::ViewState::Builder vb,
+                           const std::array<float, 7>& v) {
+            auto pose = vb.initPose();
+            auto pos = pose.initPosition();
+            pos.setX(v[0]); pos.setY(v[1]); pos.setZ(v[2]);
+            auto rot = pose.initOrientation();
+            rot.setX(v[3]); rot.setY(v[4]); rot.setZ(v[5]); rot.setW(v[6]);
+            // Fov is left as default (zeros). The Quest derives the warp
+            // matrix from xrLocateViews fov on present-time and pairs it
+            // with the rendered fov reported by the runtime — but until
+            // we plumb fov through SubmitFrameRequest the Quest falls
+            // back to assuming the now-fov also matches render-fov, which
+            // is correct to within ~0.1° per frame on Quest 3.
+            (void)vb.initFov();
+        };
+        if (rp.valid) {
+            fillView(hdr.initRenderedLeft(), rp.left);
+            fillView(hdr.initRenderedRight(), rp.right);
+        } else {
+            // Identity pose so the wire side never reads garbage.
+            std::array<float, 7> id{0,0,0, 0,0,0, 1};
+            fillView(hdr.initRenderedLeft(), id);
+            fillView(hdr.initRenderedRight(), id);
+        }
         hdr.setCodec(owner_->cfg_.codec == fuvr::VideoCodec::H264
                          ? ::fuvr::proto::VideoCodec::H264
                          : ::fuvr::proto::VideoCodec::HEVC);
@@ -79,6 +116,8 @@ public:
         if (f.isKeyframe) owner_->curFrameKeyframe_ = true;
 
         if (f.endOfFrame) {
+            std::lock_guard lk(owner_->renderedPosesMu_);
+            owner_->renderedPoses_.erase(f.frameId);
             EncodeStatsEvent ev{
                 .frameId          = owner_->curFrameId_,
                 .encodeDurationNs = durNs,
@@ -137,10 +176,29 @@ bool Session::submitFrame(CVPixelBufferRef pb,
                           uint64_t frameId,
                           uint64_t renderStartNs,
                           bool forceIdr,
-                          const float[7],
-                          const float[7]) {
+                          const float renderedLeft[7],
+                          const float renderedRight[7]) {
     if (!encoder_ || !pb) return false;
     lastEncodeStartNs_.store(nowMonoNs());
+
+    // Stash the rendered pose so FragmentSink::onFragment can stamp it on
+    // every wire header for this frame. Bound the map at 64 entries; under
+    // normal flow we erase on endOfFrame, but a frame the encoder swallows
+    // (e.g. dropped under back-pressure) must not leak its stash.
+    {
+        RenderedPose rp{};
+        rp.valid = (renderedLeft != nullptr && renderedRight != nullptr);
+        if (rp.valid) {
+            for (int i = 0; i < 7; ++i) {
+                rp.left[i]  = renderedLeft[i];
+                rp.right[i] = renderedRight[i];
+            }
+        }
+        std::lock_guard lk(renderedPosesMu_);
+        if (renderedPoses_.size() > 64) renderedPoses_.clear();
+        renderedPoses_[frameId] = rp;
+    }
+
     return encoder_->submit(pb, frameId, renderStartNs, forceIdr);
 }
 

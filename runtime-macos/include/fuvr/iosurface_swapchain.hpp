@@ -54,4 +54,33 @@ void* deviceFromCommandQueue(void* commandQueue) noexcept;
 
 uint32_t iosurfaceID(IOSurfaceRef surface) noexcept;
 
+// STEREO-SPLIT: combines two per-eye IOSurface-backed Metal textures into a
+// side-by-side IOSurface (left half = eye 0, right half = eye 1). Owns a small
+// ring of destination IOSurfaces so successive blits don't fight the encoder
+// for the previous frame's surface.
+class StereoBlitter {
+ public:
+  StereoBlitter() = default;
+  ~StereoBlitter();
+  StereoBlitter(const StereoBlitter&) = delete;
+  StereoBlitter& operator=(const StereoBlitter&) = delete;
+
+  // device: id<MTLDevice> (retained externally), commandQueue may be nullptr
+  // (a private queue is created if so). perEyeWidth/Height are the source
+  // texture dimensions; the destination is (perEyeWidth*2) x perEyeHeight.
+  bool init(void* device, void* commandQueue, uint32_t perEyeWidth,
+            uint32_t perEyeHeight) noexcept;
+
+  // Blit `leftTex` (id<MTLTexture>) and `rightTex` to a fresh combined surface.
+  // Returns the destination IOSurfaceRef (NOT retained for caller — the
+  // blitter owns it; caller must CFRetain if it outlives the next blit cycle).
+  // The returned surface has its blit committed and waited.
+  IOSurfaceRef blitToCombined(void* leftTex, void* rightTex) noexcept;
+
+  void shutdown() noexcept;
+
+ private:
+  void* impl_{nullptr};  // Opaque Obj-C state.
+};
+
 }  // namespace fuvr::runtime

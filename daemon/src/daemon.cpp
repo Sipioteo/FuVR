@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "fuvr/daemon.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -91,15 +92,48 @@ void Daemon::onTransportRecv(void* user, uint8_t channel,
         d->handleControlMessage(data, len);
         return;
     }
+    // [DEBUG-POSE] log any non-Video channel arrivals at 1 Hz so we can see
+    // pose ingest from the Quest landing in the daemon at all.
+    if (channel != FuvrChannel_Video) {
+        static std::atomic<uint64_t> lastLogNs{0};
+        uint64_t nowL = nowNs();
+        uint64_t prev = lastLogNs.load();
+        if (nowL - prev >= 1'000'000'000ull &&
+            lastLogNs.compare_exchange_strong(prev, nowL)) {
+            FUVR_LOG_INFO("daemon",
+                          "[DEBUG-POSE] transport recv ch=%u len=%zu",
+                          (unsigned)channel, len);
+        }
+    }
     if (channel != FuvrChannel_Pose) return;
-    uint64_t sid = 0;
+    // Why: Blender's runtime reconnects across "Start VR Session" cycles
+    // without sending stopSession; sessions_ accumulates entries with
+    // increasing ids. The most recent session owns the live RPC fd and
+    // active subscribers. Picking sessions_.begin() (oldest) silently routed
+    // poses to dead subscribers. Dispatch to every active session — poseRouter
+    // filters by sessionId so only live subscribers fire.
+    std::vector<uint64_t> sids;
     {
         std::lock_guard lk(d->sessionsMu_);
-        if (!d->sessions_.empty()) sid = d->sessions_.begin()->first;
+        sids.reserve(d->sessions_.size());
+        for (auto& [id, _] : d->sessions_) sids.push_back(id);
     }
     uint64_t now = nowNs();
-    d->poseRouter_.ingestPackedUpstreamFrame(data, len, sid, now);
-    d->inputRouter_.ingestPackedUpstreamFrame(data, len, sid, now);
+    for (uint64_t sid : sids) {
+        d->poseRouter_.ingestPackedUpstreamFrame(data, len, sid, now);
+        d->inputRouter_.ingestPackedUpstreamFrame(data, len, sid, now);
+    }
+    {
+        static std::atomic<uint64_t> lastPoseLogNs{0};
+        uint64_t nowL = now;
+        uint64_t prev = lastPoseLogNs.load();
+        if (nowL - prev >= 1'000'000'000ull &&
+            lastPoseLogNs.compare_exchange_strong(prev, nowL)) {
+            FUVR_LOG_INFO("daemon",
+                          "[DEBUG-POSE] pose frame: %zu bytes, sessions=%zu",
+                          len, sids.size());
+        }
+    }
 }
 
 void Daemon::handleControlMessage(const uint8_t* data, std::size_t len) {
@@ -330,6 +364,9 @@ void Daemon::onEnvelope(const InboundRpc& rpc) {
         uint64_t sid = req.getSessionId();
         uint64_t streamId = poseRouter_.addSubscriber(sid,
             [this, fd](const uint8_t* d, std::size_t n) { rpc_.send(fd, d, n); });
+        FUVR_LOG_INFO("daemon",
+                      "[DEBUG-POSE] streamPoses subscribe: sessionId=%llu fd=%d streamId=%llu",
+                      (unsigned long long)sid, fd, (unsigned long long)streamId);
         reply([&](auto e) {
             e.setStreamId(streamId);
             e.getBody().setOk();

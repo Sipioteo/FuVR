@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "eye_blit.hpp"
+#include "proto_codec.hpp"
 
 namespace fuvr {
 
@@ -68,6 +69,22 @@ private:
 
     GLuint current_texture_{0};
     bool has_frame_{false};
+
+    // Pose used by the Mac to render the currently-bound texture. Compositor
+    // pairs this with xrLocateViews now-pose to compute the ATW Δq.
+    PlainViewState rendered_left_{};
+    PlainViewState rendered_right_{};
+
+    // Throttled debug logging (FUVR_QUEST_DEBUG).
+    bool debug_atw_{false};
+    uint64_t last_debug_log_ns_{0};
+
+    // QUAT-FIX: previous-frame canonical orientations, kept per eye, used to
+    // pin q_now and q_render onto the same sign sheet across the antipodal
+    // double cover. Initialized to identity (w=1) so first-frame dot >= 0.
+    float prev_q_now_[2][4]{{0,0,0,1},{0,0,0,1}};
+    float prev_q_ren_[2][4]{{0,0,0,1},{0,0,0,1}};
+    uint64_t last_quat_dbg_ns_{0};
 
     EyeBlit blit_;
 };

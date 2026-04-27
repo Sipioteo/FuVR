@@ -10,6 +10,9 @@
 #include <GLES2/gl2ext.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "fuvr.comp", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "fuvr.comp", __VA_ARGS__)
@@ -21,6 +24,41 @@ PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC eglGetNativeClientBufferANDROID_ = nullpt
 PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR_ = nullptr;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR_ = nullptr;
 PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_ = nullptr;
+
+// --- Quaternion helpers (rotational ATW). Kept tiny — no glm dependency.
+struct Quat { float x{0}, y{0}, z{0}, w{1}; };
+
+inline Quat quat_normalize(Quat q) {
+    float n = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    if (n <= 0.0f) return {0,0,0,1};
+    float inv = 1.0f / n;
+    return { q.x*inv, q.y*inv, q.z*inv, q.w*inv };
+}
+inline Quat quat_conjugate(Quat q) { return { -q.x, -q.y, -q.z, q.w }; }
+// Hamilton product: a then b -> b * a (apply a first when rotating a vector).
+inline Quat quat_mul(Quat a, Quat b) {
+    return {
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+    };
+}
+// Convert a unit quaternion to a row-major 3x3.
+inline void quat_to_mat3_rowmajor(Quat q, float m[9]) {
+    q = quat_normalize(q);
+    const float xx = q.x*q.x, yy = q.y*q.y, zz = q.z*q.z;
+    const float xy = q.x*q.y, xz = q.x*q.z, yz = q.y*q.z;
+    const float wx = q.w*q.x, wy = q.w*q.y, wz = q.w*q.z;
+    m[0] = 1 - 2*(yy + zz); m[1] = 2*(xy - wz);     m[2] = 2*(xz + wy);
+    m[3] = 2*(xy + wz);     m[4] = 1 - 2*(xx + zz); m[5] = 2*(yz - wx);
+    m[6] = 2*(xz - wy);     m[7] = 2*(yz + wx);     m[8] = 1 - 2*(xx + yy);
+}
+
+uint64_t now_ns_steady() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 void load_gl_extensions() {
     if (eglCreateImageKHR_) return;
@@ -40,6 +78,8 @@ bool Compositor::init() {
         LOGE("EyeBlit init failed");
         return false;
     }
+    const char* dbg = std::getenv("FUVR_QUEST_DEBUG");
+    debug_atw_ = (dbg && dbg[0] && dbg[0] != '0');
     return create_swapchains();
 }
 
@@ -162,13 +202,22 @@ GLuint Compositor::upload_hardware_buffer(AHardwareBuffer* buf) {
 }
 
 void Compositor::submit_frame(const DecodedFrame& frame) {
-    if (!frame.buffer) { has_frame_ = false; return; }
+    // Why: the main loop ticks at compositor vsync (90 Hz) and pops the
+    // decoder every iteration; if the decoder hasn't published a fresh frame
+    // since the previous pop the buffer is null. Clearing has_frame_ here
+    // produced the alternating black-frame flicker. Keep the previously
+    // bound texture on the GL side and just skip — the decoder's drop-old
+    // replacement still runs, so we never starve nor lag behind by more
+    // than one decode interval.
+    if (!frame.buffer) return;
     upload_hardware_buffer(frame.buffer);
     // Why: the texture/EGLImage path keeps its own reference to the gralloc
     // pages, so we drop the ref the decoder handed us as soon as the bind
     // completes; otherwise we'd hold every frame buffer indefinitely and
     // exhaust the AImageReader's max-images pool within seconds.
     AHardwareBuffer_release(frame.buffer);
+    rendered_left_ = frame.rendered_left;
+    rendered_right_ = frame.rendered_right;
     has_frame_ = true;
 }
 
@@ -192,7 +241,119 @@ bool Compositor::render_eye(int eye_index) {
     glViewport(0, 0, e.width, e.height);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    blit_.blit(current_texture_, eye_index);
+
+    // --- Build per-eye warp params. ---------------------------------------
+    EyeBlit::WarpParams warp{};
+    const auto& views_now = xr_.last_views();
+    const PlainViewState& rv = (eye_index == 0) ? rendered_left_ : rendered_right_;
+    const auto& nv = views_now[eye_index];
+
+    // Now-fov (xrLocateViews this frame). Always trusted.
+    warp.fov_now.angleLeft  = nv.fov.angleLeft;
+    warp.fov_now.angleRight = nv.fov.angleRight;
+    warp.fov_now.angleUp    = nv.fov.angleUp;
+    warp.fov_now.angleDown  = nv.fov.angleDown;
+
+    // Render-fov: the daemon currently doesn't ship a real fov in the wire
+    // header (TODO: plumb through SubmitFrameRequest). Until it does, the
+    // safest assumption is that the Mac rendered with the same per-eye fov
+    // the headset reported on its last upstream pose sample, which is the
+    // current OpenXR fov. The shader is robust to drift here — using the
+    // now-fov gives a slightly under-corrected warp, never an over-correction.
+    bool have_render_fov = (rv.fov.angleLeft != 0.0f || rv.fov.angleRight != 0.0f);
+    warp.fov_render = have_render_fov
+        ? EyeBlit::Fov{rv.fov.angleLeft, rv.fov.angleRight, rv.fov.angleUp, rv.fov.angleDown}
+        : warp.fov_now;
+
+    // The shader needs R_delta_inv: a rotation that maps a ray direction
+    // expressed in the present-time eye frame into the render-time eye frame.
+    // Vectors transform between frames by their *inverse* world rotations:
+    //   v_world  = R(q_eye) * v_eye
+    //   v_render = R(q_render⁻¹) * R(q_now) * v_now
+    //            = R(q_render⁻¹ · q_now) * v_now
+    // so R_delta_inv corresponds to the quaternion (q_render⁻¹ · q_now).
+    // If either pose is invalid (still defaulted), fall back to identity so
+    // the blit still produces a sensible image.
+    Quat q_now { nv.pose.orientation.x, nv.pose.orientation.y,
+                 nv.pose.orientation.z, nv.pose.orientation.w };
+    Quat q_ren { rv.pose.ox, rv.pose.oy, rv.pose.oz, rv.pose.ow };
+    bool render_pose_valid = (q_ren.x != 0.0f || q_ren.y != 0.0f ||
+                              q_ren.z != 0.0f || q_ren.w != 1.0f);
+
+    // QUAT-FIX: q_now arrives raw from xrLocateViews (Meta makes no continuity
+    // guarantee across the q vs -q double cover) while q_ren came over the
+    // wire from the Mac predictor (which canonicalizes against its own
+    // history). The two sign threads can drift, and a single antipodal frame
+    // produces a Δq through the long way ~360° → instant ATW snap. Pin both
+    // onto the same sheet as the previous frame's canonical values, then
+    // recompute Δq.
+    auto qdot = [](const float a[4], const Quat& b) {
+        return a[0]*b.x + a[1]*b.y + a[2]*b.z + a[3]*b.w;
+    };
+    auto qneg = [](Quat& q) { q.x=-q.x; q.y=-q.y; q.z=-q.z; q.w=-q.w; };
+    float* prev_now = prev_q_now_[eye_index];
+    float* prev_ren = prev_q_ren_[eye_index];
+    if (qdot(prev_now, q_now) < 0.0f) qneg(q_now);
+    if (render_pose_valid && qdot(prev_ren, q_ren) < 0.0f) qneg(q_ren);
+    // Additionally make q_ren live on the same sheet as q_now so the
+    // conjugate-product never crosses the cover.
+    if (render_pose_valid) {
+        const float d = q_ren.x*q_now.x + q_ren.y*q_now.y +
+                        q_ren.z*q_now.z + q_ren.w*q_now.w;
+        if (d < 0.0f) qneg(q_ren);
+    }
+    prev_q_now_[eye_index][0] = q_now.x; prev_q_now_[eye_index][1] = q_now.y;
+    prev_q_now_[eye_index][2] = q_now.z; prev_q_now_[eye_index][3] = q_now.w;
+    if (render_pose_valid) {
+        prev_q_ren_[eye_index][0] = q_ren.x; prev_q_ren_[eye_index][1] = q_ren.y;
+        prev_q_ren_[eye_index][2] = q_ren.z; prev_q_ren_[eye_index][3] = q_ren.w;
+    }
+
+    if (eye_index == 0) {
+        const uint64_t t = now_ns_steady();
+        if (t - last_quat_dbg_ns_ > 1'000'000'000ull) {
+            last_quat_dbg_ns_ = t;
+            const float d_now = qdot(prev_q_now_[0], q_now); // post-fix: ~+1
+            const float d_ren = qdot(prev_q_ren_[0], q_ren);
+            const float d_pair = q_ren.x*q_now.x + q_ren.y*q_now.y +
+                                 q_ren.z*q_now.z + q_ren.w*q_now.w;
+            LOGI("[QUAT-DEBUG] dot(q_n,q_n-1)now=%.4f ren=%.4f pair(ren,now)=%.4f valid=%d",
+                 d_now, d_ren, d_pair, (int)render_pose_valid);
+        }
+    }
+
+    if (render_pose_valid) {
+        Quat dq = quat_mul(quat_conjugate(quat_normalize(q_ren)),
+                           quat_normalize(q_now));
+        quat_to_mat3_rowmajor(dq, warp.r_delta_inv);
+    } else {
+        // Identity row-major.
+        warp.r_delta_inv[0] = warp.r_delta_inv[4] = warp.r_delta_inv[8] = 1.0f;
+        warp.r_delta_inv[1] = warp.r_delta_inv[2] = warp.r_delta_inv[3] = 0.0f;
+        warp.r_delta_inv[5] = warp.r_delta_inv[6] = warp.r_delta_inv[7] = 0.0f;
+    }
+
+    if (debug_atw_ && eye_index == 0) {
+        const uint64_t t = now_ns_steady();
+        if (t - last_debug_log_ns_ > 1'000'000'000ull) {
+            last_debug_log_ns_ = t;
+            // Δq norm relative to identity == |sin(theta/2)| ≈ theta/2 (rad)
+            // for small angles. Useful sanity number to confirm the warp is
+            // actually responsive to head motion.
+            Quat dq_dbg = quat_mul(quat_conjugate(quat_normalize(q_ren)),
+                                   quat_normalize(q_now));
+            const float vec_norm = std::sqrt(dq_dbg.x*dq_dbg.x +
+                                             dq_dbg.y*dq_dbg.y +
+                                             dq_dbg.z*dq_dbg.z);
+            LOGI("ATW eye0 fov_now(L=%.3f R=%.3f U=%.3f D=%.3f) "
+                 "fov_render_present=%d |sin(theta/2)|=%.4f render_pose_valid=%d",
+                 warp.fov_now.angleLeft, warp.fov_now.angleRight,
+                 warp.fov_now.angleUp, warp.fov_now.angleDown,
+                 (int)have_render_fov, vec_norm, (int)render_pose_valid);
+        }
+    }
+
+    blit_.blit(current_texture_, eye_index, warp);
 
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
     glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2], prev_viewport[3]);

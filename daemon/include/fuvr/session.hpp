@@ -2,8 +2,11 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 #include <functional>
 
@@ -78,6 +81,14 @@ private:
     MetricsAggregator metrics_;
     std::atomic<uint64_t> lastEncodeStartNs_{0};
     EncodeStatsSink statsSink_;
+
+    // Rendered pose per in-flight frame, keyed by frameId. The encoder is
+    // asynchronous: submitFrame stashes the pose, FragmentSink::onFragment
+    // pops it back out so it can stamp the wire VideoFragmentHeader. Cleared
+    // on endOfFrame (and bounded against runaway growth).
+    struct RenderedPose { std::array<float, 7> left{}; std::array<float, 7> right{}; bool valid{false}; };
+    std::mutex renderedPosesMu_;
+    std::unordered_map<uint64_t, RenderedPose> renderedPoses_;
 
     // Per-frame accumulators (last fragment fires EncodeStatsEvent).
     uint64_t curFrameId_       = 0;

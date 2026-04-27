@@ -8,6 +8,8 @@
 #include <memory>
 #include <mutex>
 
+#include "proto_codec.hpp"
+
 struct AMediaCodec;
 struct AMediaFormat;
 struct AImageReader;
@@ -19,6 +21,12 @@ struct DecodedFrame {
     AHardwareBuffer* buffer{nullptr};
     uint64_t frame_id{0};
     uint64_t presentation_time_ns{0};
+    // Pose used to render this frame on the Mac (per-eye, ViewState carries
+    // pose+fov). Compositor reprojects against xrLocateViews-now to apply
+    // rotational ATW. Defaulted to identity for frames pushed before the
+    // pose plumbing is complete.
+    PlainViewState rendered_left{};
+    PlainViewState rendered_right{};
 };
 
 struct DecoderMetrics {
@@ -42,7 +50,9 @@ public:
     void set_output_size(int32_t width, int32_t height);
 
     // Push a NAL/access-unit fragment received from transport.
-    void push_encoded(const uint8_t* data, size_t size, uint64_t pts_ns, bool is_key);
+    void push_encoded(const uint8_t* data, size_t size, uint64_t pts_ns, bool is_key,
+                      const PlainViewState& rendered_left = {},
+                      const PlainViewState& rendered_right = {});
 
     // Drop-old policy: take the freshest decoded AHardwareBuffer.
     // The returned `buffer` carries one ref the caller must release with
@@ -71,8 +81,15 @@ private:
     std::mutex frame_mutex_;
     DecodedFrame latest_{};
 
+    struct InflightPts {
+        uint64_t pts_us;
+        uint64_t enqueue_ns;
+        PlainViewState rendered_left;
+        PlainViewState rendered_right;
+    };
+
     std::mutex pts_mutex_;
-    std::deque<std::pair<uint64_t, uint64_t>> queued_;
+    std::deque<InflightPts> queued_;
 
     std::mutex metrics_mutex_;
     std::deque<uint64_t> arrival_intervals_ns_;

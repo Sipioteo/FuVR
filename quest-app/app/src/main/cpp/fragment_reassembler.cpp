@@ -14,6 +14,8 @@ bool FragmentReassembler::submit(uint64_t frameId,
                                  uint16_t flags,
                                  int codec,
                                  uint64_t targetDisplayTimeNs,
+                                 const PlainViewState& renderedLeft,
+                                 const PlainViewState& renderedRight,
                                  const uint8_t* data,
                                  size_t size) {
     if (fragmentCount == 0 || fragmentIndex >= fragmentCount) return false;
@@ -27,6 +29,8 @@ bool FragmentReassembler::submit(uint64_t frameId,
         p.flags = flags;
         p.codec = codec;
         p.targetDisplayTimeNs = targetDisplayTimeNs;
+        p.renderedLeft = renderedLeft;
+        p.renderedRight = renderedRight;
         p.slices.resize(fragmentCount);
         p.presence.assign(fragmentCount, 0);
         it = partial_.emplace(frameId, std::move(p)).first;
@@ -46,6 +50,8 @@ bool FragmentReassembler::submit(uint64_t frameId,
         done.targetDisplayTimeNs = p.targetDisplayTimeNs;
         done.isKeyframe = (p.flags & kFlagIdr) != 0;
         done.codec = p.codec;
+        done.renderedLeft = p.renderedLeft;
+        done.renderedRight = p.renderedRight;
         size_t total = 0;
         for (auto& s : p.slices) total += s.size();
         done.payload.reserve(total);
