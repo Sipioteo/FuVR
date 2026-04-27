@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#define XR_USE_GRAPHICS_API_METAL 1
 #include <openxr/openxr.h>
 #include <openxr/openxr_loader_negotiation.h>
+#include <openxr/openxr_platform.h>
 
 #include <array>
 #include <atomic>
@@ -109,6 +111,7 @@ struct Session {
   std::unique_ptr<IOSurfaceXpcClient> xpcClient;
   uint64_t daemonSessionId{0};
   void* metalDevice{nullptr};  // id<MTLDevice>, retained
+  void* metalCommandQueue{nullptr};  // id<MTLCommandQueue> from KHR binding (NOT retained — owned by app)
   std::vector<std::unique_ptr<Space>> spaces;
   Pose localOriginPose{};
   EncoderStats encoderStats{};

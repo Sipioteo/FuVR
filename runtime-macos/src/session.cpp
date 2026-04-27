@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -21,8 +23,13 @@ std::mutex& globalMutex() noexcept;
 
 XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* info,
                                XrSession* out) noexcept {
+  if (std::getenv("FUVR_RT_DEBUG"))
+    std::fprintf(stderr, "[fuvr-rt] xrCreateSession(systemId=%llu)\n",
+                 info ? (unsigned long long)info->systemId : 0ull);
   Instance* inst = lookupInstance(instance);
   if (inst == nullptr || info == nullptr || out == nullptr) {
+    if (std::getenv("FUVR_RT_DEBUG"))
+      std::fprintf(stderr, "[fuvr-rt]   -> handle invalid\n");
     return XR_ERROR_HANDLE_INVALID;
   }
   auto session = std::make_unique<Session>();
@@ -30,21 +37,32 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
   session->state = XR_SESSION_STATE_IDLE;
 
   void* mtlDevice = nullptr;
+  void* mtlCommandQueue = nullptr;
   for (const XrBaseInStructure* p =
            static_cast<const XrBaseInStructure*>(info->next);
        p != nullptr; p = p->next) {
+    if (p->type == XR_TYPE_GRAPHICS_BINDING_METAL_KHR) {
+      // Why: KHR binding gives a command queue (id<MTLCommandQueue>); we
+      // derive the device from queue.device on the Objective-C++ side.
+      const auto* b = reinterpret_cast<const XrGraphicsBindingMetalKHR*>(p);
+      mtlCommandQueue = b->commandQueue;
+      mtlDevice = deviceFromCommandQueue(b->commandQueue);
+      break;
+    }
     if (p->type == XR_TYPE_GRAPHICS_BINDING_METAL_FUVR) {
       const auto* b = reinterpret_cast<const XrGraphicsBindingMetalFUVR*>(p);
       mtlDevice = b->mtlDevice;
       break;
     }
   }
-  // Why: M0/M1 apps don't yet pass XR_FUVR_metal_enable; fall back to the
-  // system default device. M3 apps will provide their own.
+  // Why: in-process tests and headless tooling fall back to the system
+  // default Metal device. Real apps (Blender, Godot) pass it via the KHR
+  // binding above.
   if (mtlDevice == nullptr) {
     mtlDevice = defaultMetalDevice();
   }
   session->metalDevice = mtlDevice;
+  session->metalCommandQueue = mtlCommandQueue;
 
   auto daemon = std::make_shared<DaemonClient>();
   session->daemon = daemon;
@@ -53,7 +71,11 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
   session->frameSink = makeDaemonFrameSink(daemon.get());
 
   bool daemonConnected = false;
+  if (std::getenv("FUVR_RT_DEBUG"))
+    std::fprintf(stderr, "[fuvr-rt]   created Session, attempting daemon connect\n");
   if (daemon->ensureConnected()) {
+    if (std::getenv("FUVR_RT_DEBUG"))
+      std::fprintf(stderr, "[fuvr-rt]   daemon connected\n");
     daemonConnected = true;
     StartSessionParams params{};
     params.perEyeWidth = 2064;
@@ -151,6 +173,8 @@ XrResult xrDestroySession_impl(XrSession sessionHandle) noexcept {
 
 XrResult xrBeginSession_impl(XrSession sessionHandle,
                               const XrSessionBeginInfo* info) noexcept {
+  if (std::getenv("FUVR_RT_DEBUG"))
+    std::fprintf(stderr, "[fuvr-rt] xrBeginSession()\n");
   Session* s = lookupSession(sessionHandle);
   if (s == nullptr || info == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
@@ -227,6 +251,13 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
   Session* s = lookupSession(sessionHandle);
   if (s == nullptr || info == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
+  }
+  if (std::getenv("FUVR_RT_DEBUG")) {
+    static std::atomic<uint64_t> endFrameCount{0};
+    uint64_t n = endFrameCount.fetch_add(1, std::memory_order_relaxed);
+    if (n < 5 || (n % 90) == 0)
+      std::fprintf(stderr, "[fuvr-rt] xrEndFrame #%llu layers=%u\n",
+                   (unsigned long long)n, info->layerCount);
   }
   if (s->frameSink) {
     SubmittedFrame f{};

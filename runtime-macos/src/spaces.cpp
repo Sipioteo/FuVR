@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "fuvr/spaces.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 
@@ -54,6 +56,9 @@ Pose composePoseInRef(const Pose& base, const XrPosef& offset) noexcept {
 XrResult xrCreateReferenceSpace_impl(XrSession sessionHandle,
                                       const XrReferenceSpaceCreateInfo* info,
                                       XrSpace* out) noexcept {
+  if (std::getenv("FUVR_RT_DEBUG") && info)
+    std::fprintf(stderr, "[fuvr-rt] xrCreateReferenceSpace(type=%d)\n",
+                 info->referenceSpaceType);
   Session* s = lookupSession(sessionHandle);
   if (s == nullptr || info == nullptr || out == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
@@ -69,7 +74,16 @@ XrResult xrCreateReferenceSpace_impl(XrSession sessionHandle,
     case XR_REFERENCE_SPACE_TYPE_STAGE:
       kind = SpaceKind::ReferenceStage;
       break;
+    case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT:
+      // Why: XR_EXT_local_floor — same as LOCAL but origin anchored at floor.
+      // We treat as LOCAL until guardian floor data is forwarded.
+      kind = SpaceKind::ReferenceLocal;
+      break;
     default:
+      if (std::getenv("FUVR_RT_DEBUG"))
+        std::fprintf(stderr,
+                     "[fuvr-rt]   -> reference space type %d unsupported\n",
+                     info->referenceSpaceType);
       return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
   }
   auto sp = std::make_unique<Space>();

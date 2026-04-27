@@ -41,6 +41,9 @@ target_link_libraries(fuvr_daemon_core PUBLIC
 # only via Foundation linkage above; keep this comment so future readers know
 # we did not forget an `-framework XPC`.
 
+set_source_files_properties(src/daemon.cpp PROPERTIES
+  COMPILE_FLAGS "-fexceptions"
+)
 set_source_files_properties(src/iosurface_bridge.mm PROPERTIES
   COMPILE_FLAGS "-fobjc-arc -fexceptions"
 )
@@ -48,7 +51,8 @@ set_source_files_properties(src/iosurface_xpc_service.mm PROPERTIES
   COMPILE_FLAGS "-fno-objc-arc"
 )
 
-find_library(FUVR_TRANSPORT_LIB fuvr_transport
+find_library(FUVR_TRANSPORT_LIB
+  NAMES transport_ffi fuvr_transport
   HINTS ${CMAKE_SOURCE_DIR}/transport/target/release
         ${CMAKE_SOURCE_DIR}/transport/target/debug
 )

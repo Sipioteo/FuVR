@@ -130,6 +130,11 @@ XrResult xrDestroyAction_impl(XrAction handle) noexcept {
 XrResult xrSuggestInteractionProfileBindings_impl(
     XrInstance instance,
     const XrInteractionProfileSuggestedBinding* bindings) noexcept {
+  if (std::getenv("FUVR_RT_DEBUG") && bindings)
+    std::fprintf(stderr,
+                 "[fuvr-rt] xrSuggestInteractionProfileBindings(profile=%llu, count=%u)\n",
+                 (unsigned long long)bindings->interactionProfile,
+                 bindings->countSuggestedBindings);
   if (lookupInstance(instance) == nullptr || bindings == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
   }
@@ -145,6 +150,10 @@ XrResult xrSuggestInteractionProfileBindings_impl(
 XrResult xrAttachSessionActionSets_impl(
     XrSession sessionHandle,
     const XrSessionActionSetsAttachInfo* info) noexcept {
+  if (std::getenv("FUVR_RT_DEBUG") && info)
+    std::fprintf(stderr,
+                 "[fuvr-rt] xrAttachSessionActionSets(count=%u)\n",
+                 info->countActionSets);
   Session* s = lookupSession(sessionHandle);
   if (s == nullptr || info == nullptr) {
     return XR_ERROR_HANDLE_INVALID;

@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#define XR_USE_GRAPHICS_API_VULKAN 0
 #include <openxr/openxr.h>
 
 #include <mutex>

@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
+#define FUVR_LOG(fmt, ...)                                                     \
+  do {                                                                         \
+    if (std::getenv("FUVR_RT_DEBUG"))                                          \
+      std::fprintf(stderr, "[fuvr-rt] " fmt "\n", ##__VA_ARGS__);              \
+  } while (0)
+
+#include "fuvr/iosurface_swapchain.hpp"
 #include "fuvr/path_registry.hpp"
 #include "fuvr/runtime.hpp"
 
@@ -55,10 +63,13 @@ uint64_t allocHandle() noexcept {
 constexpr XrSystemId kSystemId = 1;
 
 const char* kSupportedExtensions[] = {
+    "XR_KHR_metal_enable",
     "XR_KHR_vulkan_enable2",
     "XR_FUVR_metal_enable",
     "XR_EXT_hand_tracking",
     "XR_EXT_eye_gaze_interaction",
+    "XR_EXT_local_floor",
+    "XR_EXT_debug_utils",
 };
 
 }  // namespace
@@ -148,19 +159,24 @@ XrResult xrEnumerateInstanceExtensionProperties_impl(
 
 XrResult xrGetSystem_impl(XrInstance instance, const XrSystemGetInfo* info,
                            XrSystemId* systemId) noexcept {
+  FUVR_LOG("xrGetSystem(formFactor=%d)", info ? info->formFactor : -1);
   if (lookupInstance(instance) == nullptr || info == nullptr ||
       systemId == nullptr) {
+    FUVR_LOG("  -> handle invalid");
     return XR_ERROR_HANDLE_INVALID;
   }
   if (info->formFactor != XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY) {
+    FUVR_LOG("  -> form factor unsupported");
     return XR_ERROR_FORM_FACTOR_UNSUPPORTED;
   }
   *systemId = kSystemId;
+  FUVR_LOG("  -> ok systemId=%llu", (unsigned long long)kSystemId);
   return XR_SUCCESS;
 }
 
 XrResult xrGetSystemProperties_impl(XrInstance instance, XrSystemId systemId,
                                      XrSystemProperties* props) noexcept {
+  FUVR_LOG("xrGetSystemProperties(sys=%llu)", (unsigned long long)systemId);
   if (lookupInstance(instance) == nullptr || systemId != kSystemId ||
       props == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
@@ -175,6 +191,37 @@ XrResult xrGetSystemProperties_impl(XrInstance instance, XrSystemId systemId,
   props->graphicsProperties.maxSwapchainImageHeight = 2208;
   props->trackingProperties.orientationTracking = XR_TRUE;
   props->trackingProperties.positionTracking = XR_TRUE;
+  return XR_SUCCESS;
+}
+
+XrResult xrGetReferenceSpaceBoundsRect_impl(
+    XrSession session, XrReferenceSpaceType referenceSpaceType,
+    XrExtent2Df* bounds) noexcept {
+  // Why: Blender calls this during GHOST_XrSession::start to size the stage.
+  // We don't have real stage bounds (the Quest's guardian is not forwarded
+  // to the runtime), so we report unavailable. Spec: when bounds are not
+  // available, fill with zeros and return XR_SPACE_BOUNDS_UNAVAILABLE.
+  if (bounds != nullptr) {
+    bounds->width = 0.0f;
+    bounds->height = 0.0f;
+  }
+  (void)session;
+  (void)referenceSpaceType;
+  return XR_SPACE_BOUNDS_UNAVAILABLE;
+}
+
+XrResult xrGetMetalGraphicsRequirementsKHR_impl(
+    XrInstance instance, XrSystemId systemId,
+    XrGraphicsRequirementsMetalKHR* req) noexcept {
+  FUVR_LOG("xrGetMetalGraphicsRequirementsKHR(sys=%llu)", (unsigned long long)systemId);
+  if (lookupInstance(instance) == nullptr || systemId != kSystemId ||
+      req == nullptr) {
+    return XR_ERROR_HANDLE_INVALID;
+  }
+  // Why: spec requires the runtime to advertise the recommended Metal device
+  // before xrCreateSession. We expose the system default; multi-GPU Macs
+  // will need refinement in M3.
+  req->metalDevice = defaultMetalDevice();
   return XR_SUCCESS;
 }
 
@@ -198,11 +245,14 @@ XrResult xrEnumerateViewConfigurationViews_impl(
     XrInstance instance, XrSystemId systemId, XrViewConfigurationType type,
     uint32_t capacity, uint32_t* countOutput,
     XrViewConfigurationView* views) noexcept {
+  FUVR_LOG("xrEnumerateViewConfigurationViews(type=%d, cap=%u)", type, capacity);
   if (lookupInstance(instance) == nullptr || systemId != kSystemId ||
       countOutput == nullptr) {
+    FUVR_LOG("  -> handle invalid");
     return XR_ERROR_HANDLE_INVALID;
   }
   if (type != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+    FUVR_LOG("  -> view config %d unsupported", type);
     return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
   }
   if (views == nullptr || capacity == 0) {
@@ -231,6 +281,7 @@ XrResult xrEnumerateEnvironmentBlendModes_impl(
     XrInstance instance, XrSystemId systemId, XrViewConfigurationType type,
     uint32_t capacity, uint32_t* countOutput,
     XrEnvironmentBlendMode* modes) noexcept {
+  FUVR_LOG("xrEnumerateEnvironmentBlendModes(cap=%u)", capacity);
   (void)type;
   if (lookupInstance(instance) == nullptr || systemId != kSystemId ||
       countOutput == nullptr) {
@@ -250,7 +301,10 @@ XrResult xrPollEvent_impl(XrInstance instance, XrEventDataBuffer* buffer) noexce
   if (inst == nullptr || buffer == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
   }
-  return inst->events.pop(buffer) ? XR_SUCCESS : XR_EVENT_UNAVAILABLE;
+  bool got = inst->events.pop(buffer);
+  if (got && std::getenv("FUVR_RT_DEBUG"))
+    std::fprintf(stderr, "[fuvr-rt] xrPollEvent() -> type=%d\n", buffer->type);
+  return got ? XR_SUCCESS : XR_EVENT_UNAVAILABLE;
 }
 
 XrResult xrResultToString_impl(XrInstance instance, XrResult value,
@@ -305,8 +359,18 @@ XrResult xrStringToPath_impl(XrInstance instance, const char* str,
 }
 
 XrResult xrGetCurrentInteractionProfile_impl(
-    XrSession, XrPath, XrInteractionProfileState*) noexcept {
-  return XR_ERROR_FUNCTION_UNSUPPORTED;
+    XrSession, XrPath, XrInteractionProfileState* state) noexcept {
+  // Why: Blender calls this during session init to learn which controller
+  // bindings are bound for each user path. Until controller pose forwarding
+  // is wired (pass 5 item) we report XR_NULL_PATH so callers know there is
+  // no current profile but do not interpret the call as an error.
+  if (state == nullptr) {
+    return XR_ERROR_VALIDATION_FAILURE;
+  }
+  state->type = XR_TYPE_INTERACTION_PROFILE_STATE;
+  state->next = nullptr;
+  state->interactionProfile = XR_NULL_PATH;
+  return XR_SUCCESS;
 }
 
 namespace detail {

@@ -7,8 +7,10 @@
 #include <vector>
 
 #include <capnp/message.h>
+#include <capnp/serialize.h>
 #include <capnp/serialize-packed.h>
 #include <kj/io.h>
+#include <kj/exception.h>
 
 #include "fuvr/iosurface_bridge.hpp"
 #include "fuvr/logger.hpp"
@@ -99,6 +101,11 @@ void Daemon::onTransportRecv(void* user, uint8_t channel,
 }
 
 void Daemon::handleControlMessage(const uint8_t* data, std::size_t len) {
+    // Why: peers may send malformed or non-capnp data (early handshake bytes,
+    // framing glitches, etc.). KJ exceptions propagate through this C ABI
+    // callback and would terminate the daemon. Catch via kj::runCatchingExceptions
+    // because the daemon is compiled with -fno-exceptions.
+    auto e = kj::runCatchingExceptions([&]() {
     kj::ArrayInputStream is(kj::arrayPtr(data, len));
     ::capnp::PackedMessageReader reader(is);
     auto cm = reader.getRoot<::fuvr::proto::ControlMessage>();
@@ -117,6 +124,10 @@ void Daemon::handleControlMessage(const uint8_t* data, std::size_t len) {
             if (qm->hasFps)       qDecoderFps_         = qm->decoderFps;
             if (qm->hasDecodeP95) qDecoderDecodeMsP95_ = qm->decoderDecodeMsP95;
         }
+    }
+    });
+    if (e != nullptr) {
+        std::fprintf(stderr, "[fuvrd] handleControlMessage: drop malformed %zu bytes\n", len);
     }
 }
 
@@ -188,8 +199,14 @@ void Daemon::dispatchEncodeStats(const EncodeStatsEvent& ev) {
 }
 
 void Daemon::onEnvelope(const InboundRpc& rpc) {
-    kj::ArrayInputStream is(kj::arrayPtr(rpc.envelope.data(), rpc.envelope.size()));
-    ::capnp::PackedMessageReader reader(is);
+    auto exc = kj::runCatchingExceptions([&]() {
+    // Why: runtime sendEnvelope uses messageToFlatArray (unpacked); daemon
+    // must therefore decode as a FlatArrayMessageReader. PackedMessageReader
+    // would corrupt the first word and trigger "Message did not contain a
+    // root pointer".
+    const auto* words = reinterpret_cast<const ::capnp::word*>(rpc.envelope.data());
+    const std::size_t wordCount = rpc.envelope.size() / sizeof(::capnp::word);
+    ::capnp::FlatArrayMessageReader reader(kj::arrayPtr(words, wordCount));
     auto env = reader.getRoot<::fuvr::daemon::Envelope>();
     auto body = env.getBody();
     uint64_t seq = env.getSeq();
@@ -371,6 +388,11 @@ void Daemon::onEnvelope(const InboundRpc& rpc) {
     default:
         reply([&](auto e) { e.getBody().setError("unsupported"); });
         break;
+    }
+    });
+    if (exc != nullptr) {
+        std::fprintf(stderr, "[fuvrd] onEnvelope: drop malformed RPC (%zu bytes)\n",
+                     rpc.envelope.size());
     }
 }
 

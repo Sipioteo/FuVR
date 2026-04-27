@@ -1,6 +1,6 @@
 include(FetchContent)
 
-set(OPENXR_SDK_TAG "release-1.1.36" CACHE STRING "OpenXR-SDK tag")
+set(OPENXR_SDK_TAG "release-1.1.49" CACHE STRING "OpenXR-SDK tag")
 
 FetchContent_Declare(
   OpenXR-SDK

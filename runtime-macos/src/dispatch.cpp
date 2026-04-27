@@ -20,6 +20,10 @@ extern XrResult xrEnumerateViewConfigurationViews_impl(
 extern XrResult xrEnumerateEnvironmentBlendModes_impl(
     XrInstance, XrSystemId, XrViewConfigurationType, uint32_t, uint32_t*,
     XrEnvironmentBlendMode*) noexcept;
+extern XrResult xrGetMetalGraphicsRequirementsKHR_impl(
+    XrInstance, XrSystemId, XrGraphicsRequirementsMetalKHR*) noexcept;
+extern XrResult xrGetReferenceSpaceBoundsRect_impl(
+    XrSession, XrReferenceSpaceType, XrExtent2Df*) noexcept;
 extern XrResult xrPollEvent_impl(XrInstance, XrEventDataBuffer*) noexcept;
 extern XrResult xrResultToString_impl(XrInstance, XrResult, char*) noexcept;
 extern XrResult xrStructureTypeToString_impl(XrInstance, XrStructureType, char*) noexcept;
@@ -129,6 +133,10 @@ XrResult getInstanceProcAddr(XrInstance instance, const char* name,
        toPfn(xrEnumerateViewConfigurationViews_impl)},
       {"xrEnumerateEnvironmentBlendModes",
        toPfn(xrEnumerateEnvironmentBlendModes_impl)},
+      {"xrGetMetalGraphicsRequirementsKHR",
+       toPfn(xrGetMetalGraphicsRequirementsKHR_impl)},
+      {"xrGetReferenceSpaceBoundsRect",
+       toPfn(xrGetReferenceSpaceBoundsRect_impl)},
       {"xrCreateSession", toPfn(xrCreateSession_impl)},
       {"xrDestroySession", toPfn(xrDestroySession_impl)},
       {"xrBeginSession", toPfn(xrBeginSession_impl)},

@@ -49,6 +49,9 @@ void* defaultMetalDevice() noexcept;
 // Release a retained MTLDevice from defaultMetalDevice().
 void releaseMetalDevice(void* device) noexcept;
 
+// Given an id<MTLCommandQueue>, returns its id<MTLDevice> (retained).
+void* deviceFromCommandQueue(void* commandQueue) noexcept;
+
 uint32_t iosurfaceID(IOSurfaceRef surface) noexcept;
 
 }  // namespace fuvr::runtime

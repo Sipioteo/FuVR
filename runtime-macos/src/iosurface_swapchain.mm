@@ -116,6 +116,14 @@ void releaseMetalDevice(void* device) noexcept {
   CFRelease(static_cast<CFTypeRef>(device));
 }
 
+void* deviceFromCommandQueue(void* commandQueue) noexcept {
+  if (commandQueue == nullptr) return nullptr;
+  id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)commandQueue;
+  id<MTLDevice> dev = q.device;
+  if (dev == nil) return nullptr;
+  return (void*)CFBridgingRetain(dev);
+}
+
 uint32_t iosurfaceID(IOSurfaceRef surface) noexcept {
   if (surface == nullptr) return 0;
   return IOSurfaceGetID(surface);
