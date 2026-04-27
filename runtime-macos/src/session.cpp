@@ -433,13 +433,30 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
                             XR_VIEW_STATE_POSITION_TRACKED_BIT;
   }
   auto predicted = s->predictor.predict(static_cast<uint64_t>(info->displayTime));
+  // Why: previous code returned a symmetric ±0.95 rad fov for both eyes. The
+  // Quest 3 actually has an asymmetric per-eye fov (lenses canted toward the
+  // nose), so Blender rendering with the symmetric fov produced a per-eye
+  // geometry that didn't match what the headset displays — left/right images
+  // refused to fuse stereoscopically. These values approximate Quest 3's
+  // per-eye fov (outer ~64°, inner ~46°, vertical ~48°). Plumbing the exact
+  // runtime-reported fov through the wire is a follow-up; for now this is
+  // close enough that depth perception works and ATW's fov_render→fov_now
+  // fall-back stays well under a degree off.
+  constexpr float kOuter = 1.117f;  // ~64°
+  constexpr float kInner = 0.803f;  // ~46°
+  constexpr float kVert  = 0.838f;  // ~48°
   for (uint32_t i = 0; i < 2; ++i) {
     views[i].type = XR_TYPE_VIEW;
     views[i].next = nullptr;
-    views[i].fov.angleLeft = -0.95f;
-    views[i].fov.angleRight = 0.95f;
-    views[i].fov.angleUp = 0.95f;
-    views[i].fov.angleDown = -0.95f;
+    if (i == 0) {           // left eye: outer-left, inner-right
+      views[i].fov.angleLeft  = -kOuter;
+      views[i].fov.angleRight = +kInner;
+    } else {                // right eye: inner-left, outer-right
+      views[i].fov.angleLeft  = -kInner;
+      views[i].fov.angleRight = +kOuter;
+    }
+    views[i].fov.angleUp   = +kVert;
+    views[i].fov.angleDown = -kVert;
     if (predicted.has_value()) {
       const Pose& p = (i == 0) ? predicted->leftEye : predicted->rightEye;
       views[i].pose.position = {p.position.x, p.position.y, p.position.z};

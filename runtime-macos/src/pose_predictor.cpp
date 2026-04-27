@@ -161,7 +161,22 @@ std::optional<PoseSample> PosePredictor::predict(
   if (size_ == 1 || displayTimeNs <= last.timestampNs) {
     return last;
   }
-  const std::size_t lookback = size_ >= 4 ? 4 : size_;
+  // Why: the Quest pose forwarder ticks at 1 kHz but the underlying
+  // xrLocateViews only refreshes at the headset display rate (~72-90 Hz),
+  // so ~9 of every 10 samples we receive are bit-identical duplicates.
+  // A fixed N-sample lookback (e.g. 4 samples = ~4 ms) frequently lands
+  // entirely inside one duplicate run, producing either zero velocity or
+  // a sudden jump when the run changes. Walk back until we cover at least
+  // ~20 ms of wall time, which guarantees we span ≥1 fresh OpenXR update
+  // and the velocity estimate averages over real motion, not jitter.
+  std::size_t lookback = size_ >= 2 ? 2 : 1;
+  for (std::size_t k = 2; k <= size_; ++k) {
+    const PoseSample& cand = at(size_ - k);
+    const double dt =
+        static_cast<double>(last.timestampNs - cand.timestampNs) * 1e-9;
+    lookback = k;
+    if (dt >= 0.020) break;
+  }
   const PoseSample& earlier = at(size_ - lookback);
   const double dtBase =
       static_cast<double>(last.timestampNs - earlier.timestampNs) * 1e-9;
@@ -186,12 +201,22 @@ std::optional<PoseSample> PosePredictor::predict(
   out.rightEye = extrapolatePose(last.rightEye, linVel, angVel, dtPredict);
 
   if (size_ >= 2) {
-    const PoseSample& prev = at(size_ - 2);
+    // Why: use the same wide baseline as linear velocity (4 samples back at
+    // 1 kHz ≈ 3 ms) instead of the immediate previous sample (~1 ms). With a
+    // 70 ms lookahead, a 1 ms baseline produces an extrapolation factor of
+    // ~70× — any sub-millimeter sensor jitter in `last` blows up into a huge
+    // angular delta and the Quest's ATW snaps when q_render lurches frame
+    // to frame. A 3 ms baseline cuts the amplification to ~23× and the cap
+    // below clamps any remaining outliers to a reasonable max step.
+    const PoseSample& prev = (size_ >= 4) ? at(size_ - 4) : at(size_ - 2);
     const double dtPrev =
         static_cast<double>(last.timestampNs - prev.timestampNs) * 1e-9;
     if (dtPrev > 1e-6) {
-      const float t = static_cast<float>(
+      float t = static_cast<float>(
           static_cast<double>(displayTimeNs - last.timestampNs) / dtPrev);
+      // Cap extrapolation factor: at most 8× the baseline. Beyond that we
+      // hold the most-recent rotation rather than predicting through noise.
+      if (t > 8.0f) t = 8.0f;
       out.leftEye.orientation =
           slerp(prev.leftEye.orientation, last.leftEye.orientation, 1.0f + t);
       out.rightEye.orientation =
