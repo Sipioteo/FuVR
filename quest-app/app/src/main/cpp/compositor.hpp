@@ -4,6 +4,7 @@
 #define XR_USE_PLATFORM_ANDROID 1
 #define XR_USE_GRAPHICS_API_OPENGL_ES 1
 
+#include <jni.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl32.h>

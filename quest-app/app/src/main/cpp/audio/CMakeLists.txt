@@ -29,6 +29,7 @@ ExternalProject_Add(opus_external
     CMAKE_ARGS
         -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
         -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+        -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
         -DANDROID_ABI=${ANDROID_ABI}
         -DANDROID_PLATFORM=${ANDROID_PLATFORM}
         -DANDROID_STL=${ANDROID_STL}
@@ -42,6 +43,7 @@ ExternalProject_Add(opus_external
 )
 
 set(OPUS_INCLUDE_DIR "${OPUS_INSTALL}/include")
+set(OPUS_INCLUDE_DIR_OPUS_SUBDIR "${OPUS_INSTALL}/include/opus")
 set(OPUS_LIB_DIR     "${OPUS_INSTALL}/lib")
 file(MAKE_DIRECTORY "${OPUS_INCLUDE_DIR}")
 
@@ -65,6 +67,7 @@ target_include_directories(fuvr_quest_audio PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../proto_gen
     ${CAPNP_INCLUDE_DIR}
     ${OPUS_INCLUDE_DIR}
+    ${OPUS_INCLUDE_DIR_OPUS_SUBDIR}
 )
 
 # Cap'n Proto bridge needs exceptions + RTTI; the rest of the module does not.

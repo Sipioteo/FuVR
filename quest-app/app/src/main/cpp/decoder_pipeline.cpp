@@ -80,7 +80,9 @@ bool DecoderPipeline::start(Codec codec) {
     AMediaFormat_setString(format_, AMEDIAFORMAT_KEY_MIME, mime);
     AMediaFormat_setInt32(format_, AMEDIAFORMAT_KEY_WIDTH, width_);
     AMediaFormat_setInt32(format_, AMEDIAFORMAT_KEY_HEIGHT, height_);
+#if __ANDROID_API__ >= 30
     AMediaFormat_setInt32(format_, AMEDIAFORMAT_KEY_LOW_LATENCY, 1);
+#endif
 
     // Why: passing the AImageReader's ANativeWindow as the output surface
     // makes MediaCodec write decoded frames straight into AHardwareBuffer-
@@ -133,7 +135,11 @@ void DecoderPipeline::push_encoded(const uint8_t* data, size_t size,
     uint8_t* dst = AMediaCodec_getInputBuffer(codec_, idx, &cap);
     if (!dst || cap < size) return;
     std::memcpy(dst, data, size);
-    uint32_t flags = is_key ? AMEDIACODEC_BUFFER_FLAG_KEY_FRAME : 0;
+    // Why: NDK MediaCodec does not surface a key-frame input flag — the codec
+    // detects keyframes from the bitstream itself. We only need to flag end-of-
+    // stream (which we do not yet do).
+    (void)is_key;
+    uint32_t flags = 0;
     const uint64_t pts_us = pts_ns / 1000ULL;
     AMediaCodec_queueInputBuffer(codec_, idx, 0, size, pts_us, flags);
 

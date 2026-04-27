@@ -24,7 +24,7 @@ bool xr_check(XrResult r, const char* where) {
 
 bool OpenXrSession::create(android_app* app) {
     if (!init_loader(app)) return false;
-    if (!create_instance()) return false;
+    if (!create_instance(app)) return false;
     if (!create_system_and_session(app)) return false;
     if (!create_spaces()) return false;
     if (!create_action_set()) return false;
@@ -44,7 +44,7 @@ bool OpenXrSession::init_loader(android_app* app) {
     return xr_check(xrInitializeLoaderKHR((XrLoaderInitInfoBaseHeaderKHR*)&init), "xrInitializeLoaderKHR");
 }
 
-bool OpenXrSession::create_instance() {
+bool OpenXrSession::create_instance(android_app* app) {
     const char* exts[] = {
         XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
         XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
@@ -54,6 +54,8 @@ bool OpenXrSession::create_instance() {
     };
 
     XrInstanceCreateInfoAndroidKHR android_info{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
+    android_info.applicationVM = app->activity->vm;
+    android_info.applicationActivity = app->activity->clazz;
 
     XrInstanceCreateInfo info{XR_TYPE_INSTANCE_CREATE_INFO};
     info.next = &android_info;
@@ -63,7 +65,7 @@ bool OpenXrSession::create_instance() {
     info.applicationInfo.applicationVersion = 1;
     std::strcpy(info.applicationInfo.engineName, "FuVR");
     info.applicationInfo.engineVersion = 1;
-    info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+    info.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
 
     return xr_check(xrCreateInstance(&info, &instance_), "xrCreateInstance");
 }
@@ -77,6 +79,16 @@ bool OpenXrSession::create_system_and_session(android_app* /*app*/) {
     xrEnumerateViewConfigurationViews(instance_, system_id_, kViewConfig, 0, &view_count, nullptr);
     view_configs_.assign(view_count, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
     xrEnumerateViewConfigurationViews(instance_, system_id_, kViewConfig, view_count, &view_count, view_configs_.data());
+
+    // Why: OpenXR spec requires xrGet*GraphicsRequirementsKHR be called
+    // before xrCreateSession when the corresponding graphics extension is
+    // enabled. The Quest runtime enforces this strictly.
+    PFN_xrGetOpenGLESGraphicsRequirementsKHR pfnGetReqs = nullptr;
+    if (xrGetInstanceProcAddr(instance_, "xrGetOpenGLESGraphicsRequirementsKHR",
+                              reinterpret_cast<PFN_xrVoidFunction*>(&pfnGetReqs)) == XR_SUCCESS && pfnGetReqs) {
+        XrGraphicsRequirementsOpenGLESKHR reqs{XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR};
+        pfnGetReqs(instance_, system_id_, &reqs);
+    }
 
     // Compositor owns the EGL/GLES context; session creation needs the
     // graphics binding which Compositor populates after init().

@@ -17,7 +17,7 @@ find_package(OpenXR REQUIRED CONFIG)
 # widely-available `eclipse-capnproto:capnp-android` prefab exists, and
 # building from a pinned source tarball keeps the runtime version in tree.
 # ---------------------------------------------------------------------------
-set(CAPNP_VERSION "1.0.2")
+set(CAPNP_VERSION "1.3.0")
 set(CAPNP_PREFIX  "${CMAKE_BINARY_DIR}/capnp")
 set(CAPNP_INSTALL "${CAPNP_PREFIX}/install")
 
@@ -92,6 +92,7 @@ set_source_files_properties(
 
 target_include_directories(fuvr_quest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio/include
     ${PROTO_GEN_DIR}
     ${CAPNP_INCLUDE_DIR}
 )
@@ -130,4 +131,5 @@ target_link_options(fuvr_quest PRIVATE "-u" "ANativeActivity_onCreate")
 # top-level build must succeed whether or not the subdir exists yet.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/audio/CMakeLists.txt")
     add_subdirectory(audio)
+    target_link_libraries(fuvr_quest PRIVATE fuvr_quest_audio)
 endif()

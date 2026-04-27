@@ -4,6 +4,7 @@
 #define XR_USE_PLATFORM_ANDROID 1
 #define XR_USE_GRAPHICS_API_OPENGL_ES 1
 
+#include <jni.h>
 #include <EGL/egl.h>
 #include <GLES3/gl32.h>
 #include <openxr/openxr.h>
@@ -65,7 +66,7 @@ public:
 
 private:
     bool init_loader(android_app* app);
-    bool create_instance();
+    bool create_instance(android_app* app);
     bool create_system_and_session(android_app* app);
     bool create_spaces();
     bool create_action_set();
