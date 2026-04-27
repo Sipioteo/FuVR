@@ -4,8 +4,7 @@
   <br/>
 
   <h1>FuVR</h1>
-  <p><strong>Open-source PCVR streaming from Apple Silicon to Meta Quest.</strong><br/>
-  No SteamVR. No Quest Link. No reverse engineering.</p>
+  <p><strong>Perché Meta e Apple non si parlano, qualcuno doveva farlo.</strong></p>
 
   <p>
     <img src="https://img.shields.io/badge/platform-macOS%2014%2B-black?style=flat-square&logo=apple" alt="macOS 14+"/>
@@ -17,13 +16,15 @@
 
 ---
 
-FuVR lets an Apple Silicon Mac render VR content and stream it to a Meta Quest headset over USB-C or Wi-Fi, with head pose, controller input, and optional hand tracking flowing back in real time. The entire stack — OpenXR runtime, encoder, transport, and Quest client — is built from scratch for macOS, where neither SteamVR nor Quest Link exist.
+Vuoi fare VR su Mac con un Quest? Bene. Meta non supporta macOS. Apple non supporta i Quest. SteamVR su Mac è abbandonato dal 2020. Quest Link non esiste per macOS. Nessuno ha fatto niente.
 
-> **Current state:** Alpha. The full pipeline is working end-to-end — tested with Blender VR on Apple Silicon, streaming to Meta Quest over USB-C. See [`docs/STATUS.md`](docs/STATUS.md) for the detailed picture.
+FuVR fa niente di tutto questo — nel senso che fa quello che tutti gli altri si sono rifiutati di fare: prende un Apple Silicon, ci costruisce sopra un runtime OpenXR custom, codifica i frame con VideoToolbox, li spara sul Quest via USB-C o Wi-Fi, e tira indietro pose e input in tempo reale. Tutto da zero. Senza reverse engineering. Senza dipendere da SteamVR. Senza chiedere permesso.
+
+Funziona. Testato con Blender VR. Pull request benvenute.
 
 ---
 
-## How it works
+## Come funziona (la versione onesta)
 
 ```mermaid
 flowchart TB
@@ -62,26 +63,21 @@ flowchart TB
     style QUEST fill:#0d1117,stroke:#1e40af,color:#e2e8f0
 ```
 
+La parte difficile non è il codice — è che Apple e Meta non hanno mai avuto nessun incentivo a collaborare, quindi ogni pezzo di questo stack esiste nonostante loro, non grazie a loro.
+
 ---
 
 ## Quick start (Blender VR)
 
-The fastest way to test the full pipeline is with Blender's built-in VR Scene Inspection. Connect your Quest via USB-C, then:
+Collega il Quest via USB-C e:
 
 ```bash
 ./test_pipline_blender.sh
 ```
 
-The script handles everything in order:
+Fa tutto lui — ferma i processi vecchi, ricarica il daemon via launchd, rifa l'`adb reverse`, rilancia l'app sul Quest, apre Blender con il runtime FuVR e togola la VR Session Inspection da solo. Aspetta 18 secondi e ti dice com'è andata.
 
-1. Stops any previous Blender/daemon/Quest session
-2. Reloads `fuvrd` via launchd (registers the `com.fuvr.daemon.surface` Mach service)
-3. Re-establishes `adb reverse tcp:9943` to the connected Quest
-4. Restarts the FuVR Quest app with a fresh logcat
-5. Launches Blender with `XR_RUNTIME_JSON` pointing at the FuVR runtime and auto-toggles VR Scene Inspection on
-6. Prints a live status summary after ~18 s
-
-**Live log tails while running:**
+Se vuoi guardare cosa succede in tempo reale:
 
 ```bash
 tail -f /tmp/fuvrd.err.log                        # daemon
@@ -91,55 +87,57 @@ adb logcat -s fuvr.comp fuvr.proto fuvr.drift     # Quest
 
 ---
 
-## Repository layout
+## Cosa c'è dentro
 
-| Path | What it does | Language |
+| Path | Cosa fa | Linguaggio |
 |---|---|---|
-| `proto/` | Cap'n Proto wire schemas — the frozen source of truth | Cap'n Proto |
-| `runtime-macos/` | OpenXR 1.1 runtime, registered as `active_runtime.json` | C++20 |
-| `encoder-macos/` | VideoToolbox HEVC / H.264 low-latency encoder wrapper | C++ / Obj-C++ |
-| `transport/` | USB (ADB tunnel) + UDP + Reed-Solomon FEC transport | Rust |
-| `daemon/` | Host-side coordinator: encoder + transport bridge, pose router, metrics | C++ |
-| `quest-app/` | Android NDK client — receiver, MediaCodec decoder, OpenXR compositor | C++ NDK |
-| `mac-app/` | SwiftUI control surface — settings, status, log viewer | Swift |
-| `virtual-display-helper/` | `CGVirtualDisplay` subprocess for phase 2 extended-display mode | Obj-C++ |
-| `docs/` | Architecture, ADRs, status | Markdown |
+| `proto/` | Schemi Cap'n Proto — il contratto wire, non si tocca | Cap'n Proto |
+| `runtime-macos/` | Runtime OpenXR 1.1, si registra come `active_runtime.json` | C++20 |
+| `encoder-macos/` | Wrapper VideoToolbox HEVC/H.264 low-latency | C++ / Obj-C++ |
+| `transport/` | USB via ADB + UDP + Reed-Solomon FEC | Rust |
+| `daemon/` | Il collante: bridge encoder↔transport, pose router, metriche | C++ |
+| `quest-app/` | Client Android NDK — riceve, decodifica, compone | C++ NDK |
+| `mac-app/` | Pannello di controllo SwiftUI — settings, status, log | Swift |
+| `virtual-display-helper/` | Subprocess `CGVirtualDisplay` per la modalità display virtuale (fase 2) | Obj-C++ |
+| `docs/` | ADR, architettura, status | Markdown |
 
 ---
 
-## Prerequisites
+## Prerequisiti
 
-| Tool | Version |
+Niente di strano, ma serve tutto:
+
+| Tool | Versione |
 |---|---|
-| macOS | 14+ (Apple Silicon — M1 or newer) |
-| Xcode command line tools | 15+ |
+| macOS | 14+ su Apple Silicon (M1+) |
+| Xcode CLT | 15+ |
 | CMake | 3.27+ |
 | Cap'n Proto | `brew install capnp` |
-| Rust | stable (`rustup default stable`) |
-| Android NDK | r26+ with API 33+ (for Quest app) |
+| Rust | stable via `rustup` |
+| Android NDK | r26+ con API 33+ (solo per la quest-app) |
 
 ---
 
 ## Build
 
 ```bash
-# 1. Generate protocol bindings for all targets
+# Schema → binding per tutti i target
 ./scripts/gen-proto.sh
 
-# 2. macOS components (runtime, encoder, daemon)
+# Componenti macOS (runtime, encoder, daemon)
 cmake -S . -B build -G Ninja
 cmake --build build
-ctest --test-dir build          # 11/11 tests expected to pass
+ctest --test-dir build          # 11/11 dovrebbero passare
 
-# 3. Rust transport layer
+# Transport layer Rust
 cargo build --manifest-path transport/Cargo.toml
 cargo test --workspace
 
-# 4. SwiftUI control app
+# App SwiftUI
 swift build --package-path mac-app
 swift test --package-path mac-app
 
-# 5. Quest client (requires Android SDK + NDK)
+# Quest app (serve Android SDK + NDK)
 cd quest-app && ./gradlew assembleDebug
 ```
 
@@ -147,50 +145,50 @@ cd quest-app && ./gradlew assembleDebug
 
 ## Roadmap
 
-| Milestone | Description | State |
+| Milestone | Cosa | Stato |
 |---|---|---|
-| **M0 — Spike** | Validate the four critical unknowns: ADB throughput, VideoToolbox latency, Quest 90 Hz decode, `CGVirtualDisplay` on macOS 14/15 | Tools ready, hardware runs pending |
-| **M1 — First Frame** | Full pipeline: Mac renders → encodes → transmits → Quest decodes and displays | Not started |
-| **M2 — Interactive** | Round-trip pose loop at <20 ms, controller input, stable 90 Hz | Not started |
-| **M3 — Usable** | App packaging, auto-discovery, bitrate adaptation, hand tracking | Not started |
+| **M0 — Spike** | I quattro dubbi esistenziali: ADB throughput, latenza VideoToolbox, Quest 90 Hz, CGVirtualDisplay su macOS 14/15 | ✅ Validato |
+| **M1 — First Frame** | Pipeline completa: render → encode → trasmetti → Quest decodifica e mostra | ✅ Funziona |
+| **M2 — Interactive** | Pose loop <20 ms, input controller, 90 Hz stabili | 🔧 In corso |
+| **M3 — Usable** | Packaging, auto-discovery, bitrate adattivo, hand tracking | 📋 Pianificato |
 
-See [`SPEC.md`](SPEC.md) for the full architectural specification and milestone definitions.
+Dettagli tecnici in [`SPEC.md`](SPEC.md).
 
 ---
 
-## Architecture decisions
+## Decisioni architetturali
 
-Short ADR index — full documents in [`docs/adr/`](docs/adr/):
+Le cose che sembravano ovvie ma non lo erano — full write-up in [`docs/adr/`](docs/adr/):
 
-| # | Decision |
+| # | Decisione |
 |---|---|
-| 0002 | OpenXR runtime runs in-process; a separate daemon owns the encoder and transport |
-| 0003 | Cap'n Proto for the Mac↔Quest wire; JSON for the local control plane |
-| 0004 | `CGVirtualDisplay` runs in a dedicated subprocess to isolate TCC interactions |
-| 0005 | Reed-Solomon FEC (10, 4), no ARQ — latency budget is too tight for retransmit |
-| 0006 | USB transport uses `adb reverse` over the ADB TCP tunnel |
-| 0007 | IOSurface handoff uses a parallel Mach service, not `SCM_RIGHTS` (fd-only on macOS) |
+| 0002 | Il runtime OpenXR gira in-process; il daemon è separato e possiede encoder e transport |
+| 0003 | Cap'n Proto sul wire Mac↔Quest; JSON per il control plane locale |
+| 0004 | `CGVirtualDisplay` in un subprocess dedicato per isolare TCC e WindowServer |
+| 0005 | Reed-Solomon FEC (10, 4), niente ARQ — il budget di latenza non lascia spazio al retransmit |
+| 0006 | USB transport via `adb reverse` — tunnel ADB, non USB raw |
+| 0007 | Handoff IOSurface tramite Mach service parallelo, non `SCM_RIGHTS` (su macOS funziona solo per fd) |
 
 ---
 
-## Contributing
+## Contribuire
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request. The patent grant in the Apache 2.0 license is intentional and non-negotiable. By contributing you agree to the Apache ICLA.
+Leggi [`CONTRIBUTING.md`](CONTRIBUTING.md) prima di aprire una PR. Il patent grant nella licenza Apache 2.0 è intenzionale e non negoziabile. Contribuendo accetti la Apache ICLA.
 
-Issues, hardware test reports, and ADR proposals are all welcome — especially results from running the M0 spike tools on real Quest hardware.
+Hardware test report, risultati con headset diversi e proposte ADR sono più utili di qualsiasi altra cosa.
 
 ---
 
-## Development notes
+## Note di sviluppo
 
-> *Accurate representation of trying to make Apple and Meta work together.*
+> *Rappresentazione realistica di me che cerco di far collaborare Apple e Meta.*
 >
-> ![Making Apple and Meta cooperate](docs/dev-collab.gif)
+> ![Rappresentazione realistica](docs/dev-collab.gif)
 
-This project was designed and built by [Sipioteo](https://github.com/Sipioteo). [Claude Opus 4.7](https://anthropic.com) was used as a development companion — sounding board, code reviewer, and implementation aid — throughout the process. All architectural decisions, technical direction, and intellectual authorship are the author's own.
+Progetto progettato e costruito da [Sipioteo](https://github.com/Sipioteo). [Claude Opus 4.7](https://anthropic.com) ha fatto da companion durante lo sviluppo — sounding board, reviewer, aiuto implementativo. Tutte le decisioni architetturali, la direzione tecnica e la paternità intellettuale sono mie.
 
 ---
 
-## License
+## Licenza
 
-Apache License 2.0 — see [`LICENSE`](LICENSE).
+Apache 2.0 — vedi [`LICENSE`](LICENSE).
