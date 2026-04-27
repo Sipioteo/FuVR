@@ -75,6 +75,80 @@ maintaining IPD-correct projection through OpenXR's
 ./gradlew :app:hostTest
 ```
 
-Builds and runs `app/src/main/cpp/tests/test_fragment_reassembly` with the
-host C++ toolchain (NOT the NDK). It validates fragment reassembly logic
-without a Quest device.
+Builds and runs `app/src/main/cpp/tests/test_fragment_reassembly` and
+`test_clock_sync` with the host C++ toolchain (NOT the NDK). They validate
+fragment reassembly and the clock-sync pong responder without a Quest
+device.
+
+## Decoder pipeline (pass 3)
+
+The decoder is wired end-to-end from a wire-side `VideoFragmentHeader` to a
+GL-bound external texture the eye-blit shader samples:
+
+```
+MediaCodec input         decoder.push_encoded(au)
+        |                  queueInputBuffer(pts_us)
+        v
+MediaCodec  --(render=true)-->  ANativeWindow (AImageReader's surface)
+                                        |
+                                        v
+            AImageReader_setImageListener -> on_image_available
+                                        |
+                acquireLatestImage  ->  AImage_getHardwareBuffer (no ownership)
+                                        |
+                                        |   AHardwareBuffer_acquire   <-- our ref
+                                        v
+                drop-old single-slot queue (release previous if unread)
+                                        |
+                          decoder.pop_latest()  -- caller owns the ref
+                                        v
+            Compositor::submit_frame(frame)
+                eglGetNativeClientBufferANDROID
+                eglCreateImageKHR (EGL_NATIVE_BUFFER_ANDROID)
+                glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES)
+                eglDestroyImageKHR  -- texture binding keeps the buffer alive
+                AHardwareBuffer_release(frame.buffer) -- drop our ref
+            EyeBlit::blit(left|right) twice into per-eye XrSwapchain images
+```
+
+Lifecycle invariants:
+
+- The AImageReader callback owns one ref via `AHardwareBuffer_acquire` after
+  `AImage_getHardwareBuffer`; that ref is what `pop_latest` hands back.
+- The compositor **never** double-acquires; it takes the ref the decoder
+  produced, binds the texture, then releases that single ref.
+- Drop-old replacement in the decoder also calls `AHardwareBuffer_release`
+  on any previously-stored buffer the compositor never picked up; otherwise
+  every late frame leaks a gralloc buffer until the AImageReader stalls at
+  its `max-images = 4` limit.
+
+## Clock sync handshake
+
+The Mac initiates pings; the Quest is purely a responder
+(`ClockSyncResponder::build_pong`):
+
+```
+Mac                                  Quest
+ |  ControlMessage.clockSync.ping{ t0 }  |
+ |  ----------------------------------->  |  on_control: dispatch
+ |                                        |  t1 = steady_clock::now()  (receive)
+ |                                        |  t2 = steady_clock::now()  (just before send)
+ |  ControlMessage.clockSync.pong{ t0,t1,t2 }  |
+ |  <---------------------------------- |
+ |  t3 = mac::now()                       |
+ |  RTT  = (t3 - t0) - (t2 - t1)          |
+ |  skew = ((t1 - t0) + (t2 - t3)) / 2    |
+```
+
+`t1` and `t2` are both `std::chrono::steady_clock` nanoseconds on the Quest;
+they are not in the same epoch as the Mac's `t0` / `t3`, which is the whole
+point — the Mac derives skew from the cross-epoch differences.
+
+## Decoder metrics over the control channel
+
+Until the wire schema gets a Quest→Mac metrics arm, decoder fps and decode
+latency are piggy-backed on the existing `ControlMessage.error :Text` arm
+with the stable prefix `q-metrics: ` followed by `key=value, ...`. Emitted
+every ~100 ms by `ProtocolRouter::send_metrics_if_due()`. The matching
+parser on the Mac daemon side is a coordination item (see
+`quest-app/TODO.md`).

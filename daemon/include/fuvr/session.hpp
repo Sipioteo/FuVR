@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <memory>
 
+#include <functional>
+
 #include "fuvr/encoder.hpp"
 #include "fuvr/metrics.hpp"
 
@@ -14,6 +16,16 @@ struct fuvr_vdisplay_handle;
 struct FuvrTransport;
 
 namespace fuvr::daemon {
+
+// Per-frame encoder summary, fired once on the encoder's last fragment.
+struct EncodeStatsEvent {
+    uint64_t frameId;
+    uint64_t encodeDurationNs;
+    uint32_t encodedSizeBytes;
+    bool     wasKeyframe;
+};
+
+using EncodeStatsSink = std::function<void(const EncodeStatsEvent&)>;
 
 struct SessionConfig {
     uint32_t perEyeWidth = 0;
@@ -27,7 +39,8 @@ struct SessionConfig {
 
 class Session {
 public:
-    Session(uint64_t id, const SessionConfig& cfg, FuvrTransport* transport);
+    Session(uint64_t id, const SessionConfig& cfg, FuvrTransport* transport,
+            EncodeStatsSink statsSink = {});
     ~Session();
 
     Session(const Session&) = delete;
@@ -46,6 +59,11 @@ public:
                      const float renderedLeft[7],
                      const float renderedRight[7]);
 
+    // Test hook: feed synthetic encoded fragments straight into the FrameSink
+    // path so tests can exercise EncodeStats fan-out and Metrics aggregation
+    // without spinning up VideoToolbox.
+    void testInjectFragment(const fuvr::EncodedFragment& f);
+
 private:
     class FragmentSink;
 
@@ -58,6 +76,13 @@ private:
     uint32_t virtualDisplayId_ = 0;
     MetricsAggregator metrics_;
     std::atomic<uint64_t> lastEncodeStartNs_{0};
+    EncodeStatsSink statsSink_;
+
+    // Per-frame accumulators (last fragment fires EncodeStatsEvent).
+    uint64_t curFrameId_       = 0;
+    uint32_t curFrameBytes_    = 0;
+    bool     curFrameKeyframe_ = false;
+    bool     curFrameActive_   = false;
 };
 
 } // namespace fuvr::daemon

@@ -16,6 +16,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "fuvr/runtime.hpp"
 #include "fuvrd.capnp.h"
 
 namespace fuvr::runtime {
@@ -117,6 +118,17 @@ void DaemonClient::setPoseCallback(PoseCallback cb) noexcept {
   poseCb_ = std::move(cb);
 }
 
+void DaemonClient::setEncodeStatsCallback(EncodeStatsCallback cb) noexcept {
+  std::lock_guard<std::mutex> lk(cbMutex_);
+  statsCb_ = std::move(cb);
+}
+
+void DaemonClient::setDisconnectCallback(DisconnectCallback cb) noexcept {
+  std::lock_guard<std::mutex> lk(cbMutex_);
+  disconnectCb_ = std::move(cb);
+  disconnectFired_ = false;
+}
+
 bool DaemonClient::connectLocked() noexcept {
   int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) return false;
@@ -169,6 +181,17 @@ void DaemonClient::readerLoop() noexcept {
       if (n < 0 && errno == EINTR) continue;
       ::close(fd);
       fd_.store(-1);
+      if (!stop_.load()) {
+        DisconnectCallback dc;
+        {
+          std::lock_guard<std::mutex> lk(cbMutex_);
+          if (!disconnectFired_) {
+            dc = disconnectCb_;
+            disconnectFired_ = true;
+          }
+        }
+        if (dc) dc();
+      }
       continue;
     }
     buf.insert(buf.end(), tmp, tmp + n);
@@ -210,7 +233,24 @@ void DaemonClient::readerLoop() noexcept {
           if (cb) cb(s);
           break;
         }
-        case fuvr::daemon::Envelope::Body::ENCODE_STATS:
+        case fuvr::daemon::Envelope::Body::ENCODE_STATS: {
+          auto stats = body.getEncodeStats();
+          EncodeStatSample sample{};
+          sample.frameId = stats.getFrameId();
+          sample.encodeDurationNs = stats.getEncodeDurationNs();
+          sample.encodedSizeBytes = stats.getEncodedSizeBytes();
+          sample.wasKeyframe = stats.getWasKeyframe();
+          sample.arrivalNs =
+              static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch()).count());
+          EncodeStatsCallback cb;
+          {
+            std::lock_guard<std::mutex> lk(cbMutex_);
+            cb = statsCb_;
+          }
+          if (cb) cb(sample);
+          break;
+        }
         case fuvr::daemon::Envelope::Body::METRICS:
         case fuvr::daemon::Envelope::Body::LOG:
         case fuvr::daemon::Envelope::Body::PONG:
@@ -281,7 +321,7 @@ bool DaemonClient::submitFrame(uint64_t sessionId,
   req.setSessionId(sessionId);
   req.setFrameId(args.frameId);
   req.setRenderStartNs(args.renderStartNs);
-  req.setSurfaceToken(args.machSendRight);
+  req.setSurfaceToken(static_cast<uint32_t>(args.surfaceToken));
   req.setForceIdr(args.forceIdr);
   req.setRenderedLeftPosX(args.leftEye.position.x);
   req.setRenderedLeftPosY(args.leftEye.position.y);
@@ -297,8 +337,7 @@ bool DaemonClient::submitFrame(uint64_t sessionId,
   req.setRenderedRightRotY(args.rightEye.orientation.y);
   req.setRenderedRightRotZ(args.rightEye.orientation.z);
   req.setRenderedRightRotW(args.rightEye.orientation.w);
-  return sendEnvelope(fd_.load(), mb, static_cast<int>(args.machSendRight),
-                      sendMutex_);
+  return sendEnvelope(fd_.load(), mb, 0, sendMutex_);
 }
 
 void DaemonClient::shutdown() noexcept {

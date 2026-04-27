@@ -10,9 +10,14 @@
 #include <string>
 #include <thread>
 
+#include "fuvr/iosurface_xpc_client.hpp"
 #include "fuvr/pose_predictor.hpp"
 
+typedef struct __IOSurface* IOSurfaceRef;
+
 namespace fuvr::runtime {
+
+struct EncodeStatSample;
 
 struct StartSessionParams {
   uint32_t perEyeWidth{0};
@@ -32,7 +37,9 @@ struct StartSessionResult {
 struct SubmitFrameArgs {
   uint64_t frameId{0};
   uint64_t renderStartNs{0};
-  uint32_t machSendRight{0};  // mach_port_t for IOSurface send-right (consumed)
+  // Correlation token paired with the IOSurface that arrived (or will arrive)
+  // on the XPC mach service `com.fuvr.daemon.surface`. See ADR-0007.
+  uint64_t surfaceToken{0};
   bool forceIdr{false};
   Pose leftEye{};
   Pose rightEye{};
@@ -44,6 +51,8 @@ std::string resolveDaemonSocketPath();
 class DaemonClient {
  public:
   using PoseCallback = std::function<void(const PoseSample&)>;
+  using EncodeStatsCallback = std::function<void(const EncodeStatSample&)>;
+  using DisconnectCallback = std::function<void()>;
 
   DaemonClient();
   ~DaemonClient();
@@ -56,6 +65,8 @@ class DaemonClient {
 
   // Register a callback for incoming PoseSnapshot envelopes. Replaces any prior.
   void setPoseCallback(PoseCallback cb) noexcept;
+  void setEncodeStatsCallback(EncodeStatsCallback cb) noexcept;
+  void setDisconnectCallback(DisconnectCallback cb) noexcept;
 
   // Lazily connect (idempotent). Returns true if connected (or already was).
   bool ensureConnected() noexcept;
@@ -68,11 +79,14 @@ class DaemonClient {
   // Subscribe to the pose stream. Idempotent.
   bool subscribePoses(uint64_t sessionId) noexcept;
 
-  // Fire-and-forget frame submission. Sends mach send-right via SCM_RIGHTS.
-  // Does NOT close machSendRight on the caller's behalf; the underlying
-  // sendmsg + the kernel handle the right transfer. Caller may release the
-  // local mach port allocation after this call returns.
+  // Fire-and-forget frame submission. The IOSurface itself is shipped over
+  // the parallel XPC mach service ahead of this call; this carries only the
+  // correlation token and pose metadata. See ADR-0007.
   bool submitFrame(uint64_t sessionId, const SubmitFrameArgs& args) noexcept;
+
+  // Optionally hand the XPC client to the frame sink for IOSurface delivery.
+  void setXpcClient(IOSurfaceXpcClient* client) noexcept { xpc_ = client; }
+  IOSurfaceXpcClient* xpcClient() const noexcept { return xpc_; }
 
   // Disconnect and stop the reader thread.
   void shutdown() noexcept;
@@ -100,8 +114,12 @@ class DaemonClient {
 
   std::mutex cbMutex_;
   PoseCallback poseCb_;
+  EncodeStatsCallback statsCb_;
+  DisconnectCallback disconnectCb_;
+  bool disconnectFired_{false};
 
   uint32_t backoffMs_{20};
+  IOSurfaceXpcClient* xpc_{nullptr};
 };
 
 }  // namespace fuvr::runtime

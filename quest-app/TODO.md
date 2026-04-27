@@ -36,16 +36,32 @@ Tracks the work still pending after the M0 skeleton lands.
 
 ## Decoder
 
-- [ ] Output to `AImageReader` configured with
-      `AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE`, then back the MediaCodec
-      surface with the AImageReader's window. This is what gives us
-      AHardwareBuffer-backed AImages for zero-copy.
+- [x] Pass 3: Output to `AImageReader` configured with
+      `AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+      AHARDWAREBUFFER_USAGE_VIDEO_DECODE_OUTPUT_BUFFER`,
+      `AIMAGE_FORMAT_PRIVATE`, max-images=4. MediaCodec is configured with
+      the reader's `ANativeWindow`; the on-image listener acquires the
+      latest AImage, extracts the AHardwareBuffer (`AHardwareBuffer_acquire`
+      to own a ref independent of the AImage), stores it in a single-slot
+      drop-old queue, and releases the previously-buffered ref. The
+      compositor consumes via `pop_latest`, binds an EGLImage as
+      `samplerExternalOES`, immediately destroys the EGLImage (the GL
+      texture keeps the buffer alive), and releases its ref.
 - [ ] Feed CSD (VPS/SPS/PPS) from the control channel before queueing
       regular fragments; set `BUFFER_FLAG_CODEC_CONFIG` accordingly.
-- [ ] Reassemble fragments per `VideoFragmentHeader.fragmentIndex` into
-      a single access unit before queueing into MediaCodec.
+- [x] Pass 2: Reassemble fragments per `VideoFragmentHeader.fragmentIndex`
+      into a single access unit before queueing into MediaCodec
+      (`FragmentReassembler`).
 - [ ] Drop policy: when the queue grows past N pending AUs, drop until
       the next IDR (request one via control channel if missing).
+- [ ] Restart MediaCodec when SessionConfig dimensions disagree with
+      the AImageReader's. Pass 3 stores the negotiated size as a hint via
+      `DecoderPipeline::set_output_size` but does not yet hot-restart.
+- [ ] Device-side smoke: actually exercise the AImageReader callback +
+      EGLImage path on a Quest. AImageReader, AHardwareBuffer, EGL
+      ANDROID-extension behavior cannot be unit-tested on the host (the
+      symbols aren't available in the desktop NDK headers). Track in a
+      device-only integration test once we have an instrumented run.
 
 ## Transport
 
@@ -77,6 +93,47 @@ Tracks the work still pending after the M0 skeleton lands.
       survives a quick controller put-down without tearing down EGL.
 - [ ] Wire `XR_FB_display_refresh_rate` to negotiate 72/90/120 Hz with
       the Mac via the `control` channel.
+
+## Pass 3 (decoder→compositor zero-copy + clock sync responder + metrics) — landed
+
+Implemented in this pass:
+
+- `DecoderPipeline` now owns an `AImageReader` (format
+  `AIMAGE_FORMAT_PRIVATE`, usage `GPU_SAMPLED_IMAGE |
+  VIDEO_DECODE_OUTPUT_BUFFER`, max images = 4) and configures MediaCodec
+  with the reader's `ANativeWindow`. Decoded frames arrive via the
+  image-available listener, are unwrapped to `AHardwareBuffer*` with an
+  explicit `AHardwareBuffer_acquire` (since `AImage_getHardwareBuffer`
+  does not transfer ownership), and parked in a single-slot drop-old
+  queue. `pop_latest()` hands the caller the live ref.
+- `Compositor::submit_frame` now consumes that ref: builds the EGLImage
+  via `eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID, ...)`, binds the
+  external texture with `glEGLImageTargetTexture2DOES`, destroys the
+  EGLImage immediately (the texture keeps the buffer alive), and then
+  releases the AHardwareBuffer ref the decoder produced. No double-
+  acquire, no buffer leak across frames.
+- `ClockSyncResponder` (`clock_sync.{hpp,cpp}`) responds to ping arms with
+  `Pong{ t0, t1=now_ns, t2=now_ns }`, where `t1` is the receive instant
+  and `t2` is sampled immediately before the wire send. `t2 >= t1` is
+  asserted; the cross-epoch difference is the whole point of the protocol.
+- Decoder metrics (rolling 256-frame window): `fps` from inter-arrival
+  intervals at the AImageReader callback, `decode_p95_ms` from the
+  per-PTS map between `queueInputBuffer` and the AImageReader callback.
+  `ProtocolRouter::send_metrics_if_due` emits every 100 ms via the
+  `ControlMessage.error :Text` arm with prefix `q-metrics: ` (see below).
+- Host tests: `tests/test_clock_sync.cpp` covers `build_pong`,
+  `build_pong_now`, the `t2 >= t1` clamp, and `now_ns()` monotonicity.
+
+## Cross-team coordination items
+
+- The metrics-over-`error`-arm workaround needs a matching parser in the
+  Mac-side daemon: when a `ControlMessage.error` text starts with
+  `q-metrics: ` it should be lifted to the diagnostics view rather than
+  shown as an error toast. Coordination item with the daemon agent;
+  scope: not in `quest-app/`.
+- A proper Quest→Mac metrics arm in `proto/fuvr.capnp` would replace
+  this hack. That is a wire-schema bump (major version) and is
+  deliberately out of scope for v1.
 
 ## Pass 2 (Cap'n Proto + per-eye swapchains + side-by-side blit) — landed
 

@@ -4,13 +4,14 @@
 #include <android/hardware_buffer.h>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
-#include <thread>
-#include <vector>
 
 struct AMediaCodec;
 struct AMediaFormat;
+struct AImageReader;
+struct ANativeWindow;
 
 namespace fuvr {
 
@@ -18,6 +19,12 @@ struct DecodedFrame {
     AHardwareBuffer* buffer{nullptr};
     uint64_t frame_id{0};
     uint64_t presentation_time_ns{0};
+};
+
+struct DecoderMetrics {
+    float fps{0.0f};
+    float decode_ms_p95{0.0f};
+    uint64_t frames_delivered{0};
 };
 
 class DecoderPipeline {
@@ -29,22 +36,43 @@ public:
     bool start(Codec codec);
     void stop();
 
+    // Renegotiate output dimensions before start() once SessionConfig arrives.
+    void set_output_size(int32_t width, int32_t height);
+
     // Push a NAL/access-unit fragment received from transport.
     void push_encoded(const uint8_t* data, size_t size, uint64_t pts_ns, bool is_key);
 
-    // Drop-old policy: return the freshest decoded frame, or empty if none.
+    // Drop-old policy: take the freshest decoded AHardwareBuffer.
+    // The returned `buffer` carries one ref the caller must release with
+    // AHardwareBuffer_release after binding into GL.
     DecodedFrame pop_latest();
 
+    DecoderMetrics snapshot_metrics();
+
 private:
-    void output_loop();
+    static void on_image_available_thunk(void* ctx, AImageReader* reader);
+    void on_image_available(AImageReader* reader);
 
     AMediaCodec* codec_{nullptr};
     AMediaFormat* format_{nullptr};
-    std::thread output_thread_;
+    AImageReader* reader_{nullptr};
+    ANativeWindow* surface_{nullptr};
     std::atomic<bool> running_{false};
+
+    int32_t width_{4128};
+    int32_t height_{2208};
 
     std::mutex frame_mutex_;
     DecodedFrame latest_{};
+
+    std::mutex pts_mutex_;
+    std::deque<std::pair<uint64_t, uint64_t>> queued_;
+
+    std::mutex metrics_mutex_;
+    std::deque<uint64_t> arrival_intervals_ns_;
+    std::deque<uint64_t> decode_latency_ns_;
+    uint64_t last_arrival_ns_{0};
+    uint64_t total_frames_{0};
 };
 
 }

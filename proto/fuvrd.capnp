@@ -10,11 +10,11 @@
 #
 # IOSurface handoff CANNOT ride this socket: macOS's SCM_RIGHTS only carries
 # file descriptors, not mach send-rights, and IOSurfaces are mach-port-shaped.
-# The runtime instead transfers the IOSurface via a parallel mach side
-# channel — see ADR-0007. The `surfaceToken` field in `SubmitFrameRequest`
-# below is a correlation id chosen by the runtime; the same id is set as the
-# mach message header's `msgh_id` so the daemon can match the frame submission
-# to its inbound mach message.
+# The runtime transfers the IOSurface over a parallel XPC mach service named
+# `com.fuvr.daemon.surface` — see ADR-0007. The `surfaceToken` field in
+# `SubmitFrameRequest` below is a correlation id chosen by the runtime; the
+# same id is set as the `"token"` key on the matching XPC dictionary so the
+# daemon can pair frame submission with its inbound IOSurface send-right.
 
 @0xc8a4f30f6df21a7b;
 
@@ -61,9 +61,9 @@ struct StopSessionRequest {
 # The runtime renders into an IOSurface that it owns. To hand it to the
 # daemon-side encoder, the runtime:
 #   1. Mints a mach send-right for the IOSurface via IOSurfaceCreateMachPort,
-#   2. Sends a single mach_msg to the daemon's bootstrap-registered service
-#      `com.fuvr.daemon.surface`, with `msgh_id` = `surfaceToken` and the
-#      send-right inline as a port descriptor (MACH_MSG_TYPE_MOVE_SEND),
+#   2. Sends an xpc_dictionary to the daemon's XPC mach service
+#      `com.fuvr.daemon.surface`, with `"token"` = surfaceToken and
+#      `"surface"` = mach send-right (xpc_dictionary_set_mach_send),
 #   3. Sends a SubmitFrameRequest envelope on the UDS RPC socket carrying the
 #      same `surfaceToken`.
 # The daemon receives the mach send-right on its registered service, looks up

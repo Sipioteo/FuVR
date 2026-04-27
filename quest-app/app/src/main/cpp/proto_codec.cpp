@@ -169,6 +169,17 @@ std::vector<uint8_t> encode_clock_sync_pong(uint64_t t0, uint64_t t1, uint64_t t
     }
 }
 
+std::vector<uint8_t> encode_error_message(const std::string& text) {
+    try {
+        capnp::MallocMessageBuilder msg;
+        auto root = msg.initRoot<fuvr::proto::ControlMessage>();
+        root.setError(text);
+        return serialize_packed(msg);
+    } catch (...) {
+        return {};
+    }
+}
+
 std::optional<size_t> decode_video_header(const uint8_t* data, size_t size,
                                           PlainVideoHeader& out) {
     try {

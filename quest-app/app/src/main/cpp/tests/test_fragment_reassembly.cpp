@@ -96,16 +96,18 @@ void test_interleaved_frames() {
     auto p11 = make_payload(0x02, 2);
     auto p20 = make_payload(0x03, 2);
     auto p21 = make_payload(0x04, 2);
+    // Why: frame ids stay within kMaxInflight (=8) of each other so the
+    // memory-bound eviction does not drop frame 10 when frame 11 arrives.
     r.submit(10, 0, 2, 0, 0, 0, p10.data(), p10.size());
-    r.submit(20, 1, 2, 0, 0, 0, p21.data(), p21.size());
+    r.submit(11, 1, 2, 0, 0, 0, p21.data(), p21.size());
     r.submit(10, 1, 2, 0, 0, 0, p11.data(), p11.size());
     CHECK(r.has_completed());
     auto au10 = r.take_completed();
     CHECK(au10.frameId == 10);
-    r.submit(20, 0, 2, 0, 0, 0, p20.data(), p20.size());
+    r.submit(11, 0, 2, 0, 0, 0, p20.data(), p20.size());
     CHECK(r.has_completed());
     auto au20 = r.take_completed();
-    CHECK(au20.frameId == 20);
+    CHECK(au20.frameId == 11);
 }
 
 void test_stale_partial_eviction() {

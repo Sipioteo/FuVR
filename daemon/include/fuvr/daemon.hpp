@@ -8,6 +8,8 @@
 #include <thread>
 #include <unordered_map>
 
+#include "fuvr/clock_sync.hpp"
+#include "fuvr/iosurface_xpc_service.hpp"
 #include "fuvr/metrics.hpp"
 #include "fuvr/pose_router.hpp"
 #include "fuvr/rpc_server.hpp"
@@ -37,10 +39,14 @@ public:
     // Test-only access.
     PoseRouter& poseRouter() { return poseRouter_; }
     MetricsAggregator& globalMetrics() { return globalMetrics_; }
+    ClockSync& clockSync() { return clockSync_; }
 
 private:
     void onEnvelope(const InboundRpc& rpc);
     void metricsLoop();
+    void clockSyncLoop();
+    void dispatchEncodeStats(const EncodeStatsEvent& ev);
+    void handleControlMessage(const uint8_t* data, std::size_t len);
     static void onTransportRecv(void* user, uint8_t channel,
                                 const uint8_t* data, std::size_t len);
 
@@ -57,8 +63,11 @@ private:
     std::vector<MetricsSubscriber> metricsSubs_;
 
     FuvrTransport* transport_ = nullptr;
+    std::unique_ptr<IOSurfaceXpcService> xpcService_;
     std::atomic<bool> running_{false};
     std::thread metricsThread_;
+    std::thread clockSyncThread_;
+    ClockSync   clockSync_;
 };
 
 } // namespace fuvr::daemon

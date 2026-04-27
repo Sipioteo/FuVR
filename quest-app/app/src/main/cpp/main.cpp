@@ -78,6 +78,7 @@ extern "C" void android_main(android_app* app) {
         auto buf = decoder.pop_latest();
         compositor.submit_frame(buf);
         session.end_frame(compositor);
+        router.send_metrics_if_due();
     }
 
     pose_forwarder.stop();

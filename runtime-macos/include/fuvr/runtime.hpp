@@ -4,19 +4,52 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_loader_negotiation.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <vector>
 
+#include "fuvr/event_queue.hpp"
 #include "fuvr/frame_sink.hpp"
 #include "fuvr/iosurface_swapchain.hpp"
+#include "fuvr/iosurface_xpc_client.hpp"
 #include "fuvr/pose_predictor.hpp"
+#include "fuvr/spaces.hpp"
 
 namespace fuvr::runtime {
 
 class DaemonClient;
+
+struct EncodeStatSample {
+  uint64_t frameId{0};
+  uint64_t encodeDurationNs{0};
+  uint32_t encodedSizeBytes{0};
+  uint64_t arrivalNs{0};
+  bool wasKeyframe{false};
+};
+
+struct EncoderStatsSnapshot {
+  uint32_t sampleCount{0};
+  double meanEncodeMs{0.0};
+  double p95EncodeMs{0.0};
+  double fps{0.0};
+  double bitrateMbps{0.0};
+};
+
+class EncoderStats {
+ public:
+  static constexpr std::size_t kWindow = 256;
+  void push(const EncodeStatSample& s) noexcept;
+  EncoderStatsSnapshot snapshot() const noexcept;
+
+ private:
+  mutable std::mutex mu_;
+  std::array<EncodeStatSample, kWindow> ring_{};
+  std::size_t head_{0};
+  std::size_t count_{0};
+};
 
 constexpr const char* kRuntimeName = "FuVR";
 constexpr uint32_t kRuntimeVersion = XR_MAKE_VERSION(0, 1, 0);
@@ -61,15 +94,26 @@ struct Session {
   std::unique_ptr<FrameSink> frameSink;
   PosePredictor predictor;
   std::shared_ptr<DaemonClient> daemon;
+  std::unique_ptr<IOSurfaceXpcClient> xpcClient;
   uint64_t daemonSessionId{0};
   void* metalDevice{nullptr};  // id<MTLDevice>, retained
+  std::vector<std::unique_ptr<Space>> spaces;
+  Pose localOriginPose{};
+  EncoderStats encoderStats{};
+  bool beginSessionSent{false};
+  bool interactionProfileEmitted{false};
   std::mutex mutex;
+
+  EncoderStatsSnapshot encoderStatsSnapshot() const noexcept {
+    return encoderStats.snapshot();
+  }
 };
 
 struct Instance {
   XrInstance handle{XR_NULL_HANDLE};
   std::vector<std::unique_ptr<Session>> sessions;
   std::vector<std::unique_ptr<ActionSet>> actionSets;
+  EventQueue events;
   std::mutex mutex;
 };
 

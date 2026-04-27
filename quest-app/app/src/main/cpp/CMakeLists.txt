@@ -73,6 +73,7 @@ add_library(fuvr_quest SHARED
     fragment_reassembler.cpp
     protocol_router.cpp
     proto_codec.cpp
+    clock_sync.cpp
     ${PROTO_GEN_SOURCES}
 )
 

@@ -52,6 +52,7 @@ public:
 private:
     bool create_egl_context();
     bool create_swapchains();
+    bool render_eye(int eye_index);
     GLuint upload_hardware_buffer(AHardwareBuffer* buf);
 
     OpenXrSession& xr_;
@@ -64,8 +65,6 @@ private:
     std::array<EyeSwapchain, 2> eyes_{};
     XrSwapchain placeholder_swapchain_{XR_NULL_HANDLE};
 
-    AHardwareBuffer* current_buffer_{nullptr};
-    EGLImageKHR current_image_{EGL_NO_IMAGE_KHR};
     GLuint current_texture_{0};
     bool has_frame_{false};
 

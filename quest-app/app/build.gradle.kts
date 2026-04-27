@@ -130,8 +130,18 @@ val buildHostTests = tasks.register<Exec>("buildHostTests") {
     commandLine = listOf("cmake", "--build", hostTestBuildDir.get().asFile.absolutePath)
 }
 
-tasks.register<Exec>("hostTest") {
+val hostTestFragment = tasks.register<Exec>("hostTestFragment") {
     dependsOn(buildHostTests)
     workingDir = hostTestBuildDir.get().asFile
     commandLine = listOf("./test_fragment_reassembly")
+}
+
+val hostTestClockSync = tasks.register<Exec>("hostTestClockSync") {
+    dependsOn(buildHostTests)
+    workingDir = hostTestBuildDir.get().asFile
+    commandLine = listOf("./test_clock_sync")
+}
+
+tasks.register("hostTest") {
+    dependsOn(hostTestFragment, hostTestClockSync)
 }

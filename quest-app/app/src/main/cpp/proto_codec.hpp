@@ -141,6 +141,11 @@ std::vector<uint8_t> encode_hello_from_quest(const PlainDeviceCapabilities& caps
 // Outbound: pong reply built from a received ping.
 std::vector<uint8_t> encode_clock_sync_pong(uint64_t t0, uint64_t t1, uint64_t t2);
 
+// Outbound: ControlMessage carrying the `error :Text` arm. We piggy-back
+// telemetry on this arm pending a wire-schema bump that adds a Quest->Mac
+// metrics arm; see quest-app/TODO.md.
+std::vector<uint8_t> encode_error_message(const std::string& text);
+
 // Inbound: parse a packed VideoFragmentHeader from the front of the payload,
 // return how many bytes the header occupied (codec payload follows immediately).
 // Returns std::nullopt on parse failure.

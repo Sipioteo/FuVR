@@ -61,6 +61,39 @@ The transport layer (Quest -> Mac) feeds `PosePredictor::push` with
 `displayTime`, the predictor extrapolates linearly using a 4-sample window
 plus orientation extrapolation via SLERP derivative.
 
+### Event queue lifecycle
+
+Each `Instance` owns a thread-safe MPSC `EventQueue` (capacity 64). The
+daemon-client reader thread is the producer (session-state and
+loss-pending events on connect/disconnect); the application's main thread
+is the consumer via `xrPollEvent`. On overflow the oldest entries are
+dropped and the next `pop` returns an `XR_TYPE_EVENT_DATA_EVENTS_LOST`
+event. Connect emits `IDLE -> READY`; `xrBeginSession` emits
+`SYNCHRONIZED -> VISIBLE -> FOCUSED` plus a one-shot
+`INTERACTION_PROFILE_CHANGED`; `xrEndSession` emits `STOPPING -> IDLE`;
+daemon disconnect emits `LOSS_PENDING`.
+
+### Reference spaces
+
+`xrCreateReferenceSpace` accepts `VIEW`, `LOCAL`, and `STAGE`; anything
+else returns `XR_ERROR_REFERENCE_SPACE_UNSUPPORTED`. `xrLocateSpace` for a
+`VIEW` space relative to `LOCAL`/`STAGE` queries the same `PosePredictor`
+used by `xrLocateViews` and returns position+orientation valid+tracked
+flags. `STAGE` is identity for now (real Stage tracking deferred).
+`xrCreateActionSpace` succeeds and `xrLocateSpace` against it returns
+`XR_SUCCESS` with cleared validity bits — controller pose forwarding from
+the daemon is a pass 4 item (`PoseSnapshot` only carries HMD pose today).
+
+### Encoder stats path
+
+The daemon emits `EncodeStats` envelopes per frame after VideoToolbox
+finishes. The reader thread inside `DaemonClient` decodes them and pushes
+into a per-`Session` rolling 256-frame `EncoderStats` window
+(encodeDurationNs, encodedSizeBytes, arrival time). `Session::encoderStats
+Snapshot()` returns mean/p95 encode ms, fps from inter-arrival, and
+bitrate. The `fuvr-runtime-metrics` CLI is a back-door consumer linked
+against the runtime sources via `fuvr/internal/diag.hpp`.
+
 ### Extensions
 
 - `XR_KHR_vulkan_enable2` (reserved): the cross-platform path via MoltenVK.
@@ -105,19 +138,29 @@ streaming, `fuvrd` must be running.
 
 ### Frame submission protocol
 
-`xrEndFrame` looks up the IOSurface backing the most recently released
-swapchain image and hands it to `DaemonFrameSink::submit`, which:
+Per ADR-0007 the IOSurface handoff goes over a parallel XPC mach service
+(`com.fuvr.daemon.surface`), not the UDS Cap'n Proto socket — SCM_RIGHTS on
+macOS is fd-only and cannot carry mach send-rights. `DaemonFrameSink::submit`
+(see `src/frame_sink.cpp`) does:
 
-1. Calls `IOSurfaceCreateMachPort` to get a mach send-right.
-2. Sends a `SubmitFrameRequest` envelope carrying the mach port name in
-   `surfaceToken` plus the per-eye rendered pose.
-3. Releases its local copy of the mach port (the daemon receives its own
-   reference via the IOSurface registry).
+1. Mints a per-frame correlation `token`.
+2. `IOSurfaceXpcClient::sendSurface(token, surface)` — calls
+   `IOSurfaceCreateMachPort`, packs it into an `xpc_dictionary` with
+   `xpc_dictionary_set_mach_send`, sends to the daemon, and immediately
+   `mach_port_deallocate`s the local right (XPC has internalised it).
+3. `DaemonClient::submitFrame` — sends the `SubmitFrameRequest` envelope on
+   the UDS with the same `surfaceToken` plus pose metadata.
 
-Note: although the proto comment mentions SCM_RIGHTS, macOS only supports
-file descriptors (not mach ports) over SCM_RIGHTS. The current implementation
-sends the mach port name in-band; cross-task transfer for a real out-of-process
-daemon will require a `mach_msg` side channel — see `TODO.md`.
+The daemon's grace window (16 ms) handles either ordering; the XPC-first
+order above is just an optimisation.
+
+### Test bypass: `FUVR_INPROCESS_HANDOFF`
+
+Setting `FUVR_INPROCESS_HANDOFF=1` makes the runtime skip the XPC connection
+and instead `put` IOSurfaces into a process-local registry
+(`fuvr/inprocess_surface_registry.hpp`). The daemon's bridge takes from the
+same registry. Used by the unit tests, which run runtime+daemon in one
+process where launchd cannot register a mach service for us.
 
 ### XR_FUVR_metal_enable
 

@@ -10,20 +10,28 @@
 - `json_bridge.cpp` is a placeholder. The mac-app currently speaks JSON over
   `~/Library/Caches/fuvr/control.sock`; we still need to mirror its verbs
   (start/stop/status) into Cap'n Proto envelopes.
-- Clock-sync handshake: `StartSessionResponse.clockOffsetNs` and
-  `oneWayDelayNs` are returned as zero. Real values come from the
-  `ControlMessage.clockSync` exchange driven by the Quest, which the
-  daemon does not yet route.
+- ~~Clock-sync handshake~~: implemented in `src/clock_sync.cpp`. The daemon
+  pings the Quest at 1 Hz on the `Control` channel, demuxes incoming pongs,
+  and populates `StartSessionResponse.clockOffsetNs` / `oneWayDelayNs` from
+  the latest median sample. Note: with `FUVR_DAEMON_NO_TRANSPORT=1` the
+  send-callback is a no-op and the snapshot stays at zero — real values
+  appear once `libfuvr_transport.dylib` is linked.
 - Transport RTT/loss in `Metrics` is zero — the FFI does not expose stats
   hooks yet (coordinator: extend `fuvr_transport.h` with `fuvr_transport_stats`).
-- `Encoder fragment` -> `EncodeStats` reply: we record metrics internally
-  but do not push `EncodeStats` envelopes back to the runtime per frame.
-  Add when the runtime actually consumes them.
+- ~~`Encoder fragment` -> `EncodeStats` reply~~: implemented. Per-frame
+  `EncodeStats` envelopes are now pushed to every `streamMetrics` subscriber
+  (piggy-backed because `Envelope.body` cannot grow a new union arm without
+  a schema id bump). See README "EncodeStats forwarding".
 - `streamLogs` is not handled.
+
+## Future schema work
+- Add a dedicated `streamEncodeStats` subscription verb (and a matching
+  body arm if a clean way exists). This requires a minor schema bump on
+  `proto/fuvrd.capnp`; the schema id stays stable so the existing
+  `streamMetrics` piggy-back remains a graceful fallback for older clients.
 
 ## Hooks needed in other components (do not edit from this subdir)
 - Transport FFI: add a stats accessor.
-- runtime-macos: open the rpc socket, send `submitFrame` with SCM_RIGHTS.
 - mac-app: keep JSON path until the bridge lands.
 
 ## Cleanup

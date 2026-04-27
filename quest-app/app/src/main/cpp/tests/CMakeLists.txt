@@ -13,3 +13,10 @@ add_executable(test_fragment_reassembly
     ../fragment_reassembler.cpp
 )
 target_include_directories(test_fragment_reassembly PRIVATE ..)
+
+# clock_sync depends only on <chrono>; no Android or capnp linkage needed.
+add_executable(test_clock_sync
+    test_clock_sync.cpp
+    ../clock_sync.cpp
+)
+target_include_directories(test_clock_sync PRIVATE ..)

@@ -144,7 +144,6 @@ GLuint Compositor::upload_hardware_buffer(AHardwareBuffer* buf) {
                                            EGL_NATIVE_BUFFER_ANDROID, client, img_attrs);
     if (image == EGL_NO_IMAGE_KHR) return 0;
 
-    if (current_image_ != EGL_NO_IMAGE_KHR) eglDestroyImageKHR_(egl_display_, current_image_);
     if (current_texture_ == 0) glGenTextures(1, &current_texture_);
 
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, current_texture_);
@@ -154,16 +153,22 @@ GLuint Compositor::upload_hardware_buffer(AHardwareBuffer* buf) {
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    current_image_ = image;
+    // Why: glEGLImageTargetTexture2DOES makes the GL texture reference the
+    // underlying gralloc buffer directly, so the EGLImage handle itself can
+    // be destroyed immediately — the binding (and thus the AHardwareBuffer)
+    // stays alive as long as the texture exists.
+    eglDestroyImageKHR_(egl_display_, image);
     return current_texture_;
 }
 
 void Compositor::submit_frame(const DecodedFrame& frame) {
     if (!frame.buffer) { has_frame_ = false; return; }
-    if (current_buffer_) AHardwareBuffer_release(current_buffer_);
-    current_buffer_ = frame.buffer;
-    AHardwareBuffer_acquire(current_buffer_);
-    upload_hardware_buffer(current_buffer_);
+    upload_hardware_buffer(frame.buffer);
+    // Why: the texture/EGLImage path keeps its own reference to the gralloc
+    // pages, so we drop the ref the decoder handed us as soon as the bind
+    // completes; otherwise we'd hold every frame buffer indefinitely and
+    // exhaust the AImageReader's max-images pool within seconds.
+    AHardwareBuffer_release(frame.buffer);
     has_frame_ = true;
 }
 
@@ -243,10 +248,7 @@ void Compositor::shutdown() {
         }
         if (e.handle) { xrDestroySwapchain(e.handle); e.handle = XR_NULL_HANDLE; }
     }
-    if (current_image_ != EGL_NO_IMAGE_KHR && eglDestroyImageKHR_)
-        eglDestroyImageKHR_(egl_display_, current_image_);
     if (current_texture_) glDeleteTextures(1, &current_texture_);
-    if (current_buffer_) AHardwareBuffer_release(current_buffer_);
     if (egl_context_ != EGL_NO_CONTEXT) {
         eglMakeCurrent(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroyContext(egl_display_, egl_context_);

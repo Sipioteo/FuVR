@@ -48,9 +48,13 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
 
   auto daemon = std::make_shared<DaemonClient>();
   session->daemon = daemon;
+  session->xpcClient = IOSurfaceXpcClient::create("com.fuvr.daemon.surface");
+  daemon->setXpcClient(session->xpcClient.get());
   session->frameSink = makeDaemonFrameSink(daemon.get());
 
+  bool daemonConnected = false;
   if (daemon->ensureConnected()) {
+    daemonConnected = true;
     StartSessionParams params{};
     params.perEyeWidth = 2064;
     params.perEyeHeight = 2208;
@@ -63,6 +67,16 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
     Session* sessRaw = session.get();
     daemon->setPoseCallback([sessRaw](const PoseSample& s) {
       sessRaw->predictor.push(s);
+    });
+    daemon->setEncodeStatsCallback([sessRaw](const EncodeStatSample& s) {
+      sessRaw->encoderStats.push(s);
+    });
+    daemon->setDisconnectCallback([sessRaw]() {
+      Instance* i = sessRaw->instance;
+      if (i != nullptr) {
+        i->events.pushSessionStateChanged(sessRaw->handle,
+                                          XR_SESSION_STATE_LOSS_PENDING);
+      }
     });
   }
 
@@ -78,6 +92,11 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
     inst->sessions.push_back(std::move(session));
   }
   *out = raw->handle;
+  if (daemonConnected) {
+    inst->events.pushSessionStateChanged(raw->handle, XR_SESSION_STATE_IDLE);
+    inst->events.pushSessionStateChanged(raw->handle, XR_SESSION_STATE_READY);
+    raw->state = XR_SESSION_STATE_READY;
+  }
   return XR_SUCCESS;
 }
 
@@ -115,6 +134,19 @@ XrResult xrBeginSession_impl(XrSession sessionHandle,
     return XR_ERROR_HANDLE_INVALID;
   }
   s->state = XR_SESSION_STATE_SYNCHRONIZED;
+  Instance* inst = s->instance;
+  if (inst != nullptr) {
+    inst->events.pushSessionStateChanged(s->handle,
+                                          XR_SESSION_STATE_SYNCHRONIZED);
+    inst->events.pushSessionStateChanged(s->handle, XR_SESSION_STATE_VISIBLE);
+    inst->events.pushSessionStateChanged(s->handle, XR_SESSION_STATE_FOCUSED);
+    s->state = XR_SESSION_STATE_FOCUSED;
+    if (!s->interactionProfileEmitted) {
+      inst->events.pushInteractionProfileChanged(s->handle);
+      s->interactionProfileEmitted = true;
+    }
+  }
+  s->beginSessionSent = true;
   return XR_SUCCESS;
 }
 
@@ -123,7 +155,13 @@ XrResult xrEndSession_impl(XrSession sessionHandle) noexcept {
   if (s == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
   }
-  s->state = XR_SESSION_STATE_STOPPING;
+  Instance* inst = s->instance;
+  if (inst != nullptr) {
+    inst->events.pushSessionStateChanged(s->handle,
+                                          XR_SESSION_STATE_STOPPING);
+    inst->events.pushSessionStateChanged(s->handle, XR_SESSION_STATE_IDLE);
+  }
+  s->state = XR_SESSION_STATE_IDLE;
   return XR_SUCCESS;
 }
 
@@ -242,19 +280,6 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
   return XR_SUCCESS;
 }
 
-XrResult xrCreateReferenceSpace_impl(XrSession, const XrReferenceSpaceCreateInfo*,
-                                      XrSpace*) noexcept {
-  return XR_ERROR_FUNCTION_UNSUPPORTED;
-}
-
-XrResult xrDestroySpace_impl(XrSpace) noexcept {
-  return XR_ERROR_FUNCTION_UNSUPPORTED;
-}
-
-XrResult xrLocateSpace_impl(XrSpace, XrSpace, XrTime, XrSpaceLocation*) noexcept {
-  return XR_ERROR_FUNCTION_UNSUPPORTED;
-}
-
 XrResult xrEnumerateReferenceSpaces_impl(XrSession sessionHandle,
                                           uint32_t capacity, uint32_t* count,
                                           XrReferenceSpaceType* out) noexcept {
@@ -280,11 +305,6 @@ XrResult xrEnumerateReferenceSpaces_impl(XrSession sessionHandle,
   }
   *count = total;
   return XR_SUCCESS;
-}
-
-XrResult xrCreateActionSpace_impl(XrSession, const XrActionSpaceCreateInfo*,
-                                   XrSpace*) noexcept {
-  return XR_ERROR_FUNCTION_UNSUPPORTED;
 }
 
 }  // namespace fuvr::runtime

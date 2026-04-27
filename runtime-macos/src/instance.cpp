@@ -242,10 +242,11 @@ XrResult xrEnumerateEnvironmentBlendModes_impl(
 }
 
 XrResult xrPollEvent_impl(XrInstance instance, XrEventDataBuffer* buffer) noexcept {
-  if (lookupInstance(instance) == nullptr || buffer == nullptr) {
+  Instance* inst = lookupInstance(instance);
+  if (inst == nullptr || buffer == nullptr) {
     return XR_ERROR_HANDLE_INVALID;
   }
-  return XR_EVENT_UNAVAILABLE;
+  return inst->events.pop(buffer) ? XR_SUCCESS : XR_EVENT_UNAVAILABLE;
 }
 
 XrResult xrResultToString_impl(XrInstance instance, XrResult value,

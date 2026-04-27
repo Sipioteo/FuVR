@@ -1,117 +1,104 @@
 # FuVR — Implementation status
 
-Snapshot as of 2026-04-27, after coordinator pass 2. Updated at the end of
-each multi-component pass.
+Snapshot as of 2026-04-27, after coordinator pass 3.
 
 ## Where we are on the SPEC roadmap
 
-End of pass 2: **late M0 / very early M1**. The skeleton is wired
-end-to-end on the host: top-level CMake builds every component, daemon and
-runtime are bound by Cap'n Proto RPC over a Unix domain socket, the Quest
-app speaks Cap'n Proto on every wire channel, and per-eye swapchains plus a
-side-by-side blit shader are in place. **Nothing has run on real hardware
-yet.**
+End of pass 3: **late M0 / M1 in flight**. The cross-process IOSurface
+handoff (ADR-0007) is implemented via XPC; runtime↔daemon clock sync is
+real; per-frame `EncodeStats` flow back from the encoder; the OpenXR event
+queue, reference spaces, and `xrLocateSpace` are real (head-pose path); the
+Quest decoder pipeline is wired all the way through `AImageReader` →
+`AHardwareBuffer` → `EGLImage` → `GL_TEXTURE_EXTERNAL_OES`. **End-to-end
+hardware streaming has not been exercised yet.**
 
 ## Top-line verification
 
 | Check | Result |
 |---|---|
-| `cmake -S . -B build` (top level) | clean configure |
-| `cmake --build build` | clean build, all targets |
-| `ctest --test-dir build` | **11/11 passed**, 1 disabled (vdisplay needs GUI) |
-| `cargo test --workspace` (transport) | **all suites passed** (FEC, UDP loopback) |
+| `cmake --build build` | clean |
+| `ctest --test-dir build` | **24/24 passed**, 1 disabled (vdisplay needs GUI) |
+| Quest host tests (`test_fragment_reassembly` + `test_clock_sync`) | both passed |
+| `cargo test --workspace` (transport) | passed (FEC, UDP loopback) |
 | `swift test --package-path mac-app` | **10/10 passed** |
-| `bash scripts/check-licenses.sh` | clean (105 files) |
+| `scripts/check-licenses.sh` | clean (131 files) |
 
-## Per-component state (post pass 2)
+## Per-component state (post pass 3)
 
-### `proto/` — schemas
+### `proto/`
 
-- `fuvr.capnp` (the Mac↔Quest wire) — schema id `@0xb1f5d4f7c2a830e5`. Frozen.
-- `fuvrd.capnp` (the runtime↔daemon RPC) — schema id `@0xc8a4f30f6df21a7b`.
-  Frozen. Covers session lifecycle, frame submission with IOSurface handoff,
-  pose / metrics / log streaming, ping/pong.
-- Both schemas guarded by `proto-check.yml`.
+- `fuvr.capnp` — frozen at `@0xb1f5d4f7c2a830e5`.
+- `fuvrd.capnp` — frozen at `@0xc8a4f30f6df21a7b`. Comments updated to
+  reflect the XPC handoff path per the revised ADR-0007.
 
-### `runtime-macos/` — OpenXR runtime + daemon client
+### `runtime-macos/`
 
-- Pass 1: lifecycle dispatch, pose predictor, registration CLI.
-- Pass 2: `DaemonClient` (UDS Cap'n Proto, lazy connect with backoff), pose
-  stream subscription feeding `PosePredictor`, IOSurface-backed swapchains
-  (3 images, BGRA8, Metal `MTLTexture` + companion `IOSurfaceRef`), the
-  `XR_FUVR_metal_enable` extension surface (`XrSwapchainImageMetalFUVR`),
-  `DaemonFrameSink` that mints a mach send-right and submits per-frame to
-  the daemon.
-- 7/7 tests passing.
+Pass 3 additions:
+- `IOSurfaceXpcClient` (Apple XPC client for the surface mach service) plus
+  the `FUVR_INPROCESS_HANDOFF=1` test bypass via `InProcessSurfaceRegistry`.
+- Real `EventQueue` per-instance, `xrPollEvent` drains it.
+- `xrCreateReferenceSpace` (`VIEW`/`LOCAL`/`STAGE`), `xrCreateActionSpace`,
+  `xrDestroySpace`, `xrLocateSpace`. Action-space locate honestly returns
+  invalid bits because the daemon's `PoseSnapshot` does not yet carry
+  controller pose (pass 4).
+- Daemon-client now decodes `Envelope.encodeStats` and pushes into a
+  rolling `EncoderStats` window; `fuvr-runtime-metrics` CLI prints
+  encode fps / p95 / bitrate from the back-door diag header.
+- Lifecycle session-state events emitted from the daemon connection state.
 
-### `encoder-macos/` — VideoToolbox wrapper
+### `daemon/`
 
-- Unchanged in pass 2. Still: HEVC + H.264 low-latency,
-  AVCC→Annex-B framing, CSD emission, IDR forcing, `fuvr-encode-synthetic`
-  M0 spike tool, smoke test passing.
+Pass 3 additions:
+- `IOSurfaceXpcService` listener registered on `com.fuvr.daemon.surface`.
+- Per-frame `EncodeStats` envelope fan-out, piggy-backed on existing
+  `streamMetrics` subscription (no schema change).
+- NTP-style `ClockSync` ping/pong state machine: 1 Hz ping thread, median
+  of last 16 samples for `clockOffsetNs` and `oneWayDelayNs`. Populated
+  in `StartSessionResponse` with a 200 ms wait window at session start.
+- New tests: `test_clock_sync`, `test_encode_stats_forward`,
+  `test_iosurface_xpc`.
 
-### `transport/` — Rust workspace
+### `quest-app/`
 
-- Unchanged in pass 2. 5 crates, FEC round-trip + UDP loopback tests
-  passing.
+Pass 3 additions:
+- Real MediaCodec output pipeline: configured against an `AImageReader`'s
+  native window so decoded frames land directly as `AHardwareBuffer`s.
+- `AHardwareBuffer` ladder (acquire / drop-old / EGLImage bind / release)
+  fully accounted for; compositor consumes a real external texture.
+- Clock-sync responder (`ClockSyncResponder`) replies to Mac pings with
+  `t1`/`t2`.
+- Quest-side health metrics (`fps`, `decode_p95_ms`) are emitted on the
+  control channel piggy-backed on the `error` arm with the prefix
+  `q-metrics:` (workaround documented in `quest-app/TODO.md`; a clean
+  schema arm would require a major version bump).
 
-### `quest-app/` — Android NDK client
+### `mac-app/`
 
-- Pass 1: skeleton OpenXR + MediaCodec + transport + pose forwarder.
-- Pass 2: Cap'n Proto C++ runtime as `ExternalProject_Add` (capnproto-c++
-  1.0.2) for arm64-v8a; real `UpstreamFrame` packed serialisation at 1 kHz;
-  `VideoFragmentHeader` parse + fragment reassembly indexed by
-  `frameId`/`fragmentIndex`; `ControlMessage` handling (helloFromMac,
-  clockSync, haptic); per-eye swapchain creation honoring
-  `recommendedImageRect{Width,Height}`; GLES3 side-by-side blit shader
-  splitting `4128×2208` into two `2064×2208` per-eye targets with full GL
-  state save/restore; host-side `test_fragment_reassembly` covering
-  in-order, out-of-order, duplicate, interleaved, and eviction cases.
+Unchanged in pass 3.
 
-### `daemon/` (new in pass 2)
+### `transport/`, `encoder-macos/`, `virtual-display-helper/`
 
-- 16 files: UDS Cap'n Proto server, per-session encoder + transport-ffi
-  bridge, IOSurface→CVPixelBuffer mach-port lookup, pose router fanning
-  inbound `UpstreamFrame` messages out to subscribers, virtual-display
-  spawn, 10 Hz metrics ticker, JSON↔Cap'n Proto bridge for the mac-app
-  control plane.
-- Configure-time fallback when the Rust transport dylib isn't built:
-  `FUVR_DAEMON_NO_TRANSPORT` stubs the FFI calls so the daemon still
-  builds.
-- 5/5 tests passing (rolling-window metrics, RPC envelope round-trip, pose
-  router fan-out).
-
-### `mac-app/` — SwiftUI control surface
-
-- Unchanged in pass 2. `FuVRControl` library + `FuVR` executable +
-  `MockDaemon`. 10/10 tests passing.
-
-### `virtual-display-helper/` — phase-2 subprocess
-
-- Unchanged in pass 2. Builds clean; e2e test gated on a GUI session.
+Unchanged in pass 3.
 
 ### CI / infra
 
-- 6 workflows from pass 1.
-- `proto-check.yml` extended in pass 2 to also pin the daemon schema id
-  `@0xc8a4f30f6df21a7b`.
-- Top-level `enable_testing()` added so `ctest --test-dir build` aggregates
-  every component's CTest registration.
+- `proto-check.yml` already pins both schema ids.
+- Top-level CMake unchanged in pass 3 (cross-subdir target linkage handled
+  via existing `add_subdirectory` order).
 
-## What works end-to-end today
+## What works end-to-end today (in-process)
 
-In-process integration test:
+1. `FUVR_INPROCESS_HANDOFF=1`-mode integration: the runtime's swapchain
+   IOSurfaces are visible to the daemon's encoder host without XPC. Used by
+   unit tests, also valid for one-machine smoke runs.
+2. With XPC mode + the launchd plist installed
+   (`scripts/install-launchd.sh`), runtime↔daemon handoff works
+   cross-process. **Not exercised in CI**; the `FUVR_E2E_XPC=1` gate runs
+   it in a developer environment only.
 
-1. Start `fuvrd` from `build/daemon/fuvrd`.
-2. Set `OPENXR_ACTIVE_RUNTIME` to the runtime dylib (or use the
-   `fuvr-register` CLI).
-3. Run any OpenXR-capable test app linked against `fuvr_openxr_runtime`.
-4. The runtime connects to the daemon, starts a session, hands off
-   IOSurface-backed swapchain images per frame.
-
-This works today **only when runtime and daemon share a mach task** (i.e.
-the in-process unit tests). True cross-process IOSurface handoff needs the
-mach-service side channel from ADR-0007, which is the first item of pass 3.
+The host pipeline (Mac → Quest) still cannot be exercised end-to-end
+because no hardware run has happened. The four M0 spike questions remain
+the gate to M1.
 
 ## Critical M0 spikes (SPEC §5.M0)
 
@@ -119,24 +106,25 @@ mach-service side channel from ADR-0007, which is the first item of pass 3.
 |---|----------|------|-------|
 | 1 | ADB reverse over USB ≥100 Mbps with <15 ms RTT? | `transport-cli loopback-bench` | tool ready, hardware run pending |
 | 2 | VideoToolbox HEVC `RealTime=true` <15 ms encode on M2/M3? | `fuvr-encode-synthetic` | tool ready, hardware run pending |
-| 3 | Quest receive UDP + MediaCodec + projection layer @ 90 Hz? | `quest-app` debug build | transport + per-eye swapchains landed; needs decoder Surface↔AImageReader plumbing for visual output |
+| 3 | Quest receive UDP + MediaCodec + projection layer @ 90 Hz? | `quest-app` debug build | decoder pipeline now real (pass 3); ready for device-side smoke |
 | 4 | `CGVirtualDisplay` works on macOS 14/15/16? | `fuvr-vdisplay-helper --width ... --height ... --refresh ...` | tool ready, multi-version run pending |
 
-## Next coordinator pass (pass 3)
+## Next coordinator pass (pass 4)
 
-1. **ADR-0007 implementation**: mach service `com.fuvr.daemon.surface` on
-   the daemon side; `bootstrap_look_up` + per-frame `mach_msg_send` on the
-   runtime side. Symmetric work, must land together.
-2. **MediaCodec output → AHardwareBuffer plumbing on the Quest**, so the
-   blit shader sees real frames instead of `current_texture_=0`.
-3. **EncodeStats response path**: encoder → daemon → runtime, fed into a
-   metrics view in the mac-app.
-4. **Real clock sync**: implement the `ClockSync` ping/pong on both sides
-   so `StartSessionResponse.clockOffsetNs` is actually populated.
-5. **`xrPollEvent`** emitting `XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED` from
-   daemon connection state transitions.
-6. **`xrLocateSpace` + reference spaces**: currently stubbed; needed before
-   any real OpenXR app can run.
+1. **Controller pose forwarding**: extend `PoseSnapshot` (this is a daemon
+   schema change — `fuvrd.capnp` only, the wire schema stays frozen) with
+   left/right controller poses; the daemon already receives them on the
+   wire; runtime action spaces start returning valid bits.
+2. **Quest q-metrics → daemon metrics ingestion**: parse the `error` arm
+   `q-metrics:` prefix in the daemon, emit the values as part of the
+   `Metrics` envelope so the mac-app's diagnostics view shows decoder fps
+   and decode p95 ms.
+3. **Real input read-back**: connect `xrGetActionStateBoolean/Float/Vector2f`
+   to the daemon's most recent `UpstreamFrame.inputs`.
+4. **Audio path**: encoder side is `Opus` plumbing TBD; transport `Audio`
+   channel is reserved; Quest side needs the `OpenSL ES`/`AAudio` output.
+5. **First end-to-end hardware spike**: actually run M0 question 1 on a
+   real Quest 3 + M2 Mac and record numbers.
 
 ## ADR index
 
@@ -146,4 +134,4 @@ mach-service side channel from ADR-0007, which is the first item of pass 3.
 - 0004: CGVirtualDisplay subprocess
 - 0005: Reed-Solomon FEC, no ARQ
 - 0006: ADB reverse over USB
-- 0007: IOSurface handoff via parallel mach service (NEW)
+- 0007: IOSurface handoff via XPC mach service (revised in pass 3)

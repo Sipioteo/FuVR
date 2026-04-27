@@ -24,6 +24,11 @@ public:
     void install();
     void send_hello_from_quest();
 
+    // Periodic Quest->Mac metrics piggy-backed on the ControlMessage.error
+    // arm with a stable "q-metrics: " prefix. Pending a wire-schema bump
+    // adding a real metrics arm; see quest-app/TODO.md.
+    void send_metrics_if_due();
+
     // Latest negotiated session config from the Mac, if any.
     bool has_session_config() const { std::lock_guard<std::mutex> lk(mu_); return have_cfg_; }
 
@@ -38,6 +43,7 @@ private:
     FragmentReassembler reassembler_;
     mutable std::mutex mu_;
     bool have_cfg_{false};
+    uint64_t last_metrics_ns_{0};
 };
 
 }

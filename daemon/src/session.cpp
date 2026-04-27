@@ -65,6 +65,26 @@ public:
         uint64_t startNs = owner_->lastEncodeStartNs_.load();
         uint64_t durNs = startNs ? (nowMonoNs() - startNs) : 0;
         owner_->metrics_.recordEncode(durNs, static_cast<uint32_t>(f.size));
+
+        if (!owner_->curFrameActive_ || owner_->curFrameId_ != f.frameId) {
+            owner_->curFrameId_       = f.frameId;
+            owner_->curFrameBytes_    = 0;
+            owner_->curFrameKeyframe_ = false;
+            owner_->curFrameActive_   = true;
+        }
+        owner_->curFrameBytes_ += static_cast<uint32_t>(f.size);
+        if (f.isKeyframe) owner_->curFrameKeyframe_ = true;
+
+        if (f.endOfFrame) {
+            EncodeStatsEvent ev{
+                .frameId          = owner_->curFrameId_,
+                .encodeDurationNs = durNs,
+                .encodedSizeBytes = owner_->curFrameBytes_,
+                .wasKeyframe      = owner_->curFrameKeyframe_,
+            };
+            owner_->curFrameActive_ = false;
+            if (owner_->statsSink_) owner_->statsSink_(ev);
+        }
     }
 
 private:
@@ -72,8 +92,9 @@ private:
     FuvrTransport* transport_;
 };
 
-Session::Session(uint64_t id, const SessionConfig& cfg, FuvrTransport* transport)
-    : id_(id), cfg_(cfg), transport_(transport) {
+Session::Session(uint64_t id, const SessionConfig& cfg, FuvrTransport* transport,
+                 EncodeStatsSink statsSink)
+    : id_(id), cfg_(cfg), transport_(transport), statsSink_(std::move(statsSink)) {
     sink_ = std::make_unique<FragmentSink>(this, transport_);
     fuvr::EncoderConfig ec{
         .width = cfg_.perEyeWidth * 2,
@@ -98,6 +119,10 @@ Session::~Session() {
     encoder_.reset();
     sink_.reset();
     if (vdisplay_) fuvr_vdisplay_kill(vdisplay_);
+}
+
+void Session::testInjectFragment(const fuvr::EncodedFragment& f) {
+    if (sink_) sink_->onFragment(f);
 }
 
 bool Session::submitFrame(CVPixelBufferRef pb,

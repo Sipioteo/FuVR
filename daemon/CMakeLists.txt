@@ -5,10 +5,12 @@ add_library(fuvr_daemon_core STATIC
   src/rpc_server.cpp
   src/session.cpp
   src/iosurface_bridge.mm
+  src/iosurface_xpc_service.mm
   src/pose_router.cpp
   src/metrics.cpp
   src/transport_ffi_glue.cpp
   src/json_bridge.cpp
+  src/clock_sync.cpp
 )
 
 target_include_directories(fuvr_daemon_core PUBLIC
@@ -25,14 +27,21 @@ target_link_libraries(fuvr_daemon_core PUBLIC
   fuvr_warnings
   fuvr_encoder
   fuvr_vdisplay_control
+  fuvr_inprocess_handoff
   "-framework CoreVideo"
   "-framework IOSurface"
   "-framework CoreFoundation"
   "-framework Foundation"
 )
+# Why: XPC ships in libSystem (no separate framework needed) but is implicit
+# only via Foundation linkage above; keep this comment so future readers know
+# we did not forget an `-framework XPC`.
 
 set_source_files_properties(src/iosurface_bridge.mm PROPERTIES
   COMPILE_FLAGS "-fobjc-arc -fexceptions"
+)
+set_source_files_properties(src/iosurface_xpc_service.mm PROPERTIES
+  COMPILE_FLAGS "-fno-objc-arc"
 )
 
 find_library(FUVR_TRANSPORT_LIB fuvr_transport
@@ -64,6 +73,9 @@ if(FUVR_DAEMON_TESTS)
     tests/test_metrics.cpp
     tests/test_rpc_envelope.cpp
     tests/test_pose_router.cpp
+    tests/test_iosurface_xpc.cpp
+    tests/test_clock_sync.cpp
+    tests/test_encode_stats_forward.cpp
   )
   target_link_libraries(fuvr_daemon_tests PRIVATE
     fuvr_daemon_core
