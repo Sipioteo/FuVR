@@ -63,6 +63,12 @@ public:
     void capture_local_origin_if_needed(XrTime t);
 
     const std::array<ViewSnapshot, 2>& last_views() const { return last_views_; }
+    // Eye poses located relative to view_space (head). In view space the
+    // head is the origin, so these poses are essentially the per-eye IPD
+    // offsets — used to submit the projection layer head-locked, so the
+    // layer follows the head instantly and the user never sees the void
+    // during fast rotations.
+    const std::array<ViewSnapshot, 2>& last_views_view() const { return last_views_view_; }
     const std::array<XrCompositionLayerProjectionView, 2>& projection_views() const { return projection_views_; }
 
 private:
@@ -139,6 +145,7 @@ private:
     XrTime predicted_display_time_{0};
 
     std::array<ViewSnapshot, 2> last_views_{};
+    std::array<ViewSnapshot, 2> last_views_view_{};
     std::array<XrCompositionLayerProjectionView, 2> projection_views_{};
     std::vector<XrViewConfigurationView> view_configs_;
 };

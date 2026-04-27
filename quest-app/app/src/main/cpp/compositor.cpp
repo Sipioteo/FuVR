@@ -361,16 +361,81 @@ bool Compositor::render_eye(int eye_index) {
 bool Compositor::build_projection_layer(OpenXrSession& xr,
                                         XrCompositionLayerProjection& out,
                                         std::array<XrCompositionLayerProjectionView, 2>& views) {
-    if (!has_frame_ || eyes_[0].handle == XR_NULL_HANDLE || eyes_[1].handle == XR_NULL_HANDLE)
+    // Why: we deliberately do NOT gate on has_frame_. If the layer is
+    // skipped on frames where no fresh remote texture has arrived yet, the
+    // OS compositor draws no layer and the user sees the empty world —
+    // which is exactly the "void during head rotation" symptom. As long
+    // as we have valid swapchains we always submit the layer; render_eye
+    // re-uses the last bound texture (current_texture_) and applies
+    // identity ATW when the render pose is not yet valid, producing a
+    // continuous image that follows the head.
+    if (eyes_[0].handle == XR_NULL_HANDLE || eyes_[1].handle == XR_NULL_HANDLE)
         return false;
+    if (current_texture_ == 0) return false;
 
     if (!render_eye(0) || !render_eye(1)) return false;
 
     const auto& snap = xr.last_views();
+
+    // [DRIFT-DIAG #2 + #3] Compare the pose we're about to submit as the
+    // projection-layer pose (snap = sampled at begin_frame from
+    // xrLocateViews(predictedDisplayTime)) against a fresh xrLocateViews()
+    // taken right now, just before xrEndFrame. If snap drifts in stage_space
+    // while head is held still, or differs significantly from the fresh
+    // locate, we know the layer is being placed at a stale eye pose — that's
+    // the "2D plane drifts then snaps back" symptom.
+    {
+        static uint64_t last_log_ns = 0;
+        const uint64_t t_now_ns = now_ns_steady();
+        if (t_now_ns - last_log_ns > 1'000'000'000ull) {
+            last_log_ns = t_now_ns;
+            XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
+            vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+            vli.displayTime = xr.predicted_display_time();
+            vli.space = xr.stage_space();
+            XrViewState vs{XR_TYPE_VIEW_STATE};
+            uint32_t out_count = 0;
+            XrView fresh[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+            XrResult lr = xrLocateViews(xr.session(), &vli, &vs, 2,
+                                         &out_count, fresh);
+            const auto& sp = snap[0].pose;
+            const float dpx = (lr == XR_SUCCESS && out_count == 2)
+                ? (fresh[0].pose.position.x - sp.position.x) : 0.0f;
+            const float dpy = (lr == XR_SUCCESS && out_count == 2)
+                ? (fresh[0].pose.position.y - sp.position.y) : 0.0f;
+            const float dpz = (lr == XR_SUCCESS && out_count == 2)
+                ? (fresh[0].pose.position.z - sp.position.z) : 0.0f;
+            const float dq_dot = (lr == XR_SUCCESS && out_count == 2)
+                ? (fresh[0].pose.orientation.x * sp.orientation.x +
+                   fresh[0].pose.orientation.y * sp.orientation.y +
+                   fresh[0].pose.orientation.z * sp.orientation.z +
+                   fresh[0].pose.orientation.w * sp.orientation.w)
+                : 1.0f;
+            float dq_abs = dq_dot < 0 ? -dq_dot : dq_dot;
+            if (dq_abs > 1.0f) dq_abs = 1.0f;
+            const float dq_deg = 2.0f * std::acos(dq_abs) * 57.2957795f;
+            // #2: layer pose we're about to submit (raw stage_space coords)
+            // #3: delta vs fresh xrLocateViews at the same predictedDisplayTime
+            LOGI("[DRIFT #2/#3] layer_pose eye0 stage=(%.3f,%.3f,%.3f) "
+                 "ornW=%.3f | fresh-vs-snap dpos=(%.4f,%.4f,%.4f)m "
+                 "dorn=%.3f° lr=%d viewFlags=0x%x",
+                 sp.position.x, sp.position.y, sp.position.z, sp.orientation.w,
+                 dpx, dpy, dpz, dq_deg, (int)lr, (unsigned)vs.viewStateFlags);
+        }
+    }
+
+    // World-locked projection layer in stage_space. The Meta Horizon OS
+    // compositor automatically applies vsync timewarp to projection layers,
+    // re-projecting per-pixel to the current head pose at scan-out time.
+    // Combined with the always-submit policy above (no `!has_frame_` skip),
+    // the user no longer sees any void during head rotation: even if no
+    // fresh remote frame has arrived, the previous texture is reprojected
+    // and remains visible. The stereo perspective is preserved naturally
+    // because we use XrCompositionLayerProjection (not synthetic quads).
     for (int i = 0; i < 2; ++i) {
         views[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
         views[i].pose = snap[i].pose;
-        views[i].fov = snap[i].fov;
+        views[i].fov  = snap[i].fov;
         views[i].subImage.swapchain = eyes_[i].handle;
         views[i].subImage.imageRect.offset = {0, 0};
         views[i].subImage.imageRect.extent.width = eyes_[i].width;
@@ -381,6 +446,82 @@ bool Compositor::build_projection_layer(OpenXrSession& xr,
     out.space = xr.stage_space();
     out.viewCount = 2;
     out.views = views.data();
+    return true;
+}
+
+bool Compositor::build_head_locked_quads(OpenXrSession& xr,
+                                         std::array<XrCompositionLayerQuad, 2>& quads) {
+    // Why: Meta Quest's compositor does not respect XR_REFERENCE_SPACE_TYPE_VIEW
+    // on projection layers (verified via [HEAD-LOCK] diagnostics). Quad layers,
+    // however, are correctly rigidly attached when their space is view_space.
+    // We render the same ATW-corrected per-eye textures into the existing
+    // per-eye swapchains, then expose each one as a head-locked quad.
+    if (eyes_[0].handle == XR_NULL_HANDLE || eyes_[1].handle == XR_NULL_HANDLE)
+        return false;
+    if (current_texture_ == 0) return false;
+
+    if (!render_eye(0) || !render_eye(1)) return false;
+
+    // Quad geometry. The Mac rendered each eye texture from a virtual camera
+    // offset by IPD/2 from the head center, looking forward, with the eye's
+    // intrinsic (asymmetric) FOV. To preserve correct stereo when displaying
+    // these textures as quads, each quad must be placed DIRECTLY IN FRONT of
+    // the corresponding eye (not at the head center) and sized/centered to
+    // match the per-eye FOV exactly. Otherwise the brain receives mismatched
+    // disparities and the eyes diverge / cross.
+    //
+    //   eye_pos_in_view = (±IPD/2, 0, 0)            (from xrLocateViews(view_space))
+    //   quad_center     = eye_pos + (offset_x, offset_y, -depth)
+    //   offset_x        = depth * (tan(R) + tan(L)) / 2     (asymmetric center)
+    //   offset_y        = depth * (tan(U) + tan(D)) / 2
+    //   quad_w          = depth * (tan(R) - tan(L))
+    //   quad_h          = depth * (tan(U) - tan(D))
+    constexpr float kDepth = 1.0f;
+    const auto& snap = xr.last_views();
+    const auto& snap_view = xr.last_views_view();
+
+    for (int i = 0; i < 2; ++i) {
+        const XrFovf& fov = snap[i].fov;
+        const float tanL = std::tan(fov.angleLeft);
+        const float tanR = std::tan(fov.angleRight);
+        const float tanU = std::tan(fov.angleUp);
+        const float tanD = std::tan(fov.angleDown);
+        const float w = kDepth * (tanR - tanL);
+        const float h = kDepth * (tanU - tanD);
+        const float cx = kDepth * (tanR + tanL) * 0.5f;
+        const float cy = kDepth * (tanU + tanD) * 0.5f;
+
+        // Eye position in view_space (IPD offset, identity rotation).
+        const float eye_x = snap_view[i].pose.position.x;
+        const float eye_y = snap_view[i].pose.position.y;
+        const float eye_z = snap_view[i].pose.position.z;
+
+        quads[i] = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+        quads[i].space = xr.view_space();
+        quads[i].eyeVisibility = (i == 0) ? XR_EYE_VISIBILITY_LEFT
+                                          : XR_EYE_VISIBILITY_RIGHT;
+        quads[i].pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        quads[i].pose.position = { eye_x + cx, eye_y + cy, eye_z - kDepth };
+        quads[i].size = { std::fabs(w), std::fabs(h) };
+        quads[i].subImage.swapchain = eyes_[i].handle;
+        quads[i].subImage.imageRect.offset = {0, 0};
+        quads[i].subImage.imageRect.extent.width  = eyes_[i].width;
+        quads[i].subImage.imageRect.extent.height = eyes_[i].height;
+        quads[i].subImage.imageArrayIndex = 0;
+    }
+    {
+        static uint64_t last_log_ns3 = 0;
+        const uint64_t t_now_ns = now_ns_steady();
+        if (t_now_ns - last_log_ns3 > 1'000'000'000ull) {
+            last_log_ns3 = t_now_ns;
+            LOGI("[QUAD-GEOM] L pos=(%.3f,%.3f,%.3f) size=(%.3f,%.3f) | "
+                 "R pos=(%.3f,%.3f,%.3f) size=(%.3f,%.3f)",
+                 quads[0].pose.position.x, quads[0].pose.position.y,
+                 quads[0].pose.position.z, quads[0].size.width, quads[0].size.height,
+                 quads[1].pose.position.x, quads[1].pose.position.y,
+                 quads[1].pose.position.z, quads[1].size.width, quads[1].size.height);
+        }
+    }
     return true;
 }
 

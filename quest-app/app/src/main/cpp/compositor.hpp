@@ -48,6 +48,16 @@ public:
                                 XrCompositionLayerProjection& out,
                                 std::array<XrCompositionLayerProjectionView, 2>& views);
 
+    // Head-locked dual-quad path. Meta Quest's compositor ignores
+    // `space = view_space` on XrCompositionLayerProjection (the projection
+    // layer behaves as if world-locked, with the well-known "plane stays in
+    // world then snaps to eyes" symptom during head rotation). For quad
+    // layers, view_space IS honored — so we render the same ATW-corrected
+    // per-eye textures and submit them as two quads (eyeVisibility LEFT/RIGHT)
+    // anchored to view_space. Returns false if no decoded frame is ready.
+    bool build_head_locked_quads(OpenXrSession& xr,
+                                 std::array<XrCompositionLayerQuad, 2>& quads);
+
     // Black "Connecting..." quad shown until first frame arrives.
     bool build_placeholder_layer(OpenXrSession& xr, XrCompositionLayerQuad& out);
 

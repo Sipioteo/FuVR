@@ -71,14 +71,20 @@ void main() {
     float xr = dir_r.x / -dir_r.z;
     float yr = dir_r.y / -dir_r.z;
 
-    // Map back to [0,1] in the render fov. Outside the fov -> black wedge.
-    float ur = (xr - tanL_r) / (tanR_r - tanL_r);
-    float vr = (yr - tanD_r) / (tanU_r - tanD_r);
-
-    if (ur < 0.0 || ur > 1.0 || vr < 0.0 || vr > 1.0) {
-        oColor = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
-    }
+    // Map back to [0,1] in the render fov. When the user rotates faster
+    // than the pose-prediction lookahead + overscan can compensate
+    // (Δq peak > rendered-fov margin), the reprojected ray exits the
+    // rendered viewport. Previously the shader emitted explicit black for
+    // those samples — the visual result was a "shrinking polygon" of valid
+    // texture wrapped in a growing black wedge during head motion (user
+    // perception: "the plane stays still then realigns to my eyes after a
+    // moment"). We now CLAMP the UV to [0,1] so the sampler reads the
+    // nearest texture edge instead of emitting black. The edge content
+    // stretches a bit during fast turns, but the FOV stays fully covered
+    // and the apparent "shrinking screen" is gone. This is the standard
+    // ATW+overscan fallback for remote-rendered VR streaming.
+    float ur = clamp((xr - tanL_r) / (tanR_r - tanL_r), 0.0, 1.0);
+    float vr = clamp((yr - tanD_r) / (tanU_r - tanD_r), 0.0, 1.0);
 
     // Why: the source texture is a GL_TEXTURE_EXTERNAL_OES bound to an
     // AHardwareBuffer that MediaCodec wrote in display-natural orientation,
