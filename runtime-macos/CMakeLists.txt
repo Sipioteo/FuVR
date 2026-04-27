@@ -64,6 +64,7 @@ set(FUVR_RUNTIME_SOURCES
   src/daemon_client.cpp
   src/iosurface_swapchain.mm
   src/iosurface_xpc_client.mm
+  src/metalfx_upscaler.mm
 )
 
 add_library(fuvr_openxr_runtime MODULE ${FUVR_RUNTIME_SOURCES})
@@ -86,6 +87,7 @@ target_link_libraries(fuvr_openxr_runtime
     fuvr_openxr_headers
     fuvr_inprocess_handoff
     "-framework Metal"
+    "-framework MetalFX"
     "-framework IOSurface"
     "-framework CoreFoundation"
     "-framework Foundation"
@@ -105,6 +107,9 @@ set_source_files_properties(src/iosurface_swapchain.mm PROPERTIES
 )
 set_source_files_properties(src/iosurface_xpc_client.mm PROPERTIES
   COMPILE_FLAGS "-fno-objc-arc"
+)
+set_source_files_properties(src/metalfx_upscaler.mm PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
 )
 
 add_executable(fuvr-register src/register_runtime.cpp)
@@ -175,6 +180,7 @@ if(FUVR_RUNTIME_TESTS)
     src/frame_sink.cpp
     src/iosurface_swapchain.mm
     src/iosurface_xpc_client.mm
+    src/metalfx_upscaler.mm
   )
   target_include_directories(fuvr_runtime_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -186,6 +192,7 @@ if(FUVR_RUNTIME_TESTS)
       fuvr_inprocess_handoff
       GTest::gtest_main
       "-framework Metal"
+      "-framework MetalFX"
       "-framework IOSurface"
       "-framework CoreFoundation"
       "-framework Foundation"
@@ -198,6 +205,9 @@ if(FUVR_RUNTIME_TESTS)
   )
   set_source_files_properties(src/iosurface_xpc_client.mm PROPERTIES
     COMPILE_FLAGS "-fno-objc-arc"
+  )
+  set_source_files_properties(src/metalfx_upscaler.mm PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc"
   )
   include(GoogleTest)
   gtest_discover_tests(fuvr_runtime_tests)

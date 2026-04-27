@@ -83,34 +83,79 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
     // has connected yet (daemon-without-headset case, e.g. CI smoke tests).
     StartSessionParams params{};
     DeviceCapabilities caps{};
-    // FUVR_RT_RENDER_SCALE: scales the per-eye render resolution Blender
-    // uses (and the encoder/decoder are configured at) to lift the
-    // Mac-side render-rate ceiling. Default 1.0 = full Quest 3 dims
-    // (2064x2208 per eye, ~9.1 MP SBS, ~30 fps in Eevee on M-series).
-    // 0.5 → ~2.3 MP SBS, comfortably 90 fps in Eevee. The Quest decoder
-    // reconfigures from session-start config (set_output_size in
-    // protocol_router.cpp) and the eye_blit shader scales whatever
-    // decoded texture into the 2064x2208 eye swapchain via UVs, so the
-    // visible image stays correct.
-    const float renderScale = []() {
-      const char* env = std::getenv("FUVR_RT_RENDER_SCALE");
-      if (env == nullptr || *env == '\0') return 1.0f;
-      const float v = std::strtof(env, nullptr);
-      if (v < 0.25f || v > 1.0f) return 1.0f;
-      return v;
-    }();
-    auto scaleEven = [renderScale](uint32_t v) {
-      uint32_t out = static_cast<uint32_t>(v * renderScale);
-      // H.264/HEVC require even dims; round up to even.
+    // Scale knobs to lift the Mac-side render-rate ceiling without
+    // sacrificing image quality uniformly. Three env vars, all default 1.0:
+    //
+    //   FUVR_RT_RENDER_SCALE   — uniform scale (legacy / convenience)
+    //   FUVR_RT_RENDER_SCALE_X — horizontal-only scale (overrides X)
+    //   FUVR_RT_RENDER_SCALE_Y — vertical-only scale   (overrides Y)
+    //
+    // Lens distortion compresses pixels horizontally near the outer edges
+    // more than vertically, so a typical "keep graphics, gain fps" combo
+    // is X=0.75 Y=1.0 — render 25% fewer horizontal pixels (33% faster)
+    // while keeping full vertical resolution where the eye is most
+    // sensitive. The Quest decoder reconfigures from session-start config
+    // and the eye_blit shader samples the smaller decoded texture into
+    // the 2064x2208 eye swapchain via UVs, so the picture remains correct.
+    auto readScale = [](const char* env, float fallback) -> float {
+      const char* v = std::getenv(env);
+      if (v == nullptr || *v == '\0') return fallback;
+      const float f = std::strtof(v, nullptr);
+      if (f < 0.25f || f > 1.0f) return fallback;
+      return f;
+    };
+    float uniformScale = readScale("FUVR_RT_RENDER_SCALE", 1.0f);
+    float scaleX = readScale("FUVR_RT_RENDER_SCALE_X", uniformScale);
+    float scaleY = readScale("FUVR_RT_RENDER_SCALE_Y", uniformScale);
+    // METALFX: when FUVR_RT_METALFX=spatial, force Blender to render at
+    // half per-eye (the upscaler reconstructs full dim before SBS combine
+    // + encode). Lower user-set scales still win — if the user says 0.4 we
+    // honor that (they want even cheaper renders). Important asymmetry:
+    // here in session.cpp we keep `params.perEye{Width,Height}` at FULL
+    // resolution so the encoder/SBS path negotiates 4128x2208 over the
+    // wire — matching the upscaled textures we feed it. Only the
+    // *Blender-side* swapchain dim (returned from
+    // xrEnumerateViewConfigurationViews) is forced to half.
+    bool metalFxEnabled = false;
+    if (const char* env = std::getenv("FUVR_RT_METALFX")) {
+      if (std::strcmp(env, "spatial") == 0) {
+        metalFxEnabled = true;
+        if (scaleX > 0.5f) scaleX = 0.5f;
+        if (scaleY > 0.5f) scaleY = 0.5f;
+        std::fprintf(stderr,
+                     "[METALFX] enabled (spatial); forcing Blender render "
+                     "scale to %.2fx%.2f\n", scaleX, scaleY);
+      }
+    }
+    session->metalFxEnabled = metalFxEnabled;
+    auto scaleEvenX = [scaleX](uint32_t v) {
+      uint32_t out = static_cast<uint32_t>(v * scaleX);
+      return (out + 1u) & ~1u;  // HEVC/H.264 require even dims
+    };
+    auto scaleEvenY = [scaleY](uint32_t v) {
+      uint32_t out = static_cast<uint32_t>(v * scaleY);
       return (out + 1u) & ~1u;
     };
+    if (std::getenv("FUVR_RT_DEBUG") || scaleX < 0.999f || scaleY < 0.999f) {
+      std::fprintf(stderr,
+                   "[fuvr-rt] render scale: X=%.2f Y=%.2f\n", scaleX, scaleY);
+    }
     if (daemon->getDeviceCapabilities(&caps) && caps.valid) {
       // Encoder/decoder dims are negotiated via session-start config
       // (Quest reads perEyeWidth/Height and reconfigures decoder), so we
       // can scale freely — Quest swapchain stays 2064x2208, eye_blit
       // samples the smaller decoded texture via UVs.
-      params.perEyeWidth = scaleEven(2064);
-      params.perEyeHeight = scaleEven(2208);
+      // METALFX: keep encoder/SBS dims at FULL — the upscaler will lift
+      // half-res Blender textures back to full before they reach the
+      // stereo blitter. Without this, the encoder would be configured at
+      // half dim and we'd lose the entire point of upscaling.
+      if (metalFxEnabled) {
+        params.perEyeWidth = ((2064u + 1u) & ~1u);
+        params.perEyeHeight = ((2208u + 1u) & ~1u);
+      } else {
+        params.perEyeWidth = scaleEvenX(2064);
+        params.perEyeHeight = scaleEvenY(2208);
+      }
       (void)caps.perEyeWidth;
       (void)caps.perEyeHeight;
       // Pick the highest advertised rate <= 120; Quest 3 reports 120 but PCVR
@@ -138,13 +183,23 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
       // TODO: surface this via the connection UI; today we silently fall
       // back. Hardcoded Quest 3 defaults; the daemon will negotiate down
       // when the Quest finally connects.
-      params.perEyeWidth = scaleEven(2064);
-      params.perEyeHeight = scaleEven(2208);
+      if (metalFxEnabled) {
+        params.perEyeWidth = ((2064u + 1u) & ~1u);
+        params.perEyeHeight = ((2208u + 1u) & ~1u);
+      } else {
+        params.perEyeWidth = scaleEvenX(2064);
+        params.perEyeHeight = scaleEvenY(2208);
+      }
       params.refreshRateHz = 90;
       if (std::getenv("FUVR_RT_DEBUG"))
         std::fprintf(stderr,
                      "[fuvr-rt] no caps from daemon yet; using Quest 3 defaults\n");
     }
+    // Capture the encoder-side full per-eye dims as the upscaler's output
+    // target. With MetalFX on, params.perEye{Width,Height} are full; with
+    // it off, they're already-scaled (and the upscaler is unused).
+    session->metalFxFullPerEyeWidth = params.perEyeWidth;
+    session->metalFxFullPerEyeHeight = params.perEyeHeight;
     StartSessionResult result{};
     if (daemon->startSession(params, &result)) {
       session->daemonSessionId = result.sessionId;
@@ -426,22 +481,73 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
               resolvedFovFromImage = true;
             }
             if (L.mtlTexture != nullptr && R.mtlTexture != nullptr) {
+              // METALFX: lazily build the upscaler the first time we see a
+              // pair of eye textures with known dims. Input dim is the
+              // swapchain's per-eye dim (half, post-FUVR_RT_RENDER_SCALE);
+              // output dim is the session's recorded full per-eye dim
+              // (matches encoder + SBS combined target).
+              void* leftTex = L.mtlTexture;
+              void* rightTex = R.mtlTexture;
+              uint32_t blitW = L.width;
+              uint32_t blitH = L.height;
+              if (s->metalFxEnabled) {
+                if (!s->metalFxUpscaler) {
+                  s->metalFxUpscaler = std::make_unique<MetalFxUpscaler>();
+                  if (!s->metalFxUpscaler->init(
+                          s->metalDevice, s->metalCommandQueue,
+                          L.width, L.height,
+                          s->metalFxFullPerEyeWidth,
+                          s->metalFxFullPerEyeHeight)) {
+                    std::fprintf(stderr,
+                                 "[METALFX] init failed; disabling upscaler "
+                                 "for this session (will SBS at half dim)\n");
+                    s->metalFxUpscaler.reset();
+                    s->metalFxEnabled = false;
+                  }
+                }
+                if (s->metalFxUpscaler) {
+                  void* uL = s->metalFxUpscaler->upscaleEye(0, L.mtlTexture);
+                  void* uR = s->metalFxUpscaler->upscaleEye(1, R.mtlTexture);
+                  if (uL != nullptr && uR != nullptr) {
+                    leftTex = uL;
+                    rightTex = uR;
+                    blitW = s->metalFxUpscaler->outputWidth();
+                    blitH = s->metalFxUpscaler->outputHeight();
+                  }
+                  // 1Hz log so the user can verify it's running.
+                  static std::atomic<uint64_t> lastLogNs{0};
+                  uint64_t nowNs = static_cast<uint64_t>(
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count());
+                  uint64_t prev = lastLogNs.load(std::memory_order_relaxed);
+                  if (nowNs - prev >= 1'000'000'000ull &&
+                      lastLogNs.compare_exchange_strong(prev, nowNs)) {
+                    std::fprintf(stderr,
+                                 "[METALFX] upscaling %ux%u -> %ux%u/eye, "
+                                 "frame_us=%lld\n",
+                                 L.width, L.height,
+                                 s->metalFxUpscaler->outputWidth(),
+                                 s->metalFxUpscaler->outputHeight(),
+                                 (long long)s->metalFxUpscaler->lastFrameUs());
+                  }
+                }
+              }
               if (!s->stereoBlitter) {
                 s->stereoBlitter = std::make_unique<StereoBlitter>();
                 if (!s->stereoBlitter->init(s->metalDevice,
                                              s->metalCommandQueue,
-                                             L.width, L.height)) {
+                                             blitW, blitH)) {
                   s->stereoBlitter.reset();
                 }
               }
               if (s->stereoBlitter) {
-                surf = s->stereoBlitter->blitToCombined(L.mtlTexture,
-                                                         R.mtlTexture);
+                surf = s->stereoBlitter->blitToCombined(leftTex, rightTex);
                 if (surf != nullptr) {
-                  f.width = L.width * 2;
-                  f.height = L.height;
-                  f.leftMetalTexture = L.mtlTexture;
-                  f.rightMetalTexture = R.mtlTexture;
+                  f.width = blitW * 2;
+                  f.height = blitH;
+                  f.leftMetalTexture = leftTex;
+                  f.rightMetalTexture = rightTex;
                 }
               }
             }

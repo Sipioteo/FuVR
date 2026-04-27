@@ -19,6 +19,10 @@
 #include "fuvr/frame_sink.hpp"
 #include "fuvr/iosurface_swapchain.hpp"
 #include "fuvr/iosurface_xpc_client.hpp"
+// METALFX upscaler — pure C++ declarations, ObjC API is hidden in the .mm.
+// Included here so unique_ptr<MetalFxUpscaler> in Session has a complete
+// type at the point where Session's implicit destructor is generated.
+#include "fuvr/metalfx_upscaler.hpp"
 #include "fuvr/pose_predictor.hpp"
 #include "fuvr/spaces.hpp"
 
@@ -164,6 +168,16 @@ struct Session {
   // before submitting to the daemon's encoder. Lazily initialized in
   // xrEndFrame on the first projection layer with viewCount >= 2.
   std::unique_ptr<StereoBlitter> stereoBlitter;
+  // METALFX: when FUVR_RT_METALFX=spatial, Blender renders at half per-eye
+  // dim and we upscale to full per-eye dim before SBS combine + encode.
+  // metalFxFullPerEyeWidth/Height are the *full* dims (encoder + SBS target);
+  // the swapchain images coming in from xrEndFrame are the *half* dims.
+  // metalFxUpscaler is lazily constructed in xrEndFrame_impl on the first
+  // projection layer with two views.
+  bool metalFxEnabled{false};
+  uint32_t metalFxFullPerEyeWidth{0};
+  uint32_t metalFxFullPerEyeHeight{0};
+  std::unique_ptr<MetalFxUpscaler> metalFxUpscaler;
   std::mutex mutex;
 
   EncoderStatsSnapshot encoderStatsSnapshot() const noexcept {

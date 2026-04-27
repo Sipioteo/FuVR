@@ -340,25 +340,38 @@ XrResult xrEnumerateViewConfigurationViews_impl(
                             ? caps.perEyeWidth : 2064u;
   uint32_t recH = (caps.valid && caps.perEyeHeight != 0)
                             ? caps.perEyeHeight : 2208u;
-  // FUVR_RT_RENDER_SCALE: optionally scale the per-eye render resolution
-  // Blender will use. Same env var read in session.cpp at session-start
-  // time; both call sites must agree so encoder dims match what Blender
-  // actually renders into. Default 1.0; clamp [0.25, 1.0]; round to
-  // even (HEVC/H.264 requirement).
-  const float renderScale = []() {
-    const char* env = std::getenv("FUVR_RT_RENDER_SCALE");
-    if (env == nullptr || *env == '\0') return 1.0f;
-    const float v = std::strtof(env, nullptr);
-    if (v < 0.25f || v > 1.0f) return 1.0f;
-    return v;
-  }();
-  if (renderScale < 0.999f) {
-    auto scaleEven = [renderScale](uint32_t v) {
-      uint32_t out = static_cast<uint32_t>(v * renderScale);
-      return (out + 1u) & ~1u;
-    };
-    recW = scaleEven(recW);
-    recH = scaleEven(recH);
+  // FUVR_RT_RENDER_SCALE{,_X,_Y}: scale the per-eye render resolution
+  // Blender uses. Per-axis variants override the uniform scale so the
+  // user can drop horizontal resolution (where lens distortion already
+  // compresses pixels) without sacrificing vertical sharpness. Both
+  // call sites (instance.cpp + session.cpp) must agree so encoder dims
+  // match what Blender actually renders into. All defaults 1.0; clamp
+  // [0.25, 1.0]; round up to even (HEVC/H.264 requirement).
+  auto readScale = [](const char* env, float fallback) -> float {
+    const char* v = std::getenv(env);
+    if (v == nullptr || *v == '\0') return fallback;
+    const float f = std::strtof(v, nullptr);
+    if (f < 0.25f || f > 1.0f) return fallback;
+    return f;
+  };
+  float uniformScale = readScale("FUVR_RT_RENDER_SCALE", 1.0f);
+  float scaleX = readScale("FUVR_RT_RENDER_SCALE_X", uniformScale);
+  float scaleY = readScale("FUVR_RT_RENDER_SCALE_Y", uniformScale);
+  // METALFX: when spatial upscaling is enabled, Blender renders half-res
+  // and the runtime upscales before encode. We must report the half dim
+  // here so Blender allocates half-res swapchain textures (matching what
+  // it actually renders into). Session.cpp keeps the encoder side at full
+  // dim — the asymmetry is intentional.
+  if (const char* mfx = std::getenv("FUVR_RT_METALFX")) {
+    if (std::strcmp(mfx, "spatial") == 0) {
+      if (scaleX > 0.5f) scaleX = 0.5f;
+      if (scaleY > 0.5f) scaleY = 0.5f;
+    }
+  }
+  if (scaleX < 0.999f || scaleY < 0.999f) {
+    auto roundEven = [](uint32_t v) { return (v + 1u) & ~1u; };
+    recW = roundEven(static_cast<uint32_t>(recW * scaleX));
+    recH = roundEven(static_cast<uint32_t>(recH * scaleY));
   }
   // TODO: Quest reports max separately via XrViewConfigurationView; thread
   // that through helloFromQuest. For now we expose recommended as max too.
