@@ -57,6 +57,31 @@ enum Cmd {
         #[arg(long, default_value_t = 5)]
         timeout: u64,
     },
+    /// Pretend to be a Quest: TCP-connect to 127.0.0.1:PORT, send
+    /// helloFromQuest, then receive video fragments, reassemble Annex-B HEVC
+    /// access units, and pipe them into `ffplay` so you can watch what the
+    /// real headset would see in a 2D window. Pair with `feed-quest`
+    /// (synthetic) or with the live daemon (Blender / vdisplay).
+    FakeQuest {
+        #[arg(long, default_value_t = 9943)]
+        port: u16,
+        /// Per-eye width to advertise in helloFromQuest.
+        #[arg(long, default_value_t = 2064)]
+        per_eye_width: u32,
+        /// Per-eye height to advertise in helloFromQuest.
+        #[arg(long, default_value_t = 2208)]
+        per_eye_height: u32,
+        /// Refresh rate to advertise (Hz).
+        #[arg(long, default_value_t = 90)]
+        fps: u32,
+        /// Optional path to ALSO write the reassembled HEVC Annex-B stream
+        /// (so you can replay it later with ffplay/QuickTime).
+        #[arg(long)]
+        out: Option<String>,
+        /// Skip launching ffplay (just print stats / write to --out).
+        #[arg(long, default_value_t = false)]
+        no_player: bool,
+    },
     /// Listen on TCP 9943 and stream a pre-encoded HEVC Annex-B file to
     /// the connected Quest as a debug test pattern. Loops the file forever.
     FeedQuest {
@@ -100,6 +125,9 @@ async fn main() -> Result<()> {
         Cmd::MdnsBrowse { timeout } => mdns_browse(timeout).await,
         Cmd::FeedQuest { hevc, width, height, fps, bitrate } => {
             feed_quest(hevc, width, height, fps, bitrate).await
+        }
+        Cmd::FakeQuest { port, per_eye_width, per_eye_height, fps, out, no_player } => {
+            fake_quest(port, per_eye_width, per_eye_height, fps, out, no_player).await
         }
     }
 }
@@ -228,6 +256,196 @@ async fn feed_quest(
         let _ = drain.await;
         println!("Quest disconnected; waiting for next connection...");
     }
+}
+
+async fn fake_quest(
+    port: u16,
+    per_eye_width: u32,
+    per_eye_height: u32,
+    fps: u32,
+    out: Option<String>,
+    no_player: bool,
+) -> Result<()> {
+    use ::capnp::message::{Builder, HeapAllocator, ReaderOptions};
+    use ::capnp::serialize_packed;
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use transport_core::proto as wire;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("connecting to 127.0.0.1:{port}"))?;
+    println!("fake-quest: connected to 127.0.0.1:{port}");
+
+    // helloFromQuest
+    let mut hello = Builder::<HeapAllocator>::new_default();
+    {
+        let mut ctrl = hello.init_root::<wire::control_message::Builder>();
+        let mut caps = ctrl.reborrow().init_hello_from_quest();
+        caps.set_device_model("Fake Quest 3 (Mac)");
+        caps.set_system_version("fake");
+        caps.set_per_eye_width(per_eye_width);
+        caps.set_per_eye_height(per_eye_height);
+        {
+            let mut rates = caps.reborrow().init_refresh_rates_hz(1);
+            rates.set(0, fps);
+        }
+        {
+            let mut codecs = caps.reborrow().init_supported_codecs(2);
+            codecs.set(0, wire::VideoCodec::Hevc);
+            codecs.set(1, wire::VideoCodec::H264);
+        }
+        caps.set_has_hand_tracking(false);
+        caps.set_has_eye_tracking(false);
+    }
+    let mut hello_bytes = Vec::new();
+    serialize_packed::write_message(&mut hello_bytes, &hello)?;
+    let hello_frame = transport_core::wire::encode_usb_frame(
+        transport_core::channel::Channel::Control as u8,
+        &hello_bytes,
+    );
+    sock.write_all(&hello_frame).await?;
+    println!("fake-quest: sent helloFromQuest ({}x{} @ {fps}Hz)", per_eye_width, per_eye_height);
+
+    // ffplay subprocess (low-latency HEVC)
+    let mut player = if no_player {
+        None
+    } else {
+        match Command::new("ffplay")
+            .args([
+                "-hide_banner",
+                "-loglevel", "warning",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-framedrop",
+                "-probesize", "32",
+                "-analyzeduration", "0",
+                "-window_title", "fake-quest",
+                "-f", "hevc",
+                "-i", "pipe:0",
+            ])
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => {
+                println!("fake-quest: spawned ffplay (close the window to quit)");
+                Some(child)
+            }
+            Err(e) => {
+                eprintln!("fake-quest: ffplay spawn failed ({e}); continuing without player");
+                None
+            }
+        }
+    };
+    let mut player_stdin = player.as_mut().and_then(|c| c.stdin.take());
+
+    let mut out_file = match out.as_deref() {
+        Some(p) => Some(std::fs::File::create(p).with_context(|| format!("creating {p}"))?),
+        None => None,
+    };
+
+    // Reassembly buffer: frame_id -> (fragments_seen, total_count, bytes)
+    struct Pending {
+        seen: u32,
+        total: u32,
+        bytes: Vec<u8>,
+    }
+    let mut pending: HashMap<u64, Pending> = HashMap::new();
+    let mut total_frames: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut last_log = Instant::now();
+
+    // Read loop: [u32 BE total_len][u8 channel][payload].
+    let mut hdr = [0u8; 4];
+    loop {
+        if sock.read_exact(&mut hdr).await.is_err() {
+            println!("fake-quest: peer closed");
+            break;
+        }
+        let total_len = u32::from_be_bytes(hdr) as usize;
+        if total_len == 0 || total_len > 64 * 1024 * 1024 {
+            anyhow::bail!("fake-quest: unreasonable frame length {total_len}");
+        }
+        let mut buf = vec![0u8; total_len];
+        sock.read_exact(&mut buf).await.context("read frame body")?;
+        let channel = buf[0];
+        let payload = &buf[1..];
+
+        match transport_core::channel::Channel::try_from(channel) {
+            Ok(transport_core::channel::Channel::Control) => {
+                println!("fake-quest: control frame ({} bytes)", payload.len());
+            }
+            Ok(transport_core::channel::Channel::Video) => {
+                // [packed VideoFragmentHeader][raw NAL bytes]
+                let mut cursor = std::io::Cursor::new(payload);
+                let reader = match serialize_packed::read_message(&mut cursor, ReaderOptions::new())
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("fake-quest: bad video header capnp: {e}");
+                        continue;
+                    }
+                };
+                let h: wire::video_fragment_header::Reader = reader.get_root()?;
+                let frame_id = h.get_frame_id();
+                let total = h.get_fragment_count().max(1);
+                let idx = h.get_fragment_index();
+                let pos = cursor.position() as usize;
+                let nal = &payload[pos..];
+
+                let entry = pending.entry(frame_id).or_insert_with(|| Pending {
+                    seen: 0,
+                    total,
+                    bytes: Vec::with_capacity(nal.len() * total as usize),
+                });
+                entry.bytes.extend_from_slice(nal);
+                entry.seen += 1;
+                let _ = idx;
+
+                let end_of_frame = (h.get_flags() & 0x2) != 0;
+                if entry.seen >= entry.total || end_of_frame {
+                    let pending_entry = pending.remove(&frame_id).unwrap();
+                    total_frames += 1;
+                    total_bytes += pending_entry.bytes.len() as u64;
+
+                    if let Some(stdin) = player_stdin.as_mut() {
+                        if stdin.write_all(&pending_entry.bytes).is_err() {
+                            println!("fake-quest: ffplay closed; dropping further frames to player");
+                            player_stdin = None;
+                        }
+                    }
+                    if let Some(f) = out_file.as_mut() {
+                        let _ = f.write_all(&pending_entry.bytes);
+                    }
+                }
+
+                if last_log.elapsed() >= Duration::from_secs(1) {
+                    println!(
+                        "fake-quest: {} frames decoded, {:.2} MB total, {} pending reassembly",
+                        total_frames,
+                        total_bytes as f64 / (1024.0 * 1024.0),
+                        pending.len()
+                    );
+                    last_log = Instant::now();
+                }
+            }
+            Ok(other) => {
+                println!("fake-quest: ignoring channel {:?} ({} bytes)", other, payload.len());
+            }
+            Err(_) => {
+                eprintln!("fake-quest: invalid channel id {channel}");
+            }
+        }
+    }
+
+    if let Some(mut child) = player {
+        drop(player_stdin);
+        let _ = child.wait();
+    }
+    Ok(())
 }
 
 fn split_annexb(buf: &[u8]) -> Vec<&[u8]> {

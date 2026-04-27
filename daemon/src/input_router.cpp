@@ -5,6 +5,7 @@
 
 #include <capnp/message.h>
 #include <capnp/serialize-packed.h>
+#include <capnp/serialize.h>
 #include <kj/io.h>
 
 #include "fuvr.capnp.h"
@@ -105,9 +106,9 @@ bool InputRouter::ingestPackedUpstreamFrame(const uint8_t* data, std::size_t len
         snap.setQuestClockNs(questClock);
         writeController(snap.initLeft(),  left);
         writeController(snap.initRight(), right);
-        kj::VectorOutputStream os;
-        ::capnp::writePackedMessage(os, out);
-        auto bytes = os.getArray();
+        // Why: runtime reads envelopes flat (see daemon_client.cpp).
+        kj::Array<::capnp::word> flat = ::capnp::messageToFlatArray(out);
+        auto bytes = flat.asBytes();
         cb(bytes.begin(), bytes.size());
     }
     return true;

@@ -29,10 +29,12 @@ uint64_t nowNs() {
 }
 
 void writePacked(::capnp::MessageBuilder& mb, std::vector<uint8_t>& out) {
-    kj::VectorOutputStream os;
-    ::capnp::writePackedMessage(os, mb);
-    auto a = os.getArray();
-    out.assign(a.begin(), a.end());
+    // Why: runtime reads daemon→runtime envelopes with FlatArrayMessageReader
+    // (see runtime-macos/src/daemon_client.cpp), so we MUST emit flat (unpacked)
+    // capnp here. Name kept for source diff minimization; semantics are flat.
+    kj::Array<::capnp::word> flat = ::capnp::messageToFlatArray(mb);
+    auto bytes = flat.asBytes();
+    out.assign(bytes.begin(), bytes.end());
 }
 }
 

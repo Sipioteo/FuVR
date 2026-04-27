@@ -51,11 +51,13 @@ public:
         ::capnp::writePackedMessage(os, hdrMsg);
         auto hdrBytes = os.getArray();
 
+        // Wire format on the Video channel: [packed VideoFragmentHeader][raw NAL bytes].
+        // Per quest-app/proto_codec.hpp::decode_video_header, the receiver parses
+        // the packed header from offset 0 and the codec payload follows immediately.
+        // Earlier code prepended a u32 LE hdrLen which no client knew how to skip,
+        // so every video frame was discarded as malformed.
         std::vector<uint8_t> wire;
-        wire.reserve(hdrBytes.size() + 4 + f.size);
-        uint32_t hdrLen = static_cast<uint32_t>(hdrBytes.size());
-        wire.insert(wire.end(), reinterpret_cast<uint8_t*>(&hdrLen),
-                    reinterpret_cast<uint8_t*>(&hdrLen) + sizeof(hdrLen));
+        wire.reserve(hdrBytes.size() + f.size);
         wire.insert(wire.end(), hdrBytes.begin(), hdrBytes.end());
         wire.insert(wire.end(), f.data, f.data + f.size);
 

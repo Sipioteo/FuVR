@@ -3,6 +3,7 @@
 
 #include <capnp/message.h>
 #include <capnp/serialize-packed.h>
+#include <capnp/serialize.h>
 #include <kj/array.h>
 #include <kj/io.h>
 
@@ -100,9 +101,9 @@ void PoseRouter::dispatchSnapshot(uint64_t sessionId,
         auto snap = e.getBody().initPoseSnapshot();
         fillSnapshot(snap, receivedAtNs, questTimestampNs, predictedDisplayTimeNs,
                      left, right, linVel, angVel, leftCtrl, rightCtrl);
-        kj::VectorOutputStream os;
-        ::capnp::writePackedMessage(os, out);
-        auto bytes = os.getArray();
+        // Why: runtime reads envelopes flat (see daemon_client.cpp).
+        kj::Array<::capnp::word> flat = ::capnp::messageToFlatArray(out);
+        auto bytes = flat.asBytes();
         cb(bytes.begin(), bytes.size());
     }
 }

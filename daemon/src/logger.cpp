@@ -8,6 +8,7 @@
 
 #include <capnp/message.h>
 #include <capnp/serialize-packed.h>
+#include <capnp/serialize.h>
 #include <kj/io.h>
 
 #include "fuvrd.capnp.h"
@@ -42,10 +43,10 @@ void encodeEnvelope(uint64_t streamId, const LogEntry& e, std::vector<uint8_t>& 
     ll.setLevel(static_cast<uint8_t>(e.level));
     ll.setModule(e.module);
     ll.setMessage(e.message);
-    kj::VectorOutputStream os;
-    ::capnp::writePackedMessage(os, mb);
-    auto a = os.getArray();
-    out.assign(a.begin(), a.end());
+    // Why: runtime reads envelopes flat (see daemon_client.cpp).
+    kj::Array<::capnp::word> flat = ::capnp::messageToFlatArray(mb);
+    auto bytes = flat.asBytes();
+    out.assign(bytes.begin(), bytes.end());
 }
 } // namespace
 
