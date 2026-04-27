@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#define XR_USE_PLATFORM_ANDROID 1
+#define XR_USE_GRAPHICS_API_OPENGL_ES 1
+
+#include <EGL/egl.h>
+#include <GLES3/gl32.h>
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+
+#include <array>
+#include <cstdint>
+#include <vector>
+
+struct android_app;
+
+namespace fuvr {
+
+class Compositor;
+
+struct ViewSnapshot {
+    XrPosef pose{};
+    XrFovf fov{};
+};
+
+class OpenXrSession {
+public:
+    bool create(android_app* app);
+    void destroy();
+
+    void poll_events();
+    bool is_running() const { return running_; }
+
+    void begin_frame();
+    void end_frame(Compositor& compositor);
+
+    // Used by pose forwarder.
+    XrInstance instance() const { return instance_; }
+    XrSession session() const { return session_; }
+    XrSpace stage_space() const { return stage_space_; }
+    XrSpace view_space() const { return view_space_; }
+    XrSpace hand_space(int hand) const { return hand_spaces_[hand]; }
+    XrTime predicted_display_time() const { return predicted_display_time_; }
+
+    const std::array<ViewSnapshot, 2>& last_views() const { return last_views_; }
+    const std::array<XrCompositionLayerProjectionView, 2>& projection_views() const { return projection_views_; }
+
+private:
+    bool init_loader(android_app* app);
+    bool create_instance();
+    bool create_system_and_session(android_app* app);
+    bool create_spaces();
+    bool create_action_set();
+
+    XrInstance instance_{XR_NULL_HANDLE};
+    XrSystemId system_id_{XR_NULL_SYSTEM_ID};
+    XrSession session_{XR_NULL_HANDLE};
+    XrSpace stage_space_{XR_NULL_HANDLE};
+    XrSpace view_space_{XR_NULL_HANDLE};
+    std::array<XrSpace, 2> hand_spaces_{XR_NULL_HANDLE, XR_NULL_HANDLE};
+
+    XrActionSet action_set_{XR_NULL_HANDLE};
+    XrAction pose_action_{XR_NULL_HANDLE};
+    XrAction trigger_action_{XR_NULL_HANDLE};
+    XrAction grip_action_{XR_NULL_HANDLE};
+    XrAction thumbstick_action_{XR_NULL_HANDLE};
+    XrAction button_a_action_{XR_NULL_HANDLE};
+    XrAction button_b_action_{XR_NULL_HANDLE};
+
+    XrSessionState session_state_{XR_SESSION_STATE_UNKNOWN};
+    bool running_{false};
+    bool frame_in_flight_{false};
+
+    XrFrameState frame_state_{XR_TYPE_FRAME_STATE};
+    XrTime predicted_display_time_{0};
+
+    std::array<ViewSnapshot, 2> last_views_{};
+    std::array<XrCompositionLayerProjectionView, 2> projection_views_{};
+    std::vector<XrViewConfigurationView> view_configs_;
+};
+
+}

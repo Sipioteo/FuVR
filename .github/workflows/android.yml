@@ -1,0 +1,73 @@
+name: android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'quest-app/**'
+      - 'proto/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'quest-app/**'
+      - 'proto/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install capnp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto libcapnp-dev
+
+      - name: Generate proto bindings
+        run: ./scripts/gen-proto.sh
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK r26d
+        run: |
+          yes | sdkmanager --install "ndk;26.3.11579264" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('quest-app/**/*.gradle*', 'quest-app/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Verify Gradle wrapper
+        working-directory: quest-app
+        run: |
+          if [ ! -x ./gradlew ]; then
+            chmod +x ./gradlew || true
+          fi
+          if [ ! -f ./gradlew ] || [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "::error::quest-app Gradle wrapper not yet present"
+            exit 1
+          fi
+
+      - name: assembleDebug
+        working-directory: quest-app
+        run: ./gradlew assembleDebug --no-daemon

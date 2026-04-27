@@ -1,0 +1,19 @@
+[package]
+name = "transport-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+transport-core = { path = "../transport-core" }
+transport-usb = { path = "../transport-usb" }
+transport-udp = { path = "../transport-udp" }
+bytes.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true

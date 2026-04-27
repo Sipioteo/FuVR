@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Minimal gradle wrapper launcher placeholder.
+# Replace with the official wrapper produced by `gradle wrapper --gradle-version 8.7`.
+exec gradle "$@"

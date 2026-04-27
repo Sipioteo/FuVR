@@ -1,0 +1,53 @@
+name: proto-check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'proto/**'
+      - 'scripts/gen-proto.sh'
+      - '.github/workflows/proto-check.yml'
+  pull_request:
+    paths:
+      - 'proto/**'
+      - 'scripts/gen-proto.sh'
+      - '.github/workflows/proto-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proto-check-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install capnp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto libcapnp-dev
+
+      - name: Install capnpc-rust
+        run: |
+          if command -v cargo >/dev/null 2>&1; then
+            cargo install capnpc --locked
+          fi
+
+      - name: Generate bindings
+        run: ./scripts/gen-proto.sh
+
+      # Wire-compatibility guard: any rotation of the schema id silently breaks
+      # every deployed Mac/Quest pair, so we pin it explicitly here.
+      - name: Verify schema id is pinned
+        run: |
+          expected='@0xb1f5d4f7c2a830e5'
+          if ! grep -q "$expected;" proto/fuvr.capnp; then
+            echo "::error::proto/fuvr.capnp schema id has changed; expected $expected"
+            grep '^@0x' proto/fuvr.capnp || true
+            exit 1
+          fi

@@ -1,0 +1,75 @@
+name: macos-cmake
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-cmake-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Homebrew prefix
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/homebrew/Cellar/capnp
+            /opt/homebrew/Cellar/ninja
+            /opt/homebrew/Cellar/pkg-config
+          key: brew-${{ matrix.os }}-capnp-ninja-pkgconfig-v1
+
+      - name: Install build tools
+        run: |
+          brew update >/dev/null
+          brew install capnp ninja pkg-config
+
+      - name: Generate Cap'n Proto bindings
+        run: ./scripts/gen-proto.sh
+
+      - name: Verify CMake project exists
+        id: cmake_check
+        run: |
+          if [ -f CMakeLists.txt ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Top-level CMakeLists.txt not found"
+            exit 1
+          fi
+
+      - name: Cache CMake FetchContent build dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps
+          key: cmake-fetchcontent-${{ matrix.os }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+          restore-keys: |
+            cmake-fetchcontent-${{ matrix.os }}-
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        working-directory: build
+        run: |
+          if [ -f CTestTestfile.cmake ]; then
+            ctest --output-on-failure
+          else
+            echo "no CTest tests registered; skipping"
+          fi

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <uses-feature android:glEsVersion="0x00030002" android:required="true" />
+    <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1" />
+    <uses-feature android:name="org.khronos.openxr" android:required="true" />
+
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:label="FuVR Quest"
+        android:hasCode="true"
+        android:debuggable="true"
+        tools:ignore="HardcodedDebugMode,MissingApplicationIcon">
+
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|quest3|questpro" />
+        <meta-data android:name="com.oculus.intent.category.VR" android:value="vr_only" />
+
+        <activity
+            android:name=".MainActivity"
+            android:label="FuVR Quest"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|uiMode|navigation|screenLayout|density"
+            android:resizeableActivity="false"
+            android:excludeFromRecents="false"
+            android:exported="true">
+
+            <meta-data android:name="android.app.lib_name" android:value="fuvr_quest" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

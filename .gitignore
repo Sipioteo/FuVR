@@ -1,0 +1,36 @@
+# Build outputs
+build/
+cmake-build-*/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Android / Gradle
+.gradle/
+quest-app/.gradle/
+quest-app/build/
+quest-app/app/build/
+quest-app/local.properties
+*.iml
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+*.xcodeproj/
+
+# macOS
+.DS_Store
+
+# Generated protocol code
+proto/gen/
+
+# Editors
+.idea/
+.vscode/
+*.swp

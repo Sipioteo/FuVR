@@ -1,0 +1,8 @@
+# CODEOWNERS — placeholder until governance lands (see SPEC.md §8).
+# Replace `@luminos-srl` with the real GitHub org/team once created.
+# Until then, all reviews route to the placeholder owner.
+
+* @luminos-srl
+
+# Wire-format and cross-component contracts require an extra review.
+proto/* @luminos-srl @maintainers

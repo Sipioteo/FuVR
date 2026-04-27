@@ -1,0 +1,22 @@
+[package]
+name = "transport-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fuvr-transport"
+path = "src/main.rs"
+
+[dependencies]
+transport-core = { path = "../transport-core" }
+transport-usb = { path = "../transport-usb" }
+transport-udp = { path = "../transport-udp" }
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

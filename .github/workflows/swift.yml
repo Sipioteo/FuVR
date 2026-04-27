@@ -1,0 +1,39 @@
+name: swift
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mac-app/**'
+      - '.github/workflows/swift.yml'
+  pull_request:
+    paths:
+      - 'mac-app/**'
+      - '.github/workflows/swift.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Swift package present
+        run: |
+          if [ ! -f mac-app/Package.swift ]; then
+            echo "::error::mac-app/Package.swift not found"
+            exit 1
+          fi
+
+      - name: swift build
+        run: swift build --package-path mac-app
+
+      - name: swift test
+        run: swift test --package-path mac-app

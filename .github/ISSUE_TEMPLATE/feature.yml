@@ -1,0 +1,50 @@
+name: Feature request
+description: Propose a new capability or enhancement
+title: "[feature] "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user-visible problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Affected component
+      multiple: true
+      options:
+        - runtime-macos
+        - encoder-macos
+        - transport
+        - quest-app
+        - mac-app
+        - virtual-display-helper
+        - proto
+        - docs / CI
+    validations:
+      required: true
+  - type: input
+    id: spec_section
+    attributes:
+      label: Related SPEC.md section
+      placeholder: "§3.1.3"
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: I agree to follow this project's Code of Conduct.
+          required: true

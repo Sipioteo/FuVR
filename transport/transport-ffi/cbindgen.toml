@@ -1,0 +1,14 @@
+language = "C"
+header = "// SPDX-License-Identifier: Apache-2.0"
+include_guard = "FUVR_TRANSPORT_H"
+cpp_compat = true
+pragma_once = true
+no_includes = false
+sys_includes = ["stdint.h", "stddef.h", "stdbool.h"]
+documentation = false
+
+[parse]
+parse_deps = false
+
+[export]
+prefix = "Fuvr"

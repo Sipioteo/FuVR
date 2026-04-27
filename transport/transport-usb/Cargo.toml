@@ -1,0 +1,17 @@
+[package]
+name = "transport-usb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+transport-core = { path = "../transport-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tracing.workspace = true
+async-trait.workspace = true

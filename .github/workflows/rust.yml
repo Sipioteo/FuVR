@@ -1,0 +1,65 @@
+name: rust
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'transport/**'
+      - 'proto/**'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'transport/**'
+      - 'proto/**'
+      - '.github/workflows/rust.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: transport
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install capnp (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto libcapnp-dev
+
+      - name: Install capnp (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: transport
+
+      - name: Install capnpc-rust
+        run: cargo install capnpc --locked
+
+      - name: Generate proto bindings
+        working-directory: ${{ github.workspace }}
+        run: ./scripts/gen-proto.sh
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-features
