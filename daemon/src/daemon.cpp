@@ -152,6 +152,31 @@ void Daemon::handleControlMessage(const uint8_t* data, std::size_t len) {
         clockSync_.onPong(p.getT0(), p.getT1(), p.getT2());
         return;
     }
+    if (cm.which() == ::fuvr::proto::ControlMessage::HELLO_FROM_QUEST) {
+        // Why: cache the headset's self-reported capabilities so the runtime
+        // can fetch them via getDeviceCapabilities and stop hardcoding Quest 3
+        // values (perEye, refresh rates, hand/eye tracking).
+        auto h = cm.getHelloFromQuest();
+        CachedCapabilities next;
+        next.valid = true;
+        next.deviceModel = h.getDeviceModel().cStr();
+        next.systemVersion = h.getSystemVersion().cStr();
+        next.perEyeWidth = h.getPerEyeWidth();
+        next.perEyeHeight = h.getPerEyeHeight();
+        auto rates = h.getRefreshRatesHz();
+        next.refreshRatesHz.reserve(rates.size());
+        for (auto r : rates) next.refreshRatesHz.push_back(r);
+        next.hasHandTracking = h.getHasHandTracking();
+        next.hasEyeTracking = h.getHasEyeTracking();
+        FUVR_LOG_INFO("daemon",
+                      "helloFromQuest: model='%s' perEye=%ux%u rates=%zu hand=%d eye=%d",
+                      next.deviceModel.c_str(), next.perEyeWidth,
+                      next.perEyeHeight, next.refreshRatesHz.size(),
+                      (int)next.hasHandTracking, (int)next.hasEyeTracking);
+        std::lock_guard lk(capsMu_);
+        caps_ = std::move(next);
+        return;
+    }
     if (cm.which() == ::fuvr::proto::ControlMessage::ERROR) {
         auto txt = cm.getError();
         std::string_view sv(txt.cStr(), txt.size());
@@ -352,8 +377,16 @@ void Daemon::onEnvelope(const InboundRpc& rpc) {
             req.getRenderedRightRotX(), req.getRenderedRightRotY(),
             req.getRenderedRightRotZ(), req.getRenderedRightRotW(),
         };
+        float leftFov[4] = {
+            req.getRenderedLeftFovAngleLeft(),  req.getRenderedLeftFovAngleRight(),
+            req.getRenderedLeftFovAngleUp(),    req.getRenderedLeftFovAngleDown(),
+        };
+        float rightFov[4] = {
+            req.getRenderedRightFovAngleLeft(),  req.getRenderedRightFovAngleRight(),
+            req.getRenderedRightFovAngleUp(),    req.getRenderedRightFovAngleDown(),
+        };
         s->submitFrame(pb, req.getFrameId(), req.getRenderStartNs(),
-                       req.getForceIdr(), left, right);
+                       req.getForceIdr(), left, right, leftFov, rightFov);
         CFRelease(pb);
         reply([&](auto e) { e.getBody().setOk(); });
         break;
@@ -418,6 +451,32 @@ void Daemon::onEnvelope(const InboundRpc& rpc) {
         reply([&](auto e) {
             e.setStreamId(sid);
             e.getBody().setOk();
+        });
+        break;
+    }
+    case ::fuvr::daemon::Envelope::Body::GET_DEVICE_CAPABILITIES: {
+        // Why: lets the runtime fetch the latest helloFromQuest snapshot so
+        // it can replace its hardcoded Quest 3 defaults with values reflecting
+        // the actual headset (perEye dims, supported refresh rates, hand/eye
+        // tracking presence). If no Quest has connected yet, the response
+        // carries `valid = false` and the runtime keeps its safe defaults.
+        CachedCapabilities snap;
+        {
+            std::lock_guard lk(capsMu_);
+            snap = caps_;
+        }
+        reply([&](auto e) {
+            auto r = e.getBody().initDeviceCapabilitiesResponse();
+            r.setValid(snap.valid);
+            r.setDeviceModel(snap.deviceModel);
+            r.setSystemVersion(snap.systemVersion);
+            r.setPerEyeWidth(snap.perEyeWidth);
+            r.setPerEyeHeight(snap.perEyeHeight);
+            auto rates = r.initRefreshRatesHz(static_cast<unsigned>(snap.refreshRatesHz.size()));
+            for (size_t i = 0; i < snap.refreshRatesHz.size(); ++i)
+                rates.set(static_cast<unsigned>(i), snap.refreshRatesHz[i]);
+            r.setHasHandTracking(snap.hasHandTracking);
+            r.setHasEyeTracking(snap.hasEyeTracking);
         });
         break;
     }

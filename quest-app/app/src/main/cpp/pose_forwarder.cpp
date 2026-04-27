@@ -72,12 +72,35 @@ void PoseForwarder::run() {
             xr_.sync_actions();
             xr_.capture_local_origin_if_needed(t);
 
-            XrSpaceLocation hand_loc[2] = {{XR_TYPE_SPACE_LOCATION}, {XR_TYPE_SPACE_LOCATION}};
+            // Hand poses with velocity. ALVR / Carmack: the headset runtime
+            // owns the IMU integrator; its velocity is dramatically cleaner
+            // than any finite-difference computed from sparse view samples.
+            // Chain XrSpaceVelocity to xrLocateSpace so the runtime fills
+            // linearVelocity / angularVelocity straight from the IMU Kalman.
+            XrSpaceVelocity hand_vel[2] = {{XR_TYPE_SPACE_VELOCITY}, {XR_TYPE_SPACE_VELOCITY}};
+            XrSpaceLocation hand_loc[2] = {{XR_TYPE_SPACE_LOCATION, &hand_vel[0]},
+                                           {XR_TYPE_SPACE_LOCATION, &hand_vel[1]}};
             for (int i = 0; i < 2; ++i) {
                 if (xr_.hand_space(i) != XR_NULL_HANDLE) {
                     xrLocateSpace(xr_.hand_space(i), xr_.stage_space(), t, &hand_loc[i]);
                 }
             }
+
+            // Head velocity: locate view_space (HMD center) against stage to
+            // get the canonical Meta-IMU linear/angular velocity. Note we use
+            // the **same** velocity for both eyes since rotational velocity is
+            // shared at the head and IPD-driven linear velocity contribution
+            // is below sensor noise. This is exactly how OVR / VrApi and ALVR
+            // derive head velocity for the streaming case.
+            XrSpaceVelocity head_vel{XR_TYPE_SPACE_VELOCITY};
+            XrSpaceLocation head_loc{XR_TYPE_SPACE_LOCATION, &head_vel};
+            if (xr_.view_space() != XR_NULL_HANDLE && xr_.stage_space() != XR_NULL_HANDLE) {
+                xrLocateSpace(xr_.view_space(), xr_.stage_space(), t, &head_loc);
+            }
+            const bool head_lin_valid =
+                (head_vel.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) != 0;
+            const bool head_ang_valid =
+                (head_vel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) != 0;
 
             const auto& views = xr_.last_views();
 
@@ -87,12 +110,32 @@ void PoseForwarder::run() {
             f.hmd.predictedDisplayTimeNs = (uint64_t)t;
             f.hmd.leftView  = to_plain(views[0].pose, views[0].fov);
             f.hmd.rightView = to_plain(views[1].pose, views[1].fov);
+            if (head_lin_valid) {
+                f.hmd.linVelX = head_vel.linearVelocity.x;
+                f.hmd.linVelY = head_vel.linearVelocity.y;
+                f.hmd.linVelZ = head_vel.linearVelocity.z;
+            }
+            if (head_ang_valid) {
+                f.hmd.angVelX = head_vel.angularVelocity.x;
+                f.hmd.angVelY = head_vel.angularVelocity.y;
+                f.hmd.angVelZ = head_vel.angularVelocity.z;
+            }
 
             for (int i = 0; i < 2; ++i) {
                 f.controllers[i].hand = i;
                 f.controllers[i].isActive =
                     (hand_loc[i].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
                 f.controllers[i].pose = to_plain(hand_loc[i].pose);
+                if (hand_vel[i].velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) {
+                    f.controllers[i].linVelX = hand_vel[i].linearVelocity.x;
+                    f.controllers[i].linVelY = hand_vel[i].linearVelocity.y;
+                    f.controllers[i].linVelZ = hand_vel[i].linearVelocity.z;
+                }
+                if (hand_vel[i].velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) {
+                    f.controllers[i].angVelX = hand_vel[i].angularVelocity.x;
+                    f.controllers[i].angVelY = hand_vel[i].angularVelocity.y;
+                    f.controllers[i].angVelZ = hand_vel[i].angularVelocity.z;
+                }
 
                 ActionStateBundle bundle;
                 if (xr_.read_action_state(i, bundle)) {

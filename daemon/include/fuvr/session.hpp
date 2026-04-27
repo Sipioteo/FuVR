@@ -61,7 +61,9 @@ public:
                      uint64_t renderStartNs,
                      bool forceIdr,
                      const float renderedLeft[7],
-                     const float renderedRight[7]);
+                     const float renderedRight[7],
+                     const float renderedLeftFov[4] = nullptr,
+                     const float renderedRightFov[4] = nullptr);
 
     // Test hook: feed synthetic encoded fragments straight into the FrameSink
     // path so tests can exercise EncodeStats fan-out and Metrics aggregation

@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "input_packer.hpp"
@@ -108,6 +109,25 @@ private:
 public:
     XrAction haptic_action() const { return haptic_action_; }
     const std::vector<XrViewConfigurationView>& view_configs() const { return view_configs_; }
+
+    // Headset capability snapshot, populated lazily from OpenXR queries the
+    // first time this is called. Used by ProtocolRouter to build a
+    // helloFromQuest with values reflecting the actual headset (recommended
+    // per-eye render dims, supported display refresh rates via
+    // XR_FB_display_refresh_rate, system name/vendor, hand-tracking presence
+    // via XR_EXT_hand_tracking system properties).
+    struct CapabilitiesSnapshot {
+        std::string deviceModel;       // XrSystemProperties.systemName
+        std::string systemVersion;     // empty for now (no portable source)
+        uint32_t perEyeWidth{0};       // recommendedImageRectWidth
+        uint32_t perEyeHeight{0};      // recommendedImageRectHeight
+        uint32_t maxPerEyeWidth{0};    // maxImageRectWidth
+        uint32_t maxPerEyeHeight{0};   // maxImageRectHeight
+        std::vector<uint32_t> refreshRatesHz;
+        bool hasHandTracking{false};
+        bool hasEyeTracking{false};
+    };
+    CapabilitiesSnapshot query_capabilities();
 
 private:
 

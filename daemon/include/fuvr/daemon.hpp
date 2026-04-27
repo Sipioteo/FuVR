@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "fuvr/clock_sync.hpp"
 #include "fuvr/input_router.hpp"
@@ -68,6 +70,25 @@ private:
     std::mutex qMetricsMu_;
     float qDecoderFps_         = 0.0f;
     float qDecoderDecodeMsP95_ = 0.0f;
+
+    // Latest device capabilities reported by the Quest's `helloFromQuest` on
+    // the control channel. Initially `valid = false` until a Quest connects.
+    // Runtime queries this via the `getDeviceCapabilities` RPC so it can stop
+    // hardcoding Quest 3 values and adapt to the actual headset (Quest 2/3/3S/
+    // Pro/future). Mutex-protected because helloFromQuest arrives on the
+    // transport thread and getDeviceCapabilities is served on the RPC thread.
+    struct CachedCapabilities {
+        bool valid = false;
+        std::string deviceModel;
+        std::string systemVersion;
+        uint32_t perEyeWidth = 0;
+        uint32_t perEyeHeight = 0;
+        std::vector<uint32_t> refreshRatesHz;
+        bool hasHandTracking = false;
+        bool hasEyeTracking = false;
+    };
+    std::mutex capsMu_;
+    CachedCapabilities caps_;
 
     FuvrTransport* transport_ = nullptr;
     std::unique_ptr<IOSurfaceXpcService> xpcService_;

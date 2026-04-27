@@ -13,6 +13,10 @@ using fuvr::runtime::Vec3;
 
 namespace {
 
+// Default sample: IMU-derived velocity = 10 m/s along +X, matching the
+// position progression used in the LinearExtrapolation test (x advances by
+// 0.1 every 10 ms ⇒ 10 m/s). Tests that need the no-IMU-velocity fallback
+// path explicitly zero linearVelocity / angularVelocity.
 PoseSample makeSample(uint64_t t, float x) {
   PoseSample s{};
   s.timestampNs = t;
@@ -20,7 +24,7 @@ PoseSample makeSample(uint64_t t, float x) {
   s.rightEye.position = Vec3{x + 0.06f, 0.0f, 0.0f};
   s.leftEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
   s.rightEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
-  s.linearVelocity = Vec3{1.0f, 0.0f, 0.0f};
+  s.linearVelocity = Vec3{10.0f, 0.0f, 0.0f};
   return s;
 }
 
@@ -89,6 +93,61 @@ TEST(PosePredictor, AntipodalQuatDoesNotGlitch) {
   EXPECT_NEAR(std::fabs(q.w), w, 0.05f);
   const float n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
   EXPECT_NEAR(n, 1.0f, 1e-3f);
+}
+
+TEST(PosePredictor, ImuAngularVelocityRotatesAroundExpectedAxis) {
+  // SoTA path: with the canonical Meta-IMU ω plumbed through, a single
+  // sample with angular velocity ω = (0, π/2, 0) rad/s should, after dt =
+  // 100 ms (capped well below the 60 ms predictor cap, so 60 ms applies),
+  // rotate the identity orientation about +Y by π/2 * 0.06 = 0.0942 rad
+  // ≈ 5.4°. quat = (0, sin(0.0471), 0, cos(0.0471)).
+  PosePredictor p;
+  PoseSample s{};
+  s.timestampNs = 0;
+  s.leftEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+  s.rightEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+  s.angularVelocity = Vec3{0.0f, static_cast<float>(M_PI_2), 0.0f};
+  // Two samples; nudge the right-eye position by 1 µm on the second so the
+  // dedup in push() (which compares pose bits) doesn't drop the second push
+  // and we end up with size_>=1 (sufficient for the IMU-velocity path).
+  p.push(s);
+  s.timestampNs = 10'000'000;  // 10 ms later, near-identical orientation.
+  s.rightEye.position.x += 1e-6f;
+  p.push(s);
+  // Predict 100 ms ahead — the predictor's 60 ms cap clamps this.
+  auto out = p.predict(110'000'000);
+  ASSERT_TRUE(out.has_value());
+  const float expectedHalf = 0.5f * static_cast<float>(M_PI_2) * 0.060f;
+  EXPECT_NEAR(out->leftEye.orientation.y, std::sin(expectedHalf), 1e-3f);
+  EXPECT_NEAR(out->leftEye.orientation.w, std::cos(expectedHalf), 1e-3f);
+  EXPECT_NEAR(out->leftEye.orientation.x, 0.0f, 1e-4f);
+  EXPECT_NEAR(out->leftEye.orientation.z, 0.0f, 1e-4f);
+}
+
+TEST(PosePredictor, NoImuVelocityFallsBackToFiniteDifferenceLinear) {
+  // Older-Quest fallback: without IMU velocities (linVel=angVel=0) the
+  // predictor still extrapolates position via single-sample finite difference.
+  PosePredictor p;
+  for (int i = 0; i < 4; ++i) {
+    PoseSample s{};
+    s.timestampNs = static_cast<uint64_t>(i) * 10'000'000ull;
+    s.leftEye.position = Vec3{static_cast<float>(i) * 0.05f, 0.0f, 0.0f};
+    s.rightEye.position = Vec3{static_cast<float>(i) * 0.05f + 0.06f, 0.0f, 0.0f};
+    s.leftEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+    s.rightEye.orientation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+    // linVel/angVel intentionally zero: simulate an upstream that hasn't
+    // started populating XrSpaceVelocity yet.
+    p.push(s);
+  }
+  auto out = p.predict(40'000'000);
+  ASSERT_TRUE(out.has_value());
+  // Last two samples 10ms apart, Δx = 0.05 ⇒ v = 5 m/s. predict 10ms ahead
+  // ⇒ 0.15 + 5*0.01 = 0.20.
+  EXPECT_NEAR(out->leftEye.position.x, 0.20f, 1e-3f);
+  // Orientation must NOT rotate when angular velocity is unknown — refusing
+  // to amplify finite-difference noise into a wild rotation is the whole
+  // point of the new design.
+  EXPECT_FLOAT_EQ(out->leftEye.orientation.w, 1.0f);
 }
 
 TEST(PosePredictor, OrientationStaysNormalized) {

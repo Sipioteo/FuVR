@@ -98,6 +98,21 @@ struct SubmitFrameRequest {
   renderedRightRotY @16 :Float32;
   renderedRightRotZ @17 :Float32;
   renderedRightRotW @18 :Float32;
+  # Per-eye FOV the runtime told the app to render with. Embedded into the
+  # wire VideoFragmentHeader so the Quest's ATW shader can use a correct
+  # fov_render — without it, the shader falls back to fov_now, which is
+  # narrower than what the runtime gives Blender (overscan), so the warp
+  # samples outside the rendered area during fast head turns ("see the
+  # screen edge"). Default 0 = pre-overscan daemons; Quest then assumes
+  # fov_render == fov_now (legacy behavior).
+  renderedLeftFovAngleLeft   @19 :Float32;
+  renderedLeftFovAngleRight  @20 :Float32;
+  renderedLeftFovAngleUp     @21 :Float32;
+  renderedLeftFovAngleDown   @22 :Float32;
+  renderedRightFovAngleLeft  @23 :Float32;
+  renderedRightFovAngleRight @24 :Float32;
+  renderedRightFovAngleUp    @25 :Float32;
+  renderedRightFovAngleDown  @26 :Float32;
 }
 
 struct EncodeStats {
@@ -176,6 +191,21 @@ struct PoseSnapshot {
   rightControllerAngVelX @48 :Float32;
   rightControllerAngVelY @49 :Float32;
   rightControllerAngVelZ @50 :Float32;
+
+  # Per-eye FOV reported by the headset's xrLocateViews. Critical for the
+  # runtime: if Blender renders with a different FOV than the headset's
+  # actual asymmetric per-eye FOV, the two eye images cannot fuse and the
+  # ATW reprojection distorts the picture. Fields default to 0 for older
+  # daemons; the runtime falls back to its hardcoded approximation in that
+  # case. (Cap'n Proto additive-field rule keeps the schema id stable.)
+  leftFovAngleLeft   @51 :Float32;
+  leftFovAngleRight  @52 :Float32;
+  leftFovAngleUp     @53 :Float32;
+  leftFovAngleDown   @54 :Float32;
+  rightFovAngleLeft  @55 :Float32;
+  rightFovAngleRight @56 :Float32;
+  rightFovAngleUp    @57 :Float32;
+  rightFovAngleDown  @58 :Float32;
 }
 
 # ---------------------------------------------------------------------------
@@ -275,5 +305,26 @@ struct Envelope {
     streamInputs      @17 :StreamInputsRequest;
     inputSnapshot     @18 :InputSnapshot;
     streamEncodeStats @19 :Void;       # dedicated subscription, decoupled from streamMetrics
+
+    # Pass 6: device-capability handshake. Runtime asks the daemon for the
+    # latest capabilities forwarded by the Quest's helloFromQuest. If the
+    # Quest hasn't connected yet, the daemon replies with `valid=false` and
+    # the runtime falls back to internal defaults. Additive arms keep the
+    # union stable across deploy skews.
+    getDeviceCapabilities      @20 :Void;
+    deviceCapabilitiesResponse @21 :DeviceCapabilitiesResponse;
   }
+}
+
+# Snapshot of the latest helloFromQuest received by the daemon. `valid` is
+# false when no Quest has reported caps yet; runtime falls back to defaults.
+struct DeviceCapabilitiesResponse {
+  valid           @0 :Bool;
+  deviceModel     @1 :Text;
+  systemVersion   @2 :Text;
+  perEyeWidth     @3 :UInt32;
+  perEyeHeight    @4 :UInt32;
+  refreshRatesHz  @5 :List(UInt32);
+  hasHandTracking @6 :Bool;
+  hasEyeTracking  @7 :Bool;
 }

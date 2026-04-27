@@ -251,6 +251,63 @@ bool OpenXrSession::create_action_set() {
     return xr_check(xrAttachSessionActionSets(session_, &attach), "xrAttachSessionActionSets");
 }
 
+OpenXrSession::CapabilitiesSnapshot OpenXrSession::query_capabilities() {
+    CapabilitiesSnapshot caps;
+    if (instance_ == XR_NULL_HANDLE || system_id_ == XR_NULL_SYSTEM_ID) {
+        return caps;
+    }
+
+    // ---- Recommended/max per-eye render dims from OpenXR ------------------
+    if (!view_configs_.empty()) {
+        // PRIMARY_STEREO has identical L/R configs on Quest; pick eye 0.
+        const auto& v = view_configs_[0];
+        caps.perEyeWidth   = v.recommendedImageRectWidth;
+        caps.perEyeHeight  = v.recommendedImageRectHeight;
+        caps.maxPerEyeWidth  = v.maxImageRectWidth;
+        caps.maxPerEyeHeight = v.maxImageRectHeight;
+    }
+
+    // ---- System properties (name + hand/eye tracking) ---------------------
+    XrSystemHandTrackingPropertiesEXT handProps{
+        XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+    XrSystemProperties sysProps{XR_TYPE_SYSTEM_PROPERTIES};
+    sysProps.next = &handProps;
+    if (XR_SUCCEEDED(xrGetSystemProperties(instance_, system_id_, &sysProps))) {
+        caps.deviceModel = sysProps.systemName;
+        caps.hasHandTracking = handProps.supportsHandTracking == XR_TRUE;
+    }
+
+    // ---- Supported display refresh rates via XR_FB_display_refresh_rate ----
+    // Why: Quest 3 supports {72, 80, 90, 120}; Quest 2 supports {72, 80, 90};
+    // negotiating from the actual list lets the daemon pick a valid rate per
+    // device generation rather than hard-coding {72, 90, 120}.
+    PFN_xrEnumerateDisplayRefreshRatesFB pfnEnum = nullptr;
+    if (xrGetInstanceProcAddr(instance_, "xrEnumerateDisplayRefreshRatesFB",
+                              reinterpret_cast<PFN_xrVoidFunction*>(&pfnEnum)) == XR_SUCCESS &&
+        pfnEnum != nullptr && session_ != XR_NULL_HANDLE) {
+        uint32_t count = 0;
+        if (XR_SUCCEEDED(pfnEnum(session_, 0, &count, nullptr)) && count > 0) {
+            std::vector<float> rates(count, 0.0f);
+            if (XR_SUCCEEDED(pfnEnum(session_, count, &count, rates.data()))) {
+                caps.refreshRatesHz.reserve(count);
+                for (float r : rates) {
+                    // Round to nearest Hz; the wire schema uses uint32.
+                    if (r > 0.0f) caps.refreshRatesHz.push_back(static_cast<uint32_t>(r + 0.5f));
+                }
+            }
+        }
+    }
+    if (caps.refreshRatesHz.empty()) {
+        // Sensible fallback if the extension isn't available (host build, etc.).
+        caps.refreshRatesHz = {72, 90};
+    }
+
+    // Eye tracking: not currently using XR_FB_eye_tracking_social or the EXT
+    // social extension. Leave false until eye-driven foveation is wired.
+    caps.hasEyeTracking = false;
+    return caps;
+}
+
 void OpenXrSession::poll_events() {
     XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
     while (xrPollEvent(instance_, &ev) == XR_SUCCESS) {

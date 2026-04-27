@@ -13,6 +13,7 @@
       std::fprintf(stderr, "[fuvr-rt] " fmt "\n", ##__VA_ARGS__);              \
   } while (0)
 
+#include "fuvr/daemon_client.hpp"
 #include "fuvr/iosurface_swapchain.hpp"
 #include "fuvr/path_registry.hpp"
 #include "fuvr/runtime.hpp"
@@ -61,6 +62,41 @@ uint64_t allocHandle() noexcept {
 }
 
 constexpr XrSystemId kSystemId = 1;
+
+// Process-wide cache of headset capabilities. Populated lazily by speculatively
+// connecting to fuvrd whenever the app calls into instance/system queries that
+// previously returned hardcoded Quest 3 values. We can't take ownership of a
+// long-lived DaemonClient here (the Session does that later), so we use a
+// throwaway connection per refresh and rate-limit refreshes to once per
+// session/instance call. If fuvrd is offline or no Quest has connected yet,
+// the cache stays invalid and callers fall back to safe defaults.
+struct CapsCache {
+  std::mutex mu;
+  bool tried = false;
+  fuvr::runtime::DeviceCapabilities caps{};
+};
+
+CapsCache& capsCache() noexcept {
+  static CapsCache c;
+  return c;
+}
+
+const fuvr::runtime::DeviceCapabilities& tryRefreshDeviceCaps() noexcept {
+  auto& c = capsCache();
+  std::lock_guard<std::mutex> lk(c.mu);
+  if (c.caps.valid) return c.caps;
+  // Single-shot probe: if the daemon is up and a Quest has connected, we'll
+  // pick up the real values; otherwise we leave the hardcoded fallback in place.
+  fuvr::runtime::DaemonClient probe;
+  if (!probe.ensureConnected()) { c.tried = true; return c.caps; }
+  fuvr::runtime::DeviceCapabilities snap{};
+  if (probe.getDeviceCapabilities(&snap, /*timeoutMs=*/200) && snap.valid) {
+    c.caps = std::move(snap);
+  }
+  c.tried = true;
+  probe.shutdown();
+  return c.caps;
+}
 
 const char* kSupportedExtensions[] = {
     "XR_KHR_metal_enable",
@@ -183,14 +219,45 @@ XrResult xrGetSystemProperties_impl(XrInstance instance, XrSystemId systemId,
   }
   props->systemId = systemId;
   props->vendorId = 0x4655;
-  std::strncpy(props->systemName, "FuVR HMD (Quest via streaming)",
-               XR_MAX_SYSTEM_NAME_SIZE - 1);
+  // Why: surface the headset's actual model name when we have it, so apps
+  // (Blender's controller-binding switch, telemetry overlays) see "Meta Quest
+  // 3" / "Meta Quest 2" rather than a generic placeholder. Falls back to a
+  // generic name when no Quest has connected yet.
+  const auto& caps = tryRefreshDeviceCaps();
+  const char* name = (caps.valid && !caps.deviceModel.empty())
+                          ? caps.deviceModel.c_str()
+                          : "FuVR HMD (Quest via streaming)";
+  std::strncpy(props->systemName, name, XR_MAX_SYSTEM_NAME_SIZE - 1);
   props->systemName[XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
   props->graphicsProperties.maxLayerCount = 16;
-  props->graphicsProperties.maxSwapchainImageWidth = 4128;
-  props->graphicsProperties.maxSwapchainImageHeight = 2208;
+  // maxSwapchain* dims: derived from the headset's per-eye max if known
+  // (side-by-side stereo so width = 2 * perEye). 4128x2208 is the Quest 3
+  // default fallback. TODO: query maxImageRect* (vs recommended) — the Quest
+  // currently only forwards recommended dims; treat them as max for now.
+  if (caps.valid && caps.perEyeWidth != 0 && caps.perEyeHeight != 0) {
+    props->graphicsProperties.maxSwapchainImageWidth =
+        caps.perEyeWidth * 2;
+    props->graphicsProperties.maxSwapchainImageHeight = caps.perEyeHeight;
+  } else {
+    props->graphicsProperties.maxSwapchainImageWidth = 4128;
+    props->graphicsProperties.maxSwapchainImageHeight = 2208;
+  }
   props->trackingProperties.orientationTracking = XR_TRUE;
   props->trackingProperties.positionTracking = XR_TRUE;
+
+  // XR_EXT_hand_tracking system properties chain. If the app extended `next`
+  // with XrSystemHandTrackingPropertiesEXT, fill it from the daemon-reported
+  // caps. Same pattern would apply for eye-gaze; eye-gaze is not yet wired
+  // through the wire protocol so we always report it absent.
+  for (XrBaseOutStructure* p = static_cast<XrBaseOutStructure*>(props->next);
+       p != nullptr; p = p->next) {
+    if (p->type == XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT) {
+      auto* ht =
+          reinterpret_cast<XrSystemHandTrackingPropertiesEXT*>(p);
+      ht->supportsHandTracking =
+          (caps.valid && caps.hasHandTracking) ? XR_TRUE : XR_FALSE;
+    }
+  }
   return XR_SUCCESS;
 }
 
@@ -263,13 +330,25 @@ XrResult xrEnumerateViewConfigurationViews_impl(
     *countOutput = 2;
     return XR_ERROR_SIZE_INSUFFICIENT;
   }
+  // Why: the recommended/max per-eye dims here are what apps (Blender,
+  // Godot) use to size their swapchains. Pulling them from the headset's
+  // helloFromQuest caps lets us report Quest 2 (1832x1920), Quest 3
+  // (2064x2208), Quest Pro, etc. Falls back to Quest 3 defaults if the
+  // daemon hasn't seen a Quest yet.
+  const auto& caps = tryRefreshDeviceCaps();
+  const uint32_t recW = (caps.valid && caps.perEyeWidth != 0)
+                            ? caps.perEyeWidth : 2064u;
+  const uint32_t recH = (caps.valid && caps.perEyeHeight != 0)
+                            ? caps.perEyeHeight : 2208u;
+  // TODO: Quest reports max separately via XrViewConfigurationView; thread
+  // that through helloFromQuest. For now we expose recommended as max too.
   for (uint32_t i = 0; i < 2; ++i) {
     views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
     views[i].next = nullptr;
-    views[i].recommendedImageRectWidth = 2064;
-    views[i].recommendedImageRectHeight = 2208;
-    views[i].maxImageRectWidth = 4128;
-    views[i].maxImageRectHeight = 2208;
+    views[i].recommendedImageRectWidth = recW;
+    views[i].recommendedImageRectHeight = recH;
+    views[i].maxImageRectWidth = recW * 2;   // side-by-side stereo upper bound
+    views[i].maxImageRectHeight = recH;
     views[i].recommendedSwapchainSampleCount = 1;
     views[i].maxSwapchainSampleCount = 1;
   }

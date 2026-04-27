@@ -38,6 +38,10 @@ PoseSample poseFromSnapshot(const fuvr::daemon::PoseSnapshot::Reader& s) noexcep
            s.getRightRotW()};
   out.linearVelocity = Vec3{s.getLinVelX(), s.getLinVelY(), s.getLinVelZ()};
   out.angularVelocity = Vec3{s.getAngVelX(), s.getAngVelY(), s.getAngVelZ()};
+  out.leftFov = Fov{s.getLeftFovAngleLeft(),  s.getLeftFovAngleRight(),
+                    s.getLeftFovAngleUp(),    s.getLeftFovAngleDown()};
+  out.rightFov = Fov{s.getRightFovAngleLeft(), s.getRightFovAngleRight(),
+                     s.getRightFovAngleUp(),   s.getRightFovAngleDown()};
 
   out.leftControllerActive = s.getLeftControllerActive();
   out.leftController.position = Vec3{s.getLeftControllerPosX(),
@@ -271,6 +275,27 @@ void DaemonClient::readerLoop() noexcept {
           }
           break;
         }
+        case fuvr::daemon::Envelope::Body::DEVICE_CAPABILITIES_RESPONSE: {
+          auto r = body.getDeviceCapabilitiesResponse();
+          std::lock_guard<std::mutex> lk(respMutex_);
+          if (pendingSeq_ != 0 && pendingSeq_ == seq) {
+            DeviceCapabilities caps;
+            caps.valid = r.getValid();
+            caps.deviceModel = r.getDeviceModel().cStr();
+            caps.systemVersion = r.getSystemVersion().cStr();
+            caps.perEyeWidth = r.getPerEyeWidth();
+            caps.perEyeHeight = r.getPerEyeHeight();
+            auto rates = r.getRefreshRatesHz();
+            caps.refreshRatesHz.reserve(rates.size());
+            for (auto v : rates) caps.refreshRatesHz.push_back(v);
+            caps.hasHandTracking = r.getHasHandTracking();
+            caps.hasEyeTracking = r.getHasEyeTracking();
+            lastCapsResponse_ = std::move(caps);
+            gotCapsResponse_ = true;
+            respCv_.notify_all();
+          }
+          break;
+        }
         case fuvr::daemon::Envelope::Body::POSE_SNAPSHOT: {
           auto snap = body.getPoseSnapshot();
           PoseSample s = poseFromSnapshot(snap);
@@ -380,6 +405,37 @@ bool DaemonClient::startSession(const StartSessionParams& params,
   return true;
 }
 
+bool DaemonClient::getDeviceCapabilities(DeviceCapabilities* out,
+                                         uint32_t timeoutMs) noexcept {
+  if (out == nullptr) return false;
+  *out = {};
+  if (!ensureConnected()) return false;
+  const uint64_t seq = nextSeq_.fetch_add(1);
+  capnp::MallocMessageBuilder mb;
+  auto env = mb.initRoot<fuvr::daemon::Envelope>();
+  env.setSeq(seq);
+  env.setStreamId(0);
+  env.getBody().setGetDeviceCapabilities();
+
+  {
+    std::lock_guard<std::mutex> lk(respMutex_);
+    pendingSeq_ = seq;
+    gotCapsResponse_ = false;
+  }
+
+  if (!sendEnvelope(fd_.load(), mb, 0, sendMutex_)) return false;
+
+  std::unique_lock<std::mutex> lk(respMutex_);
+  if (!respCv_.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                        [this] { return gotCapsResponse_; })) {
+    pendingSeq_ = 0;
+    return false;
+  }
+  *out = lastCapsResponse_;
+  pendingSeq_ = 0;
+  return true;
+}
+
 bool DaemonClient::subscribePoses(uint64_t sessionId) noexcept {
   if (!ensureConnected()) return false;
   capnp::MallocMessageBuilder mb;
@@ -439,6 +495,14 @@ bool DaemonClient::submitFrame(uint64_t sessionId,
   req.setRenderedRightRotY(args.rightEye.orientation.y);
   req.setRenderedRightRotZ(args.rightEye.orientation.z);
   req.setRenderedRightRotW(args.rightEye.orientation.w);
+  req.setRenderedLeftFovAngleLeft(args.leftFov.angleLeft);
+  req.setRenderedLeftFovAngleRight(args.leftFov.angleRight);
+  req.setRenderedLeftFovAngleUp(args.leftFov.angleUp);
+  req.setRenderedLeftFovAngleDown(args.leftFov.angleDown);
+  req.setRenderedRightFovAngleLeft(args.rightFov.angleLeft);
+  req.setRenderedRightFovAngleRight(args.rightFov.angleRight);
+  req.setRenderedRightFovAngleUp(args.rightFov.angleUp);
+  req.setRenderedRightFovAngleDown(args.rightFov.angleDown);
   return sendEnvelope(fd_.load(), mb, 0, sendMutex_);
 }
 

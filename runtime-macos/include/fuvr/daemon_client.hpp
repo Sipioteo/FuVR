@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "fuvr/action_state.hpp"
 #include "fuvr/iosurface_xpc_client.hpp"
@@ -24,6 +25,10 @@ struct StartSessionParams {
   uint32_t perEyeWidth{0};
   uint32_t perEyeHeight{0};
   uint32_t refreshRateHz{72};
+  // 50 Mbps is a sensible HEVC ceiling for stereo over wired USB / strong
+  // 5 GHz Wi-Fi. Intentionally headset-agnostic — bitrate is bounded by the
+  // network, not the device. TODO: adapt at runtime from transport RTT/loss;
+  // the daemon's bitrate-request control message already nudges it down.
   uint32_t videoBitrateBps{50'000'000};
   bool useHevc{true};
 };
@@ -35,6 +40,20 @@ struct StartSessionResult {
   uint32_t virtualDisplayId{0};
 };
 
+// Snapshot of headset-reported capabilities, fetched via
+// `DaemonClient::getDeviceCapabilities`. `valid` is false when no Quest has
+// connected yet; callers fall back to internal defaults in that case.
+struct DeviceCapabilities {
+  bool valid{false};
+  std::string deviceModel;
+  std::string systemVersion;
+  uint32_t perEyeWidth{0};
+  uint32_t perEyeHeight{0};
+  std::vector<uint32_t> refreshRatesHz;
+  bool hasHandTracking{false};
+  bool hasEyeTracking{false};
+};
+
 struct SubmitFrameArgs {
   uint64_t frameId{0};
   uint64_t renderStartNs{0};
@@ -44,6 +63,12 @@ struct SubmitFrameArgs {
   bool forceIdr{false};
   Pose leftEye{};
   Pose rightEye{};
+  // Per-eye FOV the runtime told the app to render with. Carried through to
+  // the wire VideoFragmentHeader so the Quest's ATW shader knows the actual
+  // rendered FOV (typically wider than the headset's native fov_now thanks to
+  // overscan). Default-zero means "unset, fall back to fov_now".
+  Fov leftFov{};
+  Fov rightFov{};
 };
 
 // Resolve the path to the daemon RPC socket. Public for tests.
@@ -87,6 +112,13 @@ class DaemonClient {
                     StartSessionResult* out,
                     uint32_t timeoutMs = 2000) noexcept;
 
+  // Fetch latest headset capability snapshot from the daemon (forwarded from
+  // the Quest's helloFromQuest). Synchronous; returns false on timeout or
+  // when the daemon connection is unavailable. `out->valid` reflects whether
+  // the daemon has a real snapshot or the call merely round-tripped.
+  bool getDeviceCapabilities(DeviceCapabilities* out,
+                             uint32_t timeoutMs = 500) noexcept;
+
   // Subscribe to the pose stream. Idempotent.
   bool subscribePoses(uint64_t sessionId) noexcept;
 
@@ -126,6 +158,8 @@ class DaemonClient {
   uint64_t pendingSeq_{0};
   bool gotResponse_{false};
   StartSessionResult lastStartAck_{};
+  DeviceCapabilities lastCapsResponse_{};
+  bool gotCapsResponse_{false};
 
   std::mutex cbMutex_;
   PoseCallback poseCb_;

@@ -31,7 +31,9 @@ static void fillSnapshot(::fuvr::daemon::PoseSnapshot::Builder& snap,
                          const float l[7], const float r[7],
                          const float linVel[3], const float angVel[3],
                          const ControllerSampleIn& lc,
-                         const ControllerSampleIn& rc) {
+                         const ControllerSampleIn& rc,
+                         const FovIn& leftFov,
+                         const FovIn& rightFov) {
     snap.setReceivedAtNs(receivedAtNs);
     snap.setQuestTimestampNs(questTimestampNs);
     snap.setPredictedDisplayTimeNs(predictedDisplayTimeNs);
@@ -71,6 +73,15 @@ static void fillSnapshot(::fuvr::daemon::PoseSnapshot::Builder& snap,
     snap.setRightControllerAngVelX(rc.angVel[0]);
     snap.setRightControllerAngVelY(rc.angVel[1]);
     snap.setRightControllerAngVelZ(rc.angVel[2]);
+
+    snap.setLeftFovAngleLeft(leftFov.angleLeft);
+    snap.setLeftFovAngleRight(leftFov.angleRight);
+    snap.setLeftFovAngleUp(leftFov.angleUp);
+    snap.setLeftFovAngleDown(leftFov.angleDown);
+    snap.setRightFovAngleLeft(rightFov.angleLeft);
+    snap.setRightFovAngleRight(rightFov.angleRight);
+    snap.setRightFovAngleUp(rightFov.angleUp);
+    snap.setRightFovAngleDown(rightFov.angleDown);
 }
 
 void PoseRouter::dispatchSnapshot(uint64_t sessionId,
@@ -82,7 +93,9 @@ void PoseRouter::dispatchSnapshot(uint64_t sessionId,
                                   const float linVel[3],
                                   const float angVel[3],
                                   const ControllerSampleIn& leftCtrl,
-                                  const ControllerSampleIn& rightCtrl) {
+                                  const ControllerSampleIn& rightCtrl,
+                                  const FovIn& leftFov,
+                                  const FovIn& rightFov) {
     std::vector<std::pair<uint64_t, PoseSubscriber>> targets;
     {
         std::lock_guard lk(mu_);
@@ -100,7 +113,8 @@ void PoseRouter::dispatchSnapshot(uint64_t sessionId,
         e.setStreamId(streamId);
         auto snap = e.getBody().initPoseSnapshot();
         fillSnapshot(snap, receivedAtNs, questTimestampNs, predictedDisplayTimeNs,
-                     left, right, linVel, angVel, leftCtrl, rightCtrl);
+                     left, right, linVel, angVel, leftCtrl, rightCtrl,
+                     leftFov, rightFov);
         // Why: runtime reads envelopes flat (see daemon_client.cpp).
         kj::Array<::capnp::word> flat = ::capnp::messageToFlatArray(out);
         auto bytes = flat.asBytes();
@@ -114,8 +128,16 @@ bool PoseRouter::ingestPackedUpstreamFrame(const uint8_t* data, std::size_t len,
     ::capnp::PackedMessageReader reader(is);
     auto frame = reader.getRoot<::fuvr::proto::UpstreamFrame>();
     auto hmd = frame.getHmd();
-    auto lp = hmd.getLeftView().getPose();
-    auto rp = hmd.getRightView().getPose();
+    auto lvw = hmd.getLeftView();
+    auto rvw = hmd.getRightView();
+    auto lp = lvw.getPose();
+    auto rp = rvw.getPose();
+    auto lfov = lvw.getFov();
+    auto rfov = rvw.getFov();
+    FovIn leftFov{ lfov.getAngleLeft(), lfov.getAngleRight(),
+                   lfov.getAngleUp(),   lfov.getAngleDown() };
+    FovIn rightFov{ rfov.getAngleLeft(), rfov.getAngleRight(),
+                    rfov.getAngleUp(),   rfov.getAngleDown() };
     auto lv = hmd.getLinearVelocity();
     auto av = hmd.getAngularVelocity();
 
@@ -160,7 +182,7 @@ bool PoseRouter::ingestPackedUpstreamFrame(const uint8_t* data, std::size_t len,
 
     dispatchSnapshot(sessionId, receivedAtNs, hmd.getTimestampNs(),
                      hmd.getPredictedDisplayTimeNs(), left, right, linVel, angVel,
-                     lc, rc);
+                     lc, rc, leftFov, rightFov);
     return true;
 }
 

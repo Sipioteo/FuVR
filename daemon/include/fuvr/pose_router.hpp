@@ -25,6 +25,16 @@ struct ControllerSampleIn {
     float angVel[3]   = {0, 0, 0};
 };
 
+// Per-eye FOV from xrLocateViews on the Quest. {0,0,0,0} means the upstream
+// frame didn't include FOV (older Quest builds) — runtime falls back to a
+// hardcoded approximation in that case.
+struct FovIn {
+    float angleLeft  = 0.0f;
+    float angleRight = 0.0f;
+    float angleUp    = 0.0f;
+    float angleDown  = 0.0f;
+};
+
 class PoseRouter {
 public:
     uint64_t addSubscriber(uint64_t sessionId, PoseSubscriber cb);
@@ -42,7 +52,9 @@ public:
                           const float linVel[3],
                           const float angVel[3],
                           const ControllerSampleIn& leftCtrl,
-                          const ControllerSampleIn& rightCtrl);
+                          const ControllerSampleIn& rightCtrl,
+                          const FovIn& leftFov = {},
+                          const FovIn& rightFov = {});
 
 private:
     struct Entry {

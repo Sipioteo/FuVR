@@ -26,10 +26,19 @@ struct Pose {
   Quat orientation{};
 };
 
+struct Fov {
+  float angleLeft{0.0f};
+  float angleRight{0.0f};
+  float angleUp{0.0f};
+  float angleDown{0.0f};
+};
+
 struct PoseSample {
   uint64_t timestampNs{0};
   Pose leftEye{};
   Pose rightEye{};
+  Fov leftFov{};
+  Fov rightFov{};
   Vec3 linearVelocity{};
   Vec3 angularVelocity{};
 

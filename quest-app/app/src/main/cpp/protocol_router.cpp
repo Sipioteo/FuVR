@@ -83,15 +83,28 @@ void ProtocolRouter::poll_adaptive_signals() {
 }
 
 void ProtocolRouter::send_hello_from_quest() {
+    // Why: every cap below was previously hardcoded for Quest 3. We now query
+    // the actual headset via OpenXR (system properties, view configuration,
+    // XR_FB_display_refresh_rate) so Quest 2 / 3 / 3S / Pro / future devices
+    // each negotiate using their own recommended render dims and supported
+    // refresh-rate tier list. Codec list stays static — the Quest's hardware
+    // decoder always supports HEVC + H264 across these generations.
     PlainDeviceCapabilities caps;
-    caps.deviceModel = "Quest 3";
-    caps.systemVersion = "";
-    caps.perEyeWidth = 2064;
-    caps.perEyeHeight = 2208;
-    caps.refreshRatesHz = {72, 90, 120};
-    caps.supportedCodecs = {0, 1};
-    caps.hasHandTracking = true;
-    caps.hasEyeTracking = false;
+    auto live = xr_.query_capabilities();
+    caps.deviceModel = live.deviceModel.empty() ? "Quest" : live.deviceModel;
+    caps.systemVersion = live.systemVersion;
+    caps.perEyeWidth = live.perEyeWidth != 0 ? live.perEyeWidth : 2064;
+    caps.perEyeHeight = live.perEyeHeight != 0 ? live.perEyeHeight : 2208;
+    caps.refreshRatesHz = live.refreshRatesHz.empty()
+                              ? std::vector<uint32_t>{72, 90}
+                              : live.refreshRatesHz;
+    caps.supportedCodecs = {0, 1};  // hevc, h264
+    caps.hasHandTracking = live.hasHandTracking;
+    caps.hasEyeTracking = live.hasEyeTracking;
+    LOGI("helloFromQuest: model=%s perEye=%ux%u rates=%zu hand=%d eye=%d",
+         caps.deviceModel.c_str(), caps.perEyeWidth, caps.perEyeHeight,
+         caps.refreshRatesHz.size(), (int)caps.hasHandTracking,
+         (int)caps.hasEyeTracking);
     auto bytes = encode_hello_from_quest(caps);
     if (bytes.empty()) { LOGE("encode_hello_from_quest failed"); return; }
     tx_.send(Channel::Control, bytes.data(), bytes.size());

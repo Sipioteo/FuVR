@@ -23,31 +23,31 @@ float dot(const Quat& a, const Quat& b) noexcept {
   return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
 
-Quat slerp(Quat a, Quat b, float t) noexcept {
-  float d = dot(a, b);
-  if (d < 0.0f) {
-    b = Quat{-b.x, -b.y, -b.z, -b.w};
-    d = -d;
+// Exact quaternion exponential of an angular-velocity-times-dt rotation
+// vector (axis = ω/|ω|, angle = |ω|·dt). Carmack ("Latency Mitigation
+// Strategies") and ALVR both rely on the headset runtime's IMU-Kalman ω
+// applied this way. Unlike a finite-difference slerp(prev, last, 1+t), this
+// has zero amplification of per-sample sensor jitter and zero catch-up lag at
+// motion start: the predicted Δq tracks the IMU velocity directly.
+Quat quat_exp_omega_dt(const Vec3& angVel, float dt) noexcept {
+  const float wx = angVel.x * dt;
+  const float wy = angVel.y * dt;
+  const float wz = angVel.z * dt;
+  const float halfAngle = 0.5f * std::sqrt(wx * wx + wy * wy + wz * wz);
+  if (halfAngle < 1e-6f) {
+    // Small-angle approximation: q ≈ (ω·dt/2, 1).
+    return Quat{0.5f * wx, 0.5f * wy, 0.5f * wz, 1.0f};
   }
-  if (d > 0.9995f) {
-    return normalize(Quat{
-        a.x + t * (b.x - a.x),
-        a.y + t * (b.y - a.y),
-        a.z + t * (b.z - a.z),
-        a.w + t * (b.w - a.w),
-    });
-  }
-  const float theta0 = std::acos(d);
-  const float theta = theta0 * t;
-  const float sinTheta = std::sin(theta);
-  const float sinTheta0 = std::sin(theta0);
-  const float s0 = std::cos(theta) - d * sinTheta / sinTheta0;
-  const float s1 = sinTheta / sinTheta0;
+  const float s = std::sin(halfAngle) / (2.0f * halfAngle);
+  return Quat{wx * s, wy * s, wz * s, std::cos(halfAngle)};
+}
+
+inline Quat quat_mul(const Quat& a, const Quat& b) noexcept {
   return Quat{
-      s0 * a.x + s1 * b.x,
-      s0 * a.y + s1 * b.y,
-      s0 * a.z + s1 * b.z,
-      s0 * a.w + s1 * b.w,
+      a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+      a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+      a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+      a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
   };
 }
 
@@ -59,24 +59,12 @@ Pose extrapolatePose(const Pose& base, const Vec3& linVel, const Vec3& angVel,
       base.position.y + linVel.y * dt,
       base.position.z + linVel.z * dt,
   };
-  const float halfDt = 0.5f * dt;
-  Quat omega{angVel.x * halfDt, angVel.y * halfDt, angVel.z * halfDt, 0.0f};
-  Quat dq{
-      omega.w * base.orientation.x + omega.x * base.orientation.w +
-          omega.y * base.orientation.z - omega.z * base.orientation.y,
-      omega.w * base.orientation.y - omega.x * base.orientation.z +
-          omega.y * base.orientation.w + omega.z * base.orientation.x,
-      omega.w * base.orientation.z + omega.x * base.orientation.y -
-          omega.y * base.orientation.x + omega.z * base.orientation.w,
-      omega.w * base.orientation.w - omega.x * base.orientation.x -
-          omega.y * base.orientation.y - omega.z * base.orientation.z,
-  };
-  out.orientation = normalize(Quat{
-      base.orientation.x + dq.x,
-      base.orientation.y + dq.y,
-      base.orientation.z + dq.z,
-      base.orientation.w + dq.w,
-  });
+  // World-space rotation: q_new = q_delta * q_base. Order matters — applying
+  // the delta on the left rotates the base orientation by the world-frame
+  // angular velocity, which is the convention OpenXR's XrSpaceVelocity
+  // produces (vel expressed in the reference space, not the body frame).
+  const Quat dq = quat_exp_omega_dt(angVel, dt);
+  out.orientation = normalize(quat_mul(dq, base.orientation));
   return out;
 }
 
@@ -84,6 +72,38 @@ Pose extrapolatePose(const Pose& base, const Vec3& linVel, const Vec3& angVel,
 
 void PosePredictor::push(const PoseSample& sample) noexcept {
   PoseSample s = sample;
+  // Why: the Quest pose forwarder ticks at 1 kHz but the underlying
+  // xrLocateViews only refreshes at the headset display rate (~72-90 Hz),
+  // so ~9 of every 10 samples we receive are bit-identical duplicates of
+  // the previous one. Storing them all turns a "4-sample lookback" into a
+  // ~4 ms baseline whose width fluctuates frame-to-frame depending on where
+  // a fresh OpenXR update falls in the duplicate run — that fluctuation is
+  // exactly what made the rendered image tremble even when the head was
+  // stationary or moving smoothly. Drop bit-identical eye samples here so
+  // the buffer contains only one entry per fresh OpenXR update; the 4-sample
+  // lookback in predict() then stays a stable ~44 ms window at 90 Hz.
+  if (size_ > 0) {
+    const std::size_t prevIdx = (head_ + kCapacity - 1) % kCapacity;
+    const PoseSample& prev = buffer_[prevIdx];
+    const auto& pl = prev.leftEye;
+    const auto& nl = s.leftEye;
+    const auto& pr = prev.rightEye;
+    const auto& nr = s.rightEye;
+    if (pl.position.x == nl.position.x && pl.position.y == nl.position.y &&
+        pl.position.z == nl.position.z && pl.orientation.x == nl.orientation.x &&
+        pl.orientation.y == nl.orientation.y &&
+        pl.orientation.z == nl.orientation.z &&
+        pl.orientation.w == nl.orientation.w &&
+        pr.position.x == nr.position.x && pr.position.y == nr.position.y &&
+        pr.position.z == nr.position.z && pr.orientation.x == nr.orientation.x &&
+        pr.orientation.y == nr.orientation.y &&
+        pr.orientation.z == nr.orientation.z &&
+        pr.orientation.w == nr.orientation.w) {
+      // Update only timestamp+controllers/inputs path is not worth the
+      // bookkeeping — controllers move at 90 Hz too. Just skip the push.
+      return;
+    }
+  }
   // Quaternion double-cover: q and -q represent the same rotation, but the
   // Quest may emit consecutive samples with opposite signs (OpenXR makes no
   // continuity guarantee). Without canonicalization, finite-difference and
@@ -161,86 +181,75 @@ std::optional<PoseSample> PosePredictor::predict(
   if (size_ == 1 || displayTimeNs <= last.timestampNs) {
     return last;
   }
-  // Why: the Quest pose forwarder ticks at 1 kHz but the underlying
-  // xrLocateViews only refreshes at the headset display rate (~72-90 Hz),
-  // so ~9 of every 10 samples we receive are bit-identical duplicates.
-  // A fixed N-sample lookback (e.g. 4 samples = ~4 ms) frequently lands
-  // entirely inside one duplicate run, producing either zero velocity or
-  // a sudden jump when the run changes. Walk back until we cover at least
-  // ~20 ms of wall time, which guarantees we span ≥1 fresh OpenXR update
-  // and the velocity estimate averages over real motion, not jitter.
-  std::size_t lookback = size_ >= 2 ? 2 : 1;
-  for (std::size_t k = 2; k <= size_; ++k) {
-    const PoseSample& cand = at(size_ - k);
-    const double dt =
-        static_cast<double>(last.timestampNs - cand.timestampNs) * 1e-9;
-    lookback = k;
-    if (dt >= 0.020) break;
-  }
-  const PoseSample& earlier = at(size_ - lookback);
-  const double dtBase =
-      static_cast<double>(last.timestampNs - earlier.timestampNs) * 1e-9;
+  // Algorithm (Carmack "Latency Mitigation Strategies" + ALVR client_openxr):
+  //
+  //   q(t+Δ)  ≈  exp(½·ω·Δ) · q(t)
+  //   p(t+Δ)  ≈  p(t) + v·Δ
+  //
+  // where ω and v are the IMU-derived angular/linear velocities reported by
+  // the headset's runtime (chained XrSpaceVelocity on xrLocateSpace). This
+  // is the canonical "rotate by ω·Δt" integrator that every production VR
+  // streamer uses: ω comes off the IMU's Kalman filter at sub-ms latency
+  // and is dramatically cleaner than any finite-difference computed from
+  // resampled view poses.
+  //
+  // Previously we computed a finite-difference slerp(prev, last, 1+t) over a
+  // 4-sample (~44 ms) window. That had two failure modes the user reported:
+  //
+  //   • catch-up lag at motion start: the wide baseline includes pre-motion
+  //     samples whose slope is ~0, so the predicted Δq stays small until the
+  //     baseline fully fills with moving samples (~44 ms × 2 ≈ 90 ms);
+  //   • tremor on micro-motions: the 1+t extrapolation factor (~2.6×)
+  //     amplifies any per-sample jitter in `last` directly into the Quest's
+  //     q_render, and since q_render lurches frame-to-frame the ATW Δq does
+  //     too.
+  //
+  // Both vanish with the IMU ω path: zero baseline, zero amplification.
+  //
+  // Fallback: older Quest builds (pre-this-pass) and the daemon-side router
+  // that doesn't fill velocity will deliver linVel=angVel=0. In that case we
+  // compute a single-sample finite-difference linear velocity (rotational
+  // tracking degrades to "hold last orientation" — better than amplifying
+  // noise). Once the new Quest APK lands the fallback is dormant.
+
   const float dtPredict =
       static_cast<float>(static_cast<double>(displayTimeNs - last.timestampNs) *
                          1e-9);
 
+  // Why: cap predicted dt at 60 ms. Pipeline stalls (e.g. a paused
+  // GPU on Mac) can push displayTime arbitrarily far into the future; we'd
+  // rather render with a slightly stale pose than extrapolate ω for hundreds
+  // of ms and fly off into the world. 60 ms ≈ encode + 1 frame slack.
+  constexpr float kMaxPredictSec = 0.060f;
+  const float dt = dtPredict > kMaxPredictSec ? kMaxPredictSec : dtPredict;
+
   Vec3 linVel = last.linearVelocity;
   Vec3 angVel = last.angularVelocity;
-  if (dtBase > 1e-6) {
-    const float invDt = static_cast<float>(1.0 / dtBase);
-    linVel = Vec3{
-        (last.leftEye.position.x - earlier.leftEye.position.x) * invDt,
-        (last.leftEye.position.y - earlier.leftEye.position.y) * invDt,
-        (last.leftEye.position.z - earlier.leftEye.position.z) * invDt,
-    };
+
+  // Detect "no IMU velocity provided" — fall back to one-sample finite
+  // difference for linear velocity only. Angular velocity stays zero (we
+  // refuse to amplify finite-difference noise into a wild rotation).
+  const bool hasImuVel =
+      (linVel.x != 0.0f || linVel.y != 0.0f || linVel.z != 0.0f ||
+       angVel.x != 0.0f || angVel.y != 0.0f || angVel.z != 0.0f);
+  if (!hasImuVel && size_ >= 2) {
+    const PoseSample& prev = at(size_ - 2);
+    const double dtBase =
+        static_cast<double>(last.timestampNs - prev.timestampNs) * 1e-9;
+    if (dtBase > 1e-6) {
+      const float invDt = static_cast<float>(1.0 / dtBase);
+      linVel = Vec3{
+          (last.leftEye.position.x - prev.leftEye.position.x) * invDt,
+          (last.leftEye.position.y - prev.leftEye.position.y) * invDt,
+          (last.leftEye.position.z - prev.leftEye.position.z) * invDt,
+      };
+    }
   }
 
   PoseSample out = last;
   out.timestampNs = displayTimeNs;
-  out.leftEye = extrapolatePose(last.leftEye, linVel, angVel, dtPredict);
-  out.rightEye = extrapolatePose(last.rightEye, linVel, angVel, dtPredict);
-
-  if (size_ >= 2) {
-    // Why: use the same wide baseline as linear velocity (4 samples back at
-    // 1 kHz ≈ 3 ms) instead of the immediate previous sample (~1 ms). With a
-    // 70 ms lookahead, a 1 ms baseline produces an extrapolation factor of
-    // ~70× — any sub-millimeter sensor jitter in `last` blows up into a huge
-    // angular delta and the Quest's ATW snaps when q_render lurches frame
-    // to frame. A 3 ms baseline cuts the amplification to ~23× and the cap
-    // below clamps any remaining outliers to a reasonable max step.
-    const PoseSample& prev = (size_ >= 4) ? at(size_ - 4) : at(size_ - 2);
-    const double dtPrev =
-        static_cast<double>(last.timestampNs - prev.timestampNs) * 1e-9;
-    if (dtPrev > 1e-6) {
-      float t = static_cast<float>(
-          static_cast<double>(displayTimeNs - last.timestampNs) / dtPrev);
-      // Cap extrapolation factor: at most 8× the baseline. Beyond that we
-      // hold the most-recent rotation rather than predicting through noise.
-      if (t > 8.0f) t = 8.0f;
-      out.leftEye.orientation =
-          slerp(prev.leftEye.orientation, last.leftEye.orientation, 1.0f + t);
-      out.rightEye.orientation =
-          slerp(prev.rightEye.orientation, last.rightEye.orientation, 1.0f + t);
-      out.leftEye.orientation = normalize(out.leftEye.orientation);
-      out.rightEye.orientation = normalize(out.rightEye.orientation);
-      // Slerp with t > 1 (extrapolation) can return a quat antipodal to
-      // `last` even though `last` is canonical w.r.t. the buffer. Pin the
-      // predicted output onto the same sign sheet as `last` so the wire
-      // q_render the Quest receives is monotonic across frames.
-      if (dot(last.leftEye.orientation, out.leftEye.orientation) < 0.0f) {
-        out.leftEye.orientation = Quat{-out.leftEye.orientation.x,
-                                       -out.leftEye.orientation.y,
-                                       -out.leftEye.orientation.z,
-                                       -out.leftEye.orientation.w};
-      }
-      if (dot(last.rightEye.orientation, out.rightEye.orientation) < 0.0f) {
-        out.rightEye.orientation = Quat{-out.rightEye.orientation.x,
-                                        -out.rightEye.orientation.y,
-                                        -out.rightEye.orientation.z,
-                                        -out.rightEye.orientation.w};
-      }
-    }
-  }
+  out.leftEye = extrapolatePose(last.leftEye, linVel, angVel, dt);
+  out.rightEye = extrapolatePose(last.rightEye, linVel, angVel, dt);
   return out;
 }
 

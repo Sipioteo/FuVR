@@ -77,10 +77,47 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
     if (std::getenv("FUVR_RT_DEBUG"))
       std::fprintf(stderr, "[fuvr-rt]   daemon connected\n");
     daemonConnected = true;
+    // Why: query the daemon for the latest helloFromQuest snapshot so we
+    // negotiate at the headset's actual recommended render dims and a refresh
+    // rate it actually advertises. Falls back to Quest 3 defaults if no Quest
+    // has connected yet (daemon-without-headset case, e.g. CI smoke tests).
     StartSessionParams params{};
-    params.perEyeWidth = 2064;
-    params.perEyeHeight = 2208;
-    params.refreshRateHz = 90;
+    DeviceCapabilities caps{};
+    if (daemon->getDeviceCapabilities(&caps) && caps.valid) {
+      params.perEyeWidth = caps.perEyeWidth != 0 ? caps.perEyeWidth : 2064;
+      params.perEyeHeight = caps.perEyeHeight != 0 ? caps.perEyeHeight : 2208;
+      // Pick the highest advertised rate <= 120; Quest 3 reports 120 but PCVR
+      // streaming over TCP rarely hits 120 stable, so cap at 90 by default.
+      // Override via FUVR_RT_REFRESH_HZ if you want to force a specific rate.
+      uint32_t rate = 0;
+      const char* envRate = std::getenv("FUVR_RT_REFRESH_HZ");
+      const uint32_t prefMax = envRate ? static_cast<uint32_t>(
+                                              std::strtoul(envRate, nullptr, 10))
+                                       : 90u;
+      for (uint32_t r : caps.refreshRatesHz) {
+        if (r <= prefMax && r > rate) rate = r;
+      }
+      if (rate == 0 && !caps.refreshRatesHz.empty()) {
+        rate = caps.refreshRatesHz.front();
+      }
+      params.refreshRateHz = rate != 0 ? rate : 90u;
+      if (std::getenv("FUVR_RT_DEBUG"))
+        std::fprintf(stderr,
+                     "[fuvr-rt] caps from daemon: model='%s' perEye=%ux%u rate=%u (advertised %zu rates)\n",
+                     caps.deviceModel.c_str(), params.perEyeWidth,
+                     params.perEyeHeight, params.refreshRateHz,
+                     caps.refreshRatesHz.size());
+    } else {
+      // TODO: surface this via the connection UI; today we silently fall
+      // back. Hardcoded Quest 3 defaults; the daemon will negotiate down
+      // when the Quest finally connects.
+      params.perEyeWidth = 2064;
+      params.perEyeHeight = 2208;
+      params.refreshRateHz = 90;
+      if (std::getenv("FUVR_RT_DEBUG"))
+        std::fprintf(stderr,
+                     "[fuvr-rt] no caps from daemon yet; using Quest 3 defaults\n");
+    }
     StartSessionResult result{};
     if (daemon->startSession(params, &result)) {
       session->daemonSessionId = result.sessionId;
@@ -433,30 +470,35 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
                             XR_VIEW_STATE_POSITION_TRACKED_BIT;
   }
   auto predicted = s->predictor.predict(static_cast<uint64_t>(info->displayTime));
-  // Why: previous code returned a symmetric ±0.95 rad fov for both eyes. The
-  // Quest 3 actually has an asymmetric per-eye fov (lenses canted toward the
-  // nose), so Blender rendering with the symmetric fov produced a per-eye
-  // geometry that didn't match what the headset displays — left/right images
-  // refused to fuse stereoscopically. These values approximate Quest 3's
-  // per-eye fov (outer ~64°, inner ~46°, vertical ~48°). Plumbing the exact
-  // runtime-reported fov through the wire is a follow-up; for now this is
-  // close enough that depth perception works and ATW's fov_render→fov_now
-  // fall-back stays well under a degree off.
-  constexpr float kOuter = 1.117f;  // ~64°
-  constexpr float kInner = 0.803f;  // ~46°
-  constexpr float kVert  = 0.838f;  // ~48°
+  // Why: the Quest reports its actual per-eye fov in every UpstreamFrame and
+  // the daemon now forwards it through PoseSnapshot. Use the headset's real
+  // fov so Blender renders with the same projection the headset is built
+  // around — eyes fuse properly and ATW's fov_render→fov_now fall-back stays
+  // an identity warp on the projection axis. Until a real sample arrives,
+  // fall back to a Quest 3 approximation (outer ~64°, inner ~46°, vert ~48°).
+  constexpr float kOuter = 1.117f, kInner = 0.803f, kVert = 0.838f;
+  auto pickFov = [&](int eye) -> XrFovf {
+    XrFovf out{};
+    if (predicted.has_value()) {
+      const auto& f = (eye == 0) ? predicted->leftFov : predicted->rightFov;
+      if (f.angleLeft != 0.0f || f.angleRight != 0.0f) {
+        out.angleLeft  = f.angleLeft;
+        out.angleRight = f.angleRight;
+        out.angleUp    = f.angleUp;
+        out.angleDown  = f.angleDown;
+        return out;
+      }
+    }
+    if (eye == 0) { out.angleLeft = -kOuter; out.angleRight = +kInner; }
+    else          { out.angleLeft = -kInner; out.angleRight = +kOuter; }
+    out.angleUp   = +kVert;
+    out.angleDown = -kVert;
+    return out;
+  };
   for (uint32_t i = 0; i < 2; ++i) {
     views[i].type = XR_TYPE_VIEW;
     views[i].next = nullptr;
-    if (i == 0) {           // left eye: outer-left, inner-right
-      views[i].fov.angleLeft  = -kOuter;
-      views[i].fov.angleRight = +kInner;
-    } else {                // right eye: inner-left, outer-right
-      views[i].fov.angleLeft  = -kInner;
-      views[i].fov.angleRight = +kOuter;
-    }
-    views[i].fov.angleUp   = +kVert;
-    views[i].fov.angleDown = -kVert;
+    views[i].fov = pickFov(static_cast<int>(i));
     if (predicted.has_value()) {
       const Pose& p = (i == 0) ? predicted->leftEye : predicted->rightEye;
       views[i].pose.position = {p.position.x, p.position.y, p.position.z};
