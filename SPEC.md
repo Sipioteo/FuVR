@@ -157,14 +157,11 @@ Pattern standard ALVR-like: pacchetti UDP frammentati con sequence number, FEC R
 
 #### 3.1.5 Pose Prediction
 
-Buffer circolare delle ultime N pose ricevute dal Quest (N=32 sufficiente). Quando l'app chiama `xrLocateViews` con `displayTime` futuro:
+La predizione è eseguita interamente sul Quest. Il pose forwarder campiona ogni tick a `t_target = xrPredictedDisplayTime + RTT`, dove `RTT` è una stima EWMA del round-trip Mac↔Quest (seed 35 ms, clamp `[10 ms, 80 ms]`, override via `FUVR_QUEST_RTT_OVERRIDE_MS`). I sample vengono inviati upstream con `timestampNs = t_target`, già estrapolati alla data di rendering attesa nel dominio di clock OpenXR.
 
-1. Estrai le ultime 4-8 pose
-2. Calcola velocità lineare (traslazione) e angolare (quaternioni → SLERP derivative)
-3. Estrapolazione lineare + smoothing (filtro complementare o Kalman)
-4. Ritorna pose predetta al displayTime richiesto
+Lato Mac, il `PosePredictor` riceve sample forward-stamped: quando Blender chiama `xrLocateViews(displayTime)`, `dt = displayTime − sample.timestampNs ≈ 0` e `predict()` restituisce il sample identico (passthrough). Il buffer circolare e il path di estrapolazione IMU `exp(½·ω·dt) · q_base` rimangono come fallback per client legacy (Quest senza prediction-side).
 
-Nota: il Quest stesso fa questa predizione internamente. Strategia alternativa: chiedere al Quest una pose già predetta a un timestamp futuro, e usarla as-is sul Mac. Più semplice, meno preciso se la rete jittera.
+Razionale: il Quest possiede l'IMU e il display clock; predire lì evita di accoppiare il drift di clock-sync Mac→Quest nel termine di lookahead. Il timewarp scan-out del compositor OS assorbe l'errore residuo confrontando `views[i].pose` contro la pose IMU real-time al momento dei photons.
 
 ### 3.2 Componenti Quest
 
@@ -236,6 +233,32 @@ struct VideoPacketHeader {
 ```
 
 Il `rendered_pose` è essenziale per ATW corretto sul Quest.
+
+---
+
+### 3.x Verification matrix
+
+Tunables and log markers used to validate the streamed-VR pipeline end-to-end
+(FOV consistency + motion-to-photon latency, see plan
+`bug-specification-virtual-boot.md`). All env vars are kill-switches /
+overrides — defaults are production-correct.
+
+**Environment variables**
+
+| Var | Side | Effect |
+|---|---|---|
+| `FUVR_RT_FOV_MARGIN_DEG` | runtime-macos | Overscan margin (deg) added to per-eye FOV in `xrLocateViews_impl` before being returned to Blender / stamped into `VideoFragmentHeader`. Default 12. Sweep `{12, 6, 4, 0}` to confirm OS-compositor reprojection tolerates lower headroom. |
+| `FUVR_QUEST_RTT_OVERRIDE_MS` | quest-app | Overrides the EWMA RTT estimate (`RoundTripEstimator`) used to bias `xrPredictedDisplayTime` upstream. Clamped to `[10, 80]` ms. Sweep `{20, 35, 50}` for latency calibration. |
+| `FUVR_RT_DEBUG` | runtime-macos | Enables verbose `[LATENCY-DEBUG]` / `[DEBUG-POSE]` lines on `/tmp/fuvrd.err.log`. Off by default to keep release logs clean. |
+
+**Log markers**
+
+| Marker | Source | Tail with | Meaning |
+|---|---|---|---|
+| `[LATENCY-DEBUG]` | runtime-macos predictor | `tail -F /tmp/fuvrd.err.log` | Per-frame `dt_ms` (predict horizon), `cap_fired` (60 ms cap engaged?). With Quest-side prediction `dt_ms` should be ≪ today and `cap_fired=0`. |
+| `[DEBUG-POSE]` | runtime-macos pose router | same | Forward-stamped sample tracing — `timestampNs`, `predictedDisplayTimeNs`, requested `displayTime` deltas. |
+| `[RTT]` | quest-app `pose_forwarder` / `protocol_router` | `adb logcat -s fuvr.pose fuvr.proto` | 1 Hz heartbeat reporting EWMA mean / p99 round-trip the Quest is biasing prediction by. |
+| `[FOV-CHECK]` | quest-app `protocol_router::on_video` | `adb logcat -s fuvr.proto` | 1 Hz observation log: per-eye FOV half-angles received in `VideoFragmentHeader` vs. eye-swapchain aspect ratio. Catches dim/FOV drift. |
 
 ---
 

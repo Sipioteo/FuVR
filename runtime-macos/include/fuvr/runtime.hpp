@@ -96,6 +96,20 @@ struct Swapchain {
   uint32_t acquiredIndex{0};
   uint32_t lastReleasedIndex{0};
   std::vector<std::unique_ptr<IOSurfaceImage>> images;
+  // Per-image rendered FOV. Stamped at xrReleaseSwapchainImage from the
+  // session's pendingLocateLeft/RightFov (which xrLocateViews writes when
+  // returning views to the app). xrEndFrame reads these — keyed to the
+  // *swapchain image being submitted* — so the FOV pinned in
+  // VideoFragmentHeader always matches the pixels in the surface, even when
+  // multiple frames are queued or rendered out of locate→end order.
+  // Parallel-sized to `images`. The eye assignment is by-convention: when
+  // the same swapchain is submitted as views[0] (left), readers should use
+  // `imageLeftFov[idx]`; for views[1] (right), `imageRightFov[idx]`. We
+  // store both per image so a single swapchain used for either eye works,
+  // and so we don't lose data if the locate→release pairing maps each
+  // released image to a single locate call's full eye-pair.
+  std::vector<Fov> imageLeftFov;
+  std::vector<Fov> imageRightFov;
 };
 
 struct Session {
@@ -115,14 +129,15 @@ struct Session {
   // Set at session start from daemon's measured oneWayDelayNs plus a fixed
   // render-budget; overridable via FUVR_RT_POSE_LOOKAHEAD_MS.
   uint64_t poseLookaheadNs{70'000'000};
-  // Per-eye FOV last returned by xrLocateViews. xrEndFrame copies this into
-  // SubmittedFrame so the daemon (and ultimately the Quest's ATW shader)
-  // knows the *rendered* FOV — including any overscan we applied — instead
-  // of the headset's native fov_now. Without this the ATW falls back to
-  // assuming render-fov == now-fov and the warp samples outside the actual
-  // rendered region during fast head turns ("see the screen edge").
-  Fov lastRenderedLeftFov{};
-  Fov lastRenderedRightFov{};
+  // Per-eye FOV last returned by xrLocateViews. Treated as a transient
+  // *pending* value: xrReleaseSwapchainImage copies it onto the per-image
+  // FOV slots on the released swapchain image, so xrEndFrame can recover
+  // the FOV that belongs to the specific image being submitted (rather
+  // than whatever xrLocateViews happened to write last — which would be
+  // wrong when frames don't run strictly locate→end in order, e.g.
+  // background renders or multi-frame queueing).
+  Fov pendingLocateLeftFov{};
+  Fov pendingLocateRightFov{};
   void* metalDevice{nullptr};  // id<MTLDevice>, retained
   void* metalCommandQueue{nullptr};  // id<MTLCommandQueue> from KHR binding (NOT retained — owned by app)
   std::vector<std::unique_ptr<Space>> spaces;

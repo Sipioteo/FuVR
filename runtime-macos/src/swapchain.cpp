@@ -90,6 +90,9 @@ XrResult xrCreateSwapchain_impl(XrSession sessionHandle,
   if (sc->images.empty()) {
     return XR_ERROR_OUT_OF_MEMORY;
   }
+  // Per-image FOV slots — see Swapchain definition. Sized to images[].
+  sc->imageLeftFov.assign(sc->images.size(), Fov{});
+  sc->imageRightFov.assign(sc->images.size(), Fov{});
   const uint64_t h = detail::nextHandleAlloc();
   sc->handle = reinterpret_cast<XrSwapchain>(h);
   Swapchain* raw = sc.get();
@@ -183,9 +186,19 @@ XrResult xrReleaseSwapchainImage_impl(XrSwapchain handle,
   if (!sc->images.empty()) {
     // Track which image was just released so xrEndFrame can locate the
     // IOSurface backing the frame the app just finished rendering.
-    sc->lastReleasedIndex =
+    const uint32_t idx =
         (sc->acquiredIndex + static_cast<uint32_t>(sc->images.size()) - 1) %
         static_cast<uint32_t>(sc->images.size());
+    sc->lastReleasedIndex = idx;
+    // Bind the FOV that xrLocateViews most recently returned to *this*
+    // swapchain image. Apps render to the released image immediately after
+    // locate→acquire→render→release, so the pending FOV at release time is
+    // what was used to draw the pixels in this image. This is the per-frame
+    // FOV xrEndFrame will later stamp into VideoFragmentHeader.
+    if (sc->session != nullptr && idx < sc->imageLeftFov.size()) {
+      sc->imageLeftFov[idx]  = sc->session->pendingLocateLeftFov;
+      sc->imageRightFov[idx] = sc->session->pendingLocateRightFov;
+    }
   }
   return XR_SUCCESS;
 }

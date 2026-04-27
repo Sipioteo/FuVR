@@ -159,6 +159,7 @@ if(FUVR_RUNTIME_TESTS)
     tests/test_eye_gaze.cpp
     tests/test_endframe_layers.cpp
     tests/test_session_resilience.cpp
+    tests/test_round_trip_e2e.cpp
     src/pose_predictor.cpp
     src/daemon_client.cpp
     src/event_queue.cpp

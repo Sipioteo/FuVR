@@ -93,10 +93,41 @@ bool Compositor::create_swapchains() {
     };
     const int64_t color_format = pick_format();
 
+    // Why: the Mac runtime renders into a per-eye buffer of fixed dimensions
+    // (currently 2064x2208 — see runtime-macos/src/session.cpp where
+    // StartSessionParams.perEyeWidth/Height are pinned). The decoded SBS
+    // texture's per-eye half therefore has aspect 2064:2208 (≈0.935). If the
+    // Quest swapchain dims here use the OS-recommended values (≈1680x1760
+    // on Quest 3, aspect 0.955), the blit_ fragment shader stretches a
+    // frustum-correct image non-uniformly into the swapchain, and the OS
+    // compositor (which only sees `views[i].fov` + the swapchain) interprets
+    // the stretched content as if it had been rendered at that fov — which
+    // is exactly the geometric warping that looks like "FOV mismatch" during
+    // head motion.
+    //
+    // Fix: size the swapchain to match the Mac-side per-eye dims. The dims
+    // are negotiated via the SessionConfig handshake (see protocol_router
+    // ControlKind::HelloFromMac) but that arrives *after* compositor init,
+    // so we pin to the same default the Mac currently hardcodes. If the
+    // OS-recommended dims diverge by more than a small margin, log a
+    // warning so a future Mac runtime change is caught.
+    constexpr int32_t kMacPerEyeWidth  = 2064;
+    constexpr int32_t kMacPerEyeHeight = 2208;
     for (int eye = 0; eye < 2; ++eye) {
         auto& e = eyes_[eye];
-        e.width  = (int32_t)vc[eye].recommendedImageRectWidth;
-        e.height = (int32_t)vc[eye].recommendedImageRectHeight;
+        const int32_t recW = (int32_t)vc[eye].recommendedImageRectWidth;
+        const int32_t recH = (int32_t)vc[eye].recommendedImageRectHeight;
+        const float recAspect = (recH > 0) ? (float)recW / (float)recH : 0.0f;
+        const float macAspect = (float)kMacPerEyeWidth / (float)kMacPerEyeHeight;
+        if (std::abs(recAspect - macAspect) > 0.01f) {
+            LOGI("eye %d: OS-recommended swapchain %dx%d (aspect %.3f) "
+                 "differs from Mac per-eye %dx%d (aspect %.3f); using Mac "
+                 "dims to keep blit identity-stretch-free",
+                 eye, recW, recH, recAspect,
+                 kMacPerEyeWidth, kMacPerEyeHeight, macAspect);
+        }
+        e.width  = kMacPerEyeWidth;
+        e.height = kMacPerEyeHeight;
         e.format = color_format;
 
         XrSwapchainCreateInfo sci{XR_TYPE_SWAPCHAIN_CREATE_INFO};

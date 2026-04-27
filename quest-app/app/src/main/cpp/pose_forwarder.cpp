@@ -6,21 +6,12 @@
 #include "transport_client.hpp"
 #include "proto_codec.hpp"
 #include "input_packer.hpp"
+#include "round_trip.hpp"
 
 #include <android/log.h>
 #include <chrono>
 #include <ctime>
 #include <thread>
-
-// XR_KHR_convert_timespec_time prototype + PFN. Declared here directly to
-// avoid pulling in openxr_platform.h, which on Android additionally needs
-// jni + EGL headers and balloons the include surface for one extension.
-extern "C" {
-typedef XrResult (XRAPI_PTR *PFN_xrConvertTimespecTimeToTimeKHR)(
-    XrInstance instance,
-    const struct timespec* timespecTime,
-    XrTime* time);
-}
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "fuvr.pose", __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "fuvr.pose", __VA_ARGS__)
@@ -68,16 +59,8 @@ void PoseForwarder::run() {
     LOGI("[DEBUG-POSE] forwarder thread started");
     auto last_heartbeat = steady_clock::now();
     uint64_t ticks_total = 0, ticks_running = 0, sends_ok = 0, sends_fail = 0;
-
-    // Resolve xrConvertTimespecTimeToTimeKHR once. It maps clock_gettime(MONO)
-    // into the headset's XrTime, which we then feed to xrLocateSpace to get
-    // the *current* head pose (not the future-predicted one in last_views).
-    PFN_xrConvertTimespecTimeToTimeKHR pfnConvertTimespec = nullptr;
-    if (xr_.instance() != XR_NULL_HANDLE) {
-        xrGetInstanceProcAddr(
-            xr_.instance(), "xrConvertTimespecTimeToTimeKHR",
-            reinterpret_cast<PFN_xrVoidFunction*>(&pfnConvertTimespec));
-    }
+    XrTime last_t_predicted = 0;
+    XrTime last_t_target = 0;
 
     while (running_.load()) {
         next += period;
@@ -88,32 +71,41 @@ void PoseForwarder::run() {
         if (xr_run && xr_sess) {
             ++ticks_running;
             const XrTime t_predicted = xr_.predicted_display_time();
-            // Why: send the head pose at "now" (CLOCK_MONOTONIC) rather than at
-            // predictedDisplayTime. The compositor's q_now is itself derived
-            // from xrLocateViews(predictedDisplayTime), so if we send that
-            // same future-pose to Mac, Mac echoes it back as q_render and
-            // pair(ren,now) ≡ 1.0 ⇒ ATW Δq = identity ⇒ no warp ⇒ visible
-            // lag during head motion. With t_now = CLOCK_MONOTONIC, q_render
-            // is sample-time and ATW gets a real Δq covering the full pipeline
-            // latency to correct.
-            XrTime t_now = t_predicted;
-            if (pfnConvertTimespec != nullptr && xr_.instance() != XR_NULL_HANDLE) {
-                struct timespec ts{};
-                if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
-                    XrTime converted = 0;
-                    if (pfnConvertTimespec(xr_.instance(), &ts, &converted) ==
-                        XR_SUCCESS) {
-                        t_now = converted;
-                    }
-                }
-            }
-
-            // Single sync per tick: shared by pose locate + action read.
-            // Use predicted display time for actions / capture (those want the
-            // future-aligned data). t_now is only for the sample we send.
+            // Why: predict on the Quest, not the Mac. We sample at
+            // t_target = OpenXR's predicted display time + an EWMA estimate
+            // of the Mac round-trip, so the pose we ship upstream is already
+            // extrapolated to the moment Blender's frame will land back on
+            // the Quest swapchain. The Mac-side predictor then degenerates
+            // to identity for forward-stamped samples (its dt = displayTime
+            // − sample.timestampNs ≈ 0), and the OS compositor's scan-out
+            // timewarp absorbs the residual error against real-time IMU at
+            // photons. This avoids the Mac/Quest clock-sync drift the old
+            // CLOCK_MONOTONIC sample-time path coupled into Δq, and gives
+            // the Quest — which owns the IMU and the display clock —
+            // ownership of the lookahead term end-to-end.
+            // No RTT lookahead. Earlier we biased t by an EWMA of the
+            // round-trip; in practice that double-predicts (xrWaitFrame's
+            // predictedDisplayTime is already a forward-extrapolated time
+            // from the Quest SDK) and the extra IMU integration just
+            // injects gyro noise into the rendered pose. With
+            // FUVR_RT_FOV_MARGIN_DEG=0 there is no OS scan-out overscan
+            // to hide that noise, so the user sees micro-shake at rest
+            // and judder during motion. Sample at t_predicted only and
+            // let the Quest OS compositor's scan-out timewarp absorb the
+            // pipeline lag using the rendered_pose echoed back in
+            // VideoFragmentHeader.
             xr_.sync_actions();
             xr_.capture_local_origin_if_needed(t_predicted);
-            const XrTime t = t_now;
+            const XrTime t_target = t_predicted;
+            const XrTime t = t_target;
+            last_t_predicted = t_predicted;
+            last_t_target = t_target;
+
+            XrSpaceVelocity head_vel{XR_TYPE_SPACE_VELOCITY};
+            XrSpaceLocation head_loc{XR_TYPE_SPACE_LOCATION, &head_vel};
+            if (xr_.view_space() != XR_NULL_HANDLE && xr_.stage_space() != XR_NULL_HANDLE) {
+                xrLocateSpace(xr_.view_space(), xr_.stage_space(), t, &head_loc);
+            }
 
             // Hand poses with velocity. ALVR / Carmack: the headset runtime
             // owns the IMU integrator; its velocity is dramatically cleaner
@@ -129,26 +121,15 @@ void PoseForwarder::run() {
                 }
             }
 
-            // Head velocity: locate view_space (HMD center) against stage to
-            // get the canonical Meta-IMU linear/angular velocity. Note we use
-            // the **same** velocity for both eyes since rotational velocity is
-            // shared at the head and IPD-driven linear velocity contribution
-            // is below sensor noise. This is exactly how OVR / VrApi and ALVR
-            // derive head velocity for the streaming case.
-            XrSpaceVelocity head_vel{XR_TYPE_SPACE_VELOCITY};
-            XrSpaceLocation head_loc{XR_TYPE_SPACE_LOCATION, &head_vel};
-            if (xr_.view_space() != XR_NULL_HANDLE && xr_.stage_space() != XR_NULL_HANDLE) {
-                xrLocateSpace(xr_.view_space(), xr_.stage_space(), t, &head_loc);
-            }
             const bool head_lin_valid =
                 (head_vel.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) != 0;
             const bool head_ang_valid =
                 (head_vel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) != 0;
 
-            // Fresh per-eye locate at t_now (instead of cached last_views,
-            // which is at predictedDisplayTime). FOV is an intrinsic of the
-            // headset and doesn't change frame-to-frame, so we still take it
-            // from the cached views — saves a structure copy.
+            // Fresh per-eye locate at t_target (= predictedDisplayTime +
+            // RTT). FOV is an intrinsic of the headset and doesn't change
+            // frame-to-frame, so we still take it from the cached views —
+            // saves a structure copy.
             const auto& cached_views = xr_.last_views();
             XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
             vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -168,8 +149,12 @@ void PoseForwarder::run() {
 
             PlainUpstreamFrame f;
             f.correlationFrameId = 0;
-            f.hmd.timestampNs = now_ns();
-            f.hmd.predictedDisplayTimeNs = (uint64_t)t;
+            // Stamp the sample with t_target: the Mac-side predictor reads
+            // this as "the pose is already valid at this future time", so
+            // its extrapolation dt = displayTime − timestampNs is ≈ 0 and
+            // predict() returns identity (no Mac-side lookahead).
+            f.hmd.timestampNs = (uint64_t)t_target;
+            f.hmd.predictedDisplayTimeNs = (uint64_t)t_predicted;
             f.hmd.leftView  = to_plain(pose0, cached_views[0].fov);
             f.hmd.rightView = to_plain(pose1, cached_views[1].fov);
             if (head_lin_valid) {
@@ -224,6 +209,11 @@ void PoseForwarder::run() {
                  (unsigned long long)sends_ok,
                  (unsigned long long)sends_fail,
                  (int)xr_run, (int)xr_sess);
+            const int64_t rtt_ns_hb = RoundTripEstimator::current_ns();
+            const long long offset_ns =
+                (long long)last_t_target - (long long)last_t_predicted;
+            LOGI("[RTT] mean_ms=%.2f t_target_offset_from_predicted_ms=%.2f",
+                 (double)rtt_ns_hb / 1.0e6, (double)offset_ns / 1.0e6);
             last_heartbeat = now_hb;
         }
 

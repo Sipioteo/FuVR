@@ -349,6 +349,9 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
       void* mtlTexture{nullptr};
       uint32_t width{0};
       uint32_t height{0};
+      Swapchain* sc{nullptr};
+      uint32_t idx{0};
+      bool valid{false};
     };
     auto resolveSwapchain = [&](XrSwapchain handle) -> ResolvedImage {
       for (auto& sc : s->swapchains) {
@@ -357,12 +360,19 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
         const uint32_t idx = sc->lastReleasedIndex %
                              static_cast<uint32_t>(sc->images.size());
         return {sc->images[idx]->surface, sc->images[idx]->mtlTexture,
-                sc->width, sc->height};
+                sc->width, sc->height, sc.get(), idx, true};
       }
       return {};
     };
 
     std::vector<IOSurfaceRef> layers;
+    // Per-frame rendered FOV resolved from the actual swapchain image(s)
+    // being submitted on the projection layer. Falls back to the session's
+    // pending locate-FOV when no projection layer is present (legacy
+    // single-image path / non-stereo apps).
+    bool resolvedFovFromImage = false;
+    Fov submittedLeftFov{};
+    Fov submittedRightFov{};
     {
       std::lock_guard<std::mutex> lk(s->mutex);
       // Walk every composition layer; extract the primary swapchain image
@@ -385,6 +395,19 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
           if (proj->viewCount >= 2) {
             ResolvedImage L = resolveSwapchain(proj->views[0].subImage.swapchain);
             ResolvedImage R = resolveSwapchain(proj->views[1].subImage.swapchain);
+            // Pull the per-image FOV that xrReleaseSwapchainImage stamped
+            // onto these specific images. Each released image carries the
+            // FOV xrLocateViews returned for its eye at render time, so
+            // even if frames are rendered out-of-order or queued, the FOV
+            // we ship on the wire matches the pixels in the surface.
+            if (L.valid && L.idx < L.sc->imageLeftFov.size()) {
+              submittedLeftFov = L.sc->imageLeftFov[L.idx];
+              resolvedFovFromImage = true;
+            }
+            if (R.valid && R.idx < R.sc->imageRightFov.size()) {
+              submittedRightFov = R.sc->imageRightFov[R.idx];
+              resolvedFovFromImage = true;
+            }
             if (L.mtlTexture != nullptr && R.mtlTexture != nullptr) {
               if (!s->stereoBlitter) {
                 s->stereoBlitter = std::make_unique<StereoBlitter>();
@@ -443,13 +466,19 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
       }
     }
 
-    // Why: the Quest's ATW shader receives this pose as `q_render` and
-    // computes Δq = q_now * q_render⁻¹. The image Blender just rendered
-    // used the *predicted* display-time pose (xrLocateViews → predict()),
-    // not the latest raw sample. Shipping predictor.latest() instead made
-    // Δq carry the full lookahead of head motion, snapping the warp on
-    // every move. Use the same predicted pose Blender rendered with.
-    auto rendered = s->predictor.predict(static_cast<uint64_t>(info->displayTime));
+    // Why: the Quest's projection-layer scan-out timewarp uses this pose
+    // as q_render. We must hand back exactly the pose Blender rendered
+    // with — same call as xrLocateViews_impl below — so q_render and
+    // q_now can be compared on the Quest with no drift between "what
+    // Blender saw" and "what the compositor was told". With Quest now
+    // owning the lookahead (sample stamp = predicted_display_time, no
+    // RTT bias) the predictor is a near-identity passthrough; we
+    // intentionally avoid re-extrapolating against info->displayTime
+    // because that dt mixes Quest XrTime (sample stamp) with Mac XrTime
+    // (Blender's displayTime) and produces a noisy bogus rotation that
+    // shows up as micro-shake in the rendered image. predictor.latest()
+    // returns the most recent forward-stamped sample verbatim.
+    auto rendered = s->predictor.latest();
     if (rendered.has_value()) {
       f.renderedLeft = rendered->leftEye;
       f.renderedRight = rendered->rightEye;
@@ -457,8 +486,17 @@ XrResult xrEndFrame_impl(XrSession sessionHandle,
     // Carry the same (overscan-applied) FOV that xrLocateViews returned, so
     // the Quest ATW shader gets fov_render right and doesn't fall back to
     // fov_now (which is narrower than what Blender actually rendered).
-    f.renderedLeftFov  = s->lastRenderedLeftFov;
-    f.renderedRightFov = s->lastRenderedRightFov;
+    // Prefer the per-image FOV bound to the actual swapchain image being
+    // submitted (correct even when frames don't run strict locate→end);
+    // fall back to the session-level pending FOV for the non-projection
+    // legacy path.
+    if (resolvedFovFromImage) {
+      f.renderedLeftFov  = submittedLeftFov;
+      f.renderedRightFov = submittedRightFov;
+    } else {
+      f.renderedLeftFov  = s->pendingLocateLeftFov;
+      f.renderedRightFov = s->pendingLocateRightFov;
+    }
     s->frameSink->submit(f);
   }
   return XR_SUCCESS;
@@ -486,7 +524,13 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
                             XR_VIEW_STATE_ORIENTATION_TRACKED_BIT |
                             XR_VIEW_STATE_POSITION_TRACKED_BIT;
   }
-  auto predicted = s->predictor.predict(static_cast<uint64_t>(info->displayTime));
+  // Use the latest forward-stamped sample verbatim. The Quest now samples
+  // at its own predictedDisplayTime and stamps timestampNs accordingly;
+  // Mac-side extrapolation against info->displayTime would mix clock
+  // domains (Quest vs Mac XrTime) and inject noise into Blender's render
+  // pose. xrEndFrame_impl uses the same .latest() call so q_render and
+  // the pose Blender rendered with stay byte-identical.
+  auto predicted = s->predictor.latest();
   // [LATENCY-DEBUG] At 1Hz, log how far ahead xrLocateViews is asking the
   // predictor to extrapolate (dt_ms), whether the predictor's 60ms cap
   // (pose_predictor.cpp:223) is firing, and how stale the latest sample is
@@ -551,13 +595,19 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
   // and views[i].fov = this rendered fov. The OS compositor performs scan-out
   // timewarp using the +margin region; whatever margin we ship here is the
   // headroom the OS has to reproject during head motion between render-time
-  // and display-time. Add a fixed ~12° on each of the four sides (additive,
+  // and display-time. Add a fixed ~18° on each of the four sides (additive,
   // not multiplicative — multiplicative blew tan() near the asymmetric
   // outer edge). Sign convention matches XrFovf: left/down are negative,
   // right/up positive, so margin pushes left/down more negative and
   // right/up more positive. Tunable via FUVR_RT_FOV_MARGIN_DEG env var.
+  // Default raised from 12° → 18° after observing edge-stretch artefacts
+  // on the bottom row when the user pitches up faster than the lookahead
+  // can compensate: the OS scan-out timewarp ran out of overscan in the
+  // -angleDown direction and clamped to the rendered bottom edge. 18°
+  // gives ~50 % more headroom in every direction with negligible Blender
+  // render cost.
   static const float kMarginRad = []() {
-    float deg = 12.0f;
+    float deg = 18.0f;
     if (const char* env = std::getenv("FUVR_RT_FOV_MARGIN_DEG")) {
       float v = static_cast<float>(std::strtof(env, nullptr));
       if (v >= 0.0f && v <= 30.0f) deg = v;
@@ -573,7 +623,12 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
     fov.angleUp    += kMarginRad;
     fov.angleDown  -= kMarginRad;
     views[i].fov = fov;
-    Fov& cache = (i == 0) ? s->lastRenderedLeftFov : s->lastRenderedRightFov;
+    // Cache as session-level *pending* FOV. xrReleaseSwapchainImage will
+    // copy this onto the per-image FOV slot of the released image, binding
+    // the rendered FOV to the actual swapchain image being submitted (so
+    // xrEndFrame stamps the correct FOV per frame even with multi-frame
+    // queueing or background renders).
+    Fov& cache = (i == 0) ? s->pendingLocateLeftFov : s->pendingLocateRightFov;
     cache.angleLeft  = fov.angleLeft;
     cache.angleRight = fov.angleRight;
     cache.angleUp    = fov.angleUp;

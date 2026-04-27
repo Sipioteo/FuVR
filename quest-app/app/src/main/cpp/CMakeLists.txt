@@ -69,6 +69,7 @@ add_library(fuvr_quest SHARED
     decoder_pipeline.cpp
     transport_client.cpp
     pose_forwarder.cpp
+    round_trip.cpp
     compositor.cpp
     eye_blit.cpp
     fragment_reassembler.cpp

@@ -10,7 +10,7 @@
   <p>
     <img src="https://img.shields.io/badge/platform-macOS%2014%2B-black?style=flat-square&logo=apple" alt="macOS 14+"/>
     <img src="https://img.shields.io/badge/headset-Quest%202%20%7C%203%20%7C%20Pro-5c5cff?style=flat-square" alt="Quest"/>
-    <img src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square" alt="Status"/>
+    <img src="https://img.shields.io/badge/status-alpha-brightgreen?style=flat-square" alt="Status"/>
     <img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square" alt="License"/>
   </p>
 </div>
@@ -19,7 +19,7 @@
 
 FuVR lets an Apple Silicon Mac render VR content and stream it to a Meta Quest headset over USB-C or Wi-Fi, with head pose, controller input, and optional hand tracking flowing back in real time. The entire stack — OpenXR runtime, encoder, transport, and Quest client — is built from scratch for macOS, where neither SteamVR nor Quest Link exist.
 
-> **Current state:** Pre-alpha. The build system, wire protocol, and component skeletons are in place and all tests pass. Nothing streams a frame to a headset yet. See [`docs/STATUS.md`](docs/STATUS.md) for the detailed picture.
+> **Current state:** Alpha. The full pipeline is working end-to-end — tested with Blender VR on Apple Silicon, streaming to Meta Quest over USB-C. See [`docs/STATUS.md`](docs/STATUS.md) for the detailed picture.
 
 ---
 
@@ -60,6 +60,33 @@ flowchart TB
 
     style MAC fill:#0d1117,stroke:#334155,color:#e2e8f0
     style QUEST fill:#0d1117,stroke:#1e40af,color:#e2e8f0
+```
+
+---
+
+## Quick start (Blender VR)
+
+The fastest way to test the full pipeline is with Blender's built-in VR Scene Inspection. Connect your Quest via USB-C, then:
+
+```bash
+./test_pipline_blender.sh
+```
+
+The script handles everything in order:
+
+1. Stops any previous Blender/daemon/Quest session
+2. Reloads `fuvrd` via launchd (registers the `com.fuvr.daemon.surface` Mach service)
+3. Re-establishes `adb reverse tcp:9943` to the connected Quest
+4. Restarts the FuVR Quest app with a fresh logcat
+5. Launches Blender with `XR_RUNTIME_JSON` pointing at the FuVR runtime and auto-toggles VR Scene Inspection on
+6. Prints a live status summary after ~18 s
+
+**Live log tails while running:**
+
+```bash
+tail -f /tmp/fuvrd.err.log                        # daemon
+tail -f /tmp/blender_vr_pipeline.log              # Blender
+adb logcat -s fuvr.comp fuvr.proto fuvr.drift     # Quest
 ```
 
 ---

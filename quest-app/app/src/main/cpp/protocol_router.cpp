@@ -8,6 +8,9 @@
 #include "proto_codec.hpp"
 #include "clock_sync.hpp"
 #include "metrics_format.hpp"
+
+#include <cmath>
+#include "round_trip.hpp"
 #ifdef __ANDROID__
 #include "fuvr/audio/router_glue.hpp"
 #endif
@@ -120,10 +123,58 @@ void ProtocolRouter::on_video(const uint8_t* data, size_t size) {
     const uint8_t* payload = data + *consumed;
     const size_t payload_size = size - *consumed;
 
+    // Feed the RTT estimator one sample per fragment arrival. The daemon
+    // stamps targetDisplayTimeNs in the Quest's clock domain, so the gap
+    // from "now" to that target is a usable surrogate for round-trip the
+    // pose forwarder can bias OpenXR's predicted display time by.
+    RoundTripEstimator::record_sample(ClockSyncResponder::now_ns(),
+                                      hdr.targetDisplayTimeNs);
+
     reassembler_.submit(hdr.frameId, hdr.fragmentIndex, hdr.fragmentCount,
                         hdr.flags, hdr.codec, hdr.targetDisplayTimeNs,
                         hdr.renderedLeft, hdr.renderedRight,
                         payload, payload_size);
+
+    // [FOV-CHECK] Passive observation log (1 Hz). Compares per-eye fov half-
+    // angles received in the fragment header to the Quest eye-swapchain
+    // aspect ratio so a human can spot mismatched dims vs. fov geometry. This
+    // is observation-only — no behavior change. Intentionally placed here at
+    // the receive boundary to stay clear of compositor render_eye / projection
+    // layer code that Issue A may edit.
+    {
+        static uint64_t last_fov_log_ns = 0;
+        const uint64_t now_ns = ClockSyncResponder::now_ns();
+        if (now_ns - last_fov_log_ns >= 1'000'000'000ull) {
+            last_fov_log_ns = now_ns;
+            const auto& vcs = xr_.view_configs();
+            float sc_aspect_l = 0.f, sc_aspect_r = 0.f;
+            if (vcs.size() >= 2) {
+                if (vcs[0].recommendedImageRectHeight > 0)
+                    sc_aspect_l = float(vcs[0].recommendedImageRectWidth) /
+                                  float(vcs[0].recommendedImageRectHeight);
+                if (vcs[1].recommendedImageRectHeight > 0)
+                    sc_aspect_r = float(vcs[1].recommendedImageRectWidth) /
+                                  float(vcs[1].recommendedImageRectHeight);
+            }
+            const auto& fl = hdr.renderedLeft.fov;
+            const auto& fr = hdr.renderedRight.fov;
+            const float deg = 57.29577951f;
+            // fov-implied aspect = (tan(R)-tan(L)) / (tan(U)-tan(D))
+            const float fov_aspect_l = (std::tan(fl.angleRight) - std::tan(fl.angleLeft)) /
+                                       (std::tan(fl.angleUp) - std::tan(fl.angleDown));
+            const float fov_aspect_r = (std::tan(fr.angleRight) - std::tan(fr.angleLeft)) /
+                                       (std::tan(fr.angleUp) - std::tan(fr.angleDown));
+            LOGI("[FOV-CHECK] L fov(L=%.2f R=%.2f U=%.2f D=%.2f deg) "
+                 "fov_ar=%.3f sc_ar=%.3f | R fov(L=%.2f R=%.2f U=%.2f D=%.2f deg) "
+                 "fov_ar=%.3f sc_ar=%.3f",
+                 fl.angleLeft * deg, fl.angleRight * deg,
+                 fl.angleUp * deg, fl.angleDown * deg,
+                 fov_aspect_l, sc_aspect_l,
+                 fr.angleLeft * deg, fr.angleRight * deg,
+                 fr.angleUp * deg, fr.angleDown * deg,
+                 fov_aspect_r, sc_aspect_r);
+        }
+    }
 
     while (reassembler_.has_completed()) {
         auto au = reassembler_.take_completed();

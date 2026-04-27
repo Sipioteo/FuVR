@@ -239,6 +239,56 @@ TEST(PosePredictor, DedupSkipsBitIdenticalPushes) {
   EXPECT_EQ(p.size(), 2u);
 }
 
+TEST(PosePredictor, ForwardStampedSampleIsIdentity) {
+  // Quest now predicts the pose to t_target = predictedDisplayTime + RTT
+  // before sending it upstream and stamps `timestampNs = t_target`. The
+  // Mac-side predictor must therefore return the sample essentially
+  // unchanged when displayTime is at or near the sample's timestamp —
+  // any further extrapolation would double-count the lookahead.
+  PosePredictor p;
+  PoseSample s{};
+  s.timestampNs = 1'000'000'000ull;
+  s.leftEye.position = Vec3{0.10f, 0.20f, 0.30f};
+  s.rightEye.position = Vec3{0.16f, 0.20f, 0.30f};
+  // Non-trivial orientation: ~10° about Y.
+  s.leftEye.orientation = Quat{0.0f, 0.0871557f, 0.0f, 0.9961947f};
+  s.rightEye.orientation = Quat{0.0f, 0.0871557f, 0.0f, 0.9961947f};
+  // Real IMU-derived velocities — the test must show that even with
+  // non-zero velocity, dt ≈ 0 ⇒ extrapolation is identity.
+  s.linearVelocity = Vec3{0.5f, 0.0f, 0.0f};
+  s.angularVelocity = Vec3{0.0f, static_cast<float>(M_PI_2), 0.0f};
+  p.push(s);
+
+  // (a) displayTime exactly equal to timestampNs ⇒ predict() returns the
+  // last sample verbatim (early-out on line 181 of pose_predictor.cpp).
+  {
+    auto out = p.predict(s.timestampNs);
+    ASSERT_TRUE(out.has_value());
+    EXPECT_FLOAT_EQ(out->leftEye.position.x, 0.10f);
+    EXPECT_FLOAT_EQ(out->leftEye.position.y, 0.20f);
+    EXPECT_FLOAT_EQ(out->leftEye.position.z, 0.30f);
+    EXPECT_FLOAT_EQ(out->leftEye.orientation.y, 0.0871557f);
+    EXPECT_FLOAT_EQ(out->leftEye.orientation.w, 0.9961947f);
+  }
+
+  // (b) displayTime 100 µs ahead — well below the 60 ms cap and so small
+  // that extrapolation is numerically identity within ε. The cap on
+  // pose_predictor.cpp:223 (kMaxPredictSec = 60 ms) cannot fire on a
+  // fraction-of-a-millisecond positive dt; verify it stays passive.
+  {
+    auto out = p.predict(s.timestampNs + 100'000ull);  // +0.1 ms
+    ASSERT_TRUE(out.has_value());
+    constexpr float kEps = 1e-4f;
+    EXPECT_NEAR(out->leftEye.position.x, 0.10f, kEps);
+    EXPECT_NEAR(out->leftEye.position.y, 0.20f, kEps);
+    EXPECT_NEAR(out->leftEye.position.z, 0.30f, kEps);
+    EXPECT_NEAR(out->leftEye.orientation.x, 0.0f, kEps);
+    EXPECT_NEAR(out->leftEye.orientation.y, 0.0871557f, kEps);
+    EXPECT_NEAR(out->leftEye.orientation.z, 0.0f, kEps);
+    EXPECT_NEAR(out->leftEye.orientation.w, 0.9961947f, kEps);
+  }
+}
+
 TEST(PosePredictor, OrientationStaysNormalized) {
   PosePredictor p;
   for (int i = 0; i < 5; ++i) {
