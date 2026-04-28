@@ -9,11 +9,12 @@ let package = Package(
         .executable(name: "FuVR", targets: ["FuVRApp"]),
         .library(name: "FuVRControl", targets: ["FuVRControl"]),
         .library(name: "FuVRCapnp", targets: ["FuVRCapnp"]),
+        .library(name: "FuVRADB", targets: ["FuVRADB"]),
     ],
     targets: [
         .executableTarget(
             name: "FuVRApp",
-            dependencies: ["FuVRControl"],
+            dependencies: ["FuVRControl", "FuVRADB"],
             path: "Sources/FuVRApp",
             exclude: ["Resources/Assets.xcassets"],
             resources: []
@@ -21,11 +22,24 @@ let package = Package(
         .target(
             name: "FuVRControl",
             dependencies: ["FuVRCapnp"],
-            path: "Sources/FuVRControl"
+            path: "Sources/FuVRControl",
+            exclude: ["Resources/README.md"],
+            resources: [
+                // Ship the bundled adb binaries and Quest APK. `.copy` keeps
+                // the directory tree so we can pick the right arch at runtime.
+                .copy("Resources/adb"),
+                .copy("Resources/quest"),
+            ]
         ),
         .target(
             name: "FuVRCapnp",
             path: "Sources/FuVRCapnp"
+        ),
+        // ADB device management layer — uses FuVRControl's bundled binaries.
+        .target(
+            name: "FuVRADB",
+            dependencies: ["FuVRControl"],
+            path: "Sources/FuVRADB"
         ),
         .testTarget(
             name: "FuVRControlTests",

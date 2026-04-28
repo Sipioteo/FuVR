@@ -16,6 +16,10 @@ struct FuVRApp: App {
                     OnboardingView()
                         .environmentObject(state)
                 }
+                .sheet(isPresented: $state.showQuestSetup) {
+                    QuestSetupWizard()
+                        .environmentObject(state)
+                }
                 .onAppear {
                     if !onboardingShown {
                         state.showOnboarding = true
@@ -29,6 +33,8 @@ struct FuVRApp: App {
             CommandGroup(replacing: .appInfo) {
                 Button("About FuVR") { state.showAbout = true }
                 Button("Setup wizard…") { state.showOnboarding = true }
+                Button("Set up Quest headset…") { state.showQuestSetup = true }
+                    .keyboardShortcut("h", modifiers: [.command, .shift])
             }
         }
 

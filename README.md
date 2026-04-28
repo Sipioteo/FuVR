@@ -171,6 +171,23 @@ The things that seemed obvious but weren't — full write-ups in [`docs/adr/`](d
 
 ---
 
+## Mac app
+
+<table>
+  <tr>
+    <td><img src="screenshots/Screenshot 2026-04-28 alle 09.54.52.png" alt="Device dashboard" width="100%"/><br/><sub><b>Device dashboard</b> — live RTT, FPS, encode time, packet loss</sub></td>
+    <td><img src="screenshots/Screenshot 2026-04-28 alle 09.54.55.png" alt="Session" width="100%"/><br/><sub><b>Session</b> — HEVC 2064×2208 @ 90 Hz, 150 Mb/s</sub></td>
+    <td><img src="screenshots/Screenshot 2026-04-28 alle 09.54.57.png" alt="Encoder settings" width="100%"/><br/><sub><b>Encoder</b> — codec, bitrate, refresh rate, native resolution</sub></td>
+  </tr>
+  <tr>
+    <td><img src="screenshots/Screenshot 2026-04-28 alle 09.54.59.png" alt="Transport" width="100%"/><br/><sub><b>Transport</b> — USB / ADB reverse, one-click setup</sub></td>
+    <td><img src="screenshots/Screenshot 2026-04-28 alle 09.55.07.png" alt="About" width="100%"/><br/><sub><b>About</b> — v0.4, Apache 2.0, setup wizard</sub></td>
+    <td></td>
+  </tr>
+</table>
+
+---
+
 ## Contributing
 
 Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a PR. The patent grant in the Apache 2.0 license is intentional and non-negotiable. By contributing you agree to the Apache ICLA.
