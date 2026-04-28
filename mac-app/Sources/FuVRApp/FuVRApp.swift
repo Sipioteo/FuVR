@@ -1,9 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 import SwiftUI
+import AppKit
 import FuVRControl
+
+/// AppDelegate exists for one reason: when launched via `swift run`
+/// (i.e. as a bare executable without an .app bundle / Info.plist),
+/// AppKit defaults to `.accessory` activation policy — no dock icon,
+/// no Apple menu, no ⌘Q. Promoting to `.regular` at the earliest
+/// possible moment fixes that without needing to package an .app.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ note: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+}
 
 @main
 struct FuVRApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var state = AppState()
     @AppStorage("fuvr.onboarding.shown") private var onboardingShown: Bool = false
 

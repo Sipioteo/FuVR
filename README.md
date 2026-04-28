@@ -173,16 +173,36 @@ The things that seemed obvious but weren't — full write-ups in [`docs/adr/`](d
 
 ## Mac app
 
+<img src="screenshots/Screenshot 2026-04-28 alle 09.54.52.png" alt="Device dashboard — streaming to Quest 3" width="100%"/>
+
+> **Device dashboard** — live RTT, FPS, encode time, and packet loss while streaming to Quest 3 over USB-C.
+
+<br/>
+
 <table>
   <tr>
-    <td><img src="screenshots/Screenshot 2026-04-28 alle 09.54.52.png" alt="Device dashboard" width="100%"/><br/><sub><b>Device dashboard</b> — live RTT, FPS, encode time, packet loss</sub></td>
-    <td><img src="screenshots/Screenshot 2026-04-28 alle 09.54.55.png" alt="Session" width="100%"/><br/><sub><b>Session</b> — HEVC 2064×2208 @ 90 Hz, 150 Mb/s</sub></td>
-    <td><img src="screenshots/Screenshot 2026-04-28 alle 09.54.57.png" alt="Encoder settings" width="100%"/><br/><sub><b>Encoder</b> — codec, bitrate, refresh rate, native resolution</sub></td>
+    <td width="50%">
+      <img src="screenshots/Screenshot 2026-04-28 alle 09.54.57.png" alt="Encoder settings" width="100%"/>
+      <br/><br/>
+      <b>Encoder</b> — pick HEVC, H.264, or AV1. Dial in bitrate and refresh rate. Quest 3 native resolution (2064×2208) pre-filled.
+    </td>
+    <td width="50%">
+      <img src="screenshots/Screenshot 2026-04-28 alle 09.54.59.png" alt="Transport" width="100%"/>
+      <br/><br/>
+      <b>Transport</b> — USB via ADB reverse or Wi-Fi. One-click <code>adb reverse tcp:9943</code> so you don't have to think about it.
+    </td>
   </tr>
   <tr>
-    <td><img src="screenshots/Screenshot 2026-04-28 alle 09.54.59.png" alt="Transport" width="100%"/><br/><sub><b>Transport</b> — USB / ADB reverse, one-click setup</sub></td>
-    <td><img src="screenshots/Screenshot 2026-04-28 alle 09.55.07.png" alt="About" width="100%"/><br/><sub><b>About</b> — v0.4, Apache 2.0, setup wizard</sub></td>
-    <td></td>
+    <td width="50%">
+      <img src="screenshots/Screenshot 2026-04-28 alle 09.54.55.png" alt="Session" width="100%"/>
+      <br/><br/>
+      <b>Session</b> — HEVC 2064×2208 @ 90 Hz, 150 Mb/s. Daemon socket, connection state, one-tap reconnect.
+    </td>
+    <td width="50%">
+      <img src="screenshots/Screenshot 2026-04-28 alle 09.55.07.png" alt="About" width="100%"/>
+      <br/><br/>
+      <b>About</b> — v0.4, Apache 2.0. Setup wizard re-runs any time the Quest needs re-pairing.
+    </td>
   </tr>
 </table>
 
