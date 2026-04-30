@@ -137,23 +137,33 @@ Note tecniche verificate:
 
 #### 3.1.4 Transport Layer
 
-Due modalità:
+Tre modalità, in ordine di preferenza:
 
-**USB (preferred):** ADB reverse port forwarding.
+**USB / RNDIS (preferred):** UDP over USB Tethering.
+
+Il Quest espone "USB Tethering" come device Android (menu nascosto da Meta, accessibile via `adb shell am start -n com.android.settings/.TetherSettings`). Quando il toggle è ON, Mac e Quest condividono una sottorete `192.168.42.0/24` virtuale sul cavo USB, con il Quest come gateway a `192.168.42.129`. Su questa virtual-LAN si parla **UDP raw**:
+
+- Porta dedicata: `59000`
+- MTU payload: 1450 byte (margine per RNDIS encapsulation 1500 − 28 IP/UDP − 25 PktHeader)
+- Reed-Solomon FEC `(10, 4)`: ogni frame video viene splittato in 10 data shard + 4 parity shard, ciascuno in un datagram separato — tolleranza fino a 4 datagram persi per frame senza ritrasmissione
+- Bitrate cap via TokenBucket lato Mac per evitare overflow del ring buffer NDK
+- Heartbeat 500 ms su Channel::Control per tenere viva la RNDIS interface in entrambe le direzioni
+
+Vantaggi vs. ADB-reverse: nessun Head-of-Line blocking (la perdita di un pacchetto non blocca lo stream), throughput cable-line-rate (~480 Mbps su USB 2 / multi-Gbps su USB 3), latenza <2 ms aggiuntivi.
+
+L'enforcement della modalità avviene via env var `FUVR_TRANSPORT={udp,tcp}`; default = `udp` con fallback automatico a TCP se l'interfaccia tether non è ancora su.
+
+**USB / TCP (legacy fallback):** ADB reverse port forwarding.
 
 ```
 adb reverse tcp:9943 tcp:9943
 ```
 
-Il Quest, come device Android, espone ADB via USB. Questo crea un tunnel TCP attraverso il cavo USB. Latenza misurata: 5-10ms aggiuntivi rispetto a USB raw, throughput limitato a circa 200-300 Mbps su USB 3 (overhead ADB protocol). Sufficiente per HEVC 100 Mbps.
-
-Vantaggi: zero driver USB custom, zero claim del device, compatibile con Developer Mode standard del Quest. È la strada usata da ALVR per il loro "wired mode".
-
-Svantaggi: ADB aggiunge latenza e overhead rispetto a USB bulk diretto. Un'implementazione futura potrebbe esplorare Android Open Accessory (AOA) protocol, ma richiede di non usare il Quest in modalità debug standard.
+Path TCP-over-loopback storico, mantenuto come fallback per build legacy o quando l'utente non ha ancora abilitato il tethering. Latenza 5-10 ms aggiuntivi, throughput 200-300 Mbps, soggetto a HoL blocking del kernel.
 
 **Wi-Fi:** UDP custom + Forward Error Correction.
 
-Pattern standard ALVR-like: pacchetti UDP frammentati con sequence number, FEC Reed-Solomon per resilienza al packet loss, framing custom per delimitare frame video.
+Stesso wire format del path RNDIS (Reed-Solomon Galois-8, header `PktHeader` 25 byte LE), ma sottoposto a packet loss reale della rete. Path attualmente exploratory.
 
 #### 3.1.5 Pose Prediction
 

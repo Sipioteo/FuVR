@@ -1,0 +1,11 @@
+# Android NDK C++ build artifacts
+quest-app/app/.cxx/
+
+# OpenVR shim (external/untracked)
+openvr-shim/
+
+# Bundled ADB binaries (license notices, not source)
+mac-app/Sources/FuVRControl/Resources/adb/
+
+# Benchmark output
+bench-output/

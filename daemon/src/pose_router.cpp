@@ -115,6 +115,13 @@ static void fillSnapshot(::fuvr::daemon::PoseSnapshot::Builder& snap,
     snap.setRightFovAngleDown(rightFov.angleDown);
 }
 
+bool PoseRouter::latestPoseSet(LatestPoseSet& out) const {
+    std::lock_guard lk(latestMu_);
+    if (!latest_.valid) return false;
+    out = latest_;
+    return true;
+}
+
 void PoseRouter::dispatchSnapshot(uint64_t sessionId,
                                   uint64_t receivedAtNs,
                                   uint64_t questTimestampNs,
@@ -127,6 +134,68 @@ void PoseRouter::dispatchSnapshot(uint64_t sessionId,
                                   const ControllerSampleIn& rightCtrl,
                                   const FovIn& leftFov,
                                   const FovIn& rightFov) {
+    // Populate the OpenVR-shim pose cache. HMD = midpoint of view positions,
+    // orientation from left view (see header comment). Per-controller pose
+    // gets full pos+quat+vel; valid bit derived from `active`.
+    {
+        LatestPoseSet next{};
+        next.valid = true;
+        next.questTimestampNs = questTimestampNs;
+        next.receivedAtNs = receivedAtNs;
+        next.validMask = 0x1; // HMD always valid once we got a frame
+        next.hmd[0] = 0.5f * (left[0] + right[0]);
+        next.hmd[1] = 0.5f * (left[1] + right[1]);
+        next.hmd[2] = 0.5f * (left[2] + right[2]);
+        next.hmd[3] = left[3]; // qx
+        next.hmd[4] = left[4]; // qy
+        next.hmd[5] = left[5]; // qz
+        next.hmd[6] = left[6]; // qw
+        next.hmd[7]  = linVel[0];
+        next.hmd[8]  = linVel[1];
+        next.hmd[9]  = linVel[2];
+        next.hmd[10] = angVel[0];
+        next.hmd[11] = angVel[1];
+        next.hmd[12] = angVel[2];
+        if (leftCtrl.active) {
+            next.validMask |= 0x2;
+            next.leftCtrl[0] = leftCtrl.pos[0];
+            next.leftCtrl[1] = leftCtrl.pos[1];
+            next.leftCtrl[2] = leftCtrl.pos[2];
+            next.leftCtrl[3] = leftCtrl.rot[0];
+            next.leftCtrl[4] = leftCtrl.rot[1];
+            next.leftCtrl[5] = leftCtrl.rot[2];
+            next.leftCtrl[6] = leftCtrl.rot[3];
+            next.leftCtrl[7]  = leftCtrl.linVel[0];
+            next.leftCtrl[8]  = leftCtrl.linVel[1];
+            next.leftCtrl[9]  = leftCtrl.linVel[2];
+            next.leftCtrl[10] = leftCtrl.angVel[0];
+            next.leftCtrl[11] = leftCtrl.angVel[1];
+            next.leftCtrl[12] = leftCtrl.angVel[2];
+        } else {
+            next.leftCtrl[6] = 1.0f; // identity quat for safety
+        }
+        if (rightCtrl.active) {
+            next.validMask |= 0x4;
+            next.rightCtrl[0] = rightCtrl.pos[0];
+            next.rightCtrl[1] = rightCtrl.pos[1];
+            next.rightCtrl[2] = rightCtrl.pos[2];
+            next.rightCtrl[3] = rightCtrl.rot[0];
+            next.rightCtrl[4] = rightCtrl.rot[1];
+            next.rightCtrl[5] = rightCtrl.rot[2];
+            next.rightCtrl[6] = rightCtrl.rot[3];
+            next.rightCtrl[7]  = rightCtrl.linVel[0];
+            next.rightCtrl[8]  = rightCtrl.linVel[1];
+            next.rightCtrl[9]  = rightCtrl.linVel[2];
+            next.rightCtrl[10] = rightCtrl.angVel[0];
+            next.rightCtrl[11] = rightCtrl.angVel[1];
+            next.rightCtrl[12] = rightCtrl.angVel[2];
+        } else {
+            next.rightCtrl[6] = 1.0f;
+        }
+        std::lock_guard lk(latestMu_);
+        latest_ = next;
+    }
+
     const uint64_t tStartNs = latencyDebugEnabled() ? monoNs() : 0ull;
     std::vector<std::pair<uint64_t, PoseSubscriber>> targets;
     {

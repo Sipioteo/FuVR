@@ -14,6 +14,7 @@ async fn loopback_round_trip() {
     let cfg = UdpConfig {
         mtu_payload: 1200,
         fec: FecConfig { data_shards: 4, parity_shards: 2 },
+        bitrate_bps_cap: None,
     };
 
     let any: SocketAddr = "127.0.0.1:0".parse().unwrap();

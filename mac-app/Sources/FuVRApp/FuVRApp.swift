@@ -12,6 +12,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+
+        // Override the generic Terminal/cmd dock icon when running via
+        // `swift run` (no .app bundle / Info.plist). Bundle.module resolves
+        // to the per-target resource bundle SwiftPM generates for FuVRApp.
+        if let url = Bundle.module.url(forResource: "AppIcon", withExtension: "png"),
+           let img = NSImage(contentsOf: url) {
+            NSApp.applicationIconImage = img
+        }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
@@ -27,17 +35,13 @@ struct FuVRApp: App {
             ContentView()
                 .environmentObject(state)
                 .frame(minWidth: 880, minHeight: 600)
-                .sheet(isPresented: $state.showOnboarding) {
-                    OnboardingView()
-                        .environmentObject(state)
-                }
                 .sheet(isPresented: $state.showQuestSetup) {
                     QuestSetupWizard()
                         .environmentObject(state)
                 }
                 .onAppear {
                     if !onboardingShown {
-                        state.showOnboarding = true
+                        state.showQuestSetup = true
                         onboardingShown = true
                     }
                 }
@@ -47,8 +51,7 @@ struct FuVRApp: App {
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About FuVR") { state.showAbout = true }
-                Button("Setup wizard…") { state.showOnboarding = true }
-                Button("Set up Quest headset…") { state.showQuestSetup = true }
+                Button("Setup wizard…") { state.showQuestSetup = true }
                     .keyboardShortcut("h", modifiers: [.command, .shift])
             }
         }

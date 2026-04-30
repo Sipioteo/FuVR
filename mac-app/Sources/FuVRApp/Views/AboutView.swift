@@ -18,7 +18,7 @@ struct AboutView: View {
                 .font(.callout).foregroundStyle(.secondary)
 
             Button {
-                state.showOnboarding = true
+                state.showQuestSetup = true
             } label: {
                 Label("Re-run setup wizard", systemImage: "wand.and.stars")
             }

@@ -241,19 +241,25 @@ void DaemonClient::readerLoop() noexcept {
     ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
     if (n <= 0) {
       if (n < 0 && errno == EINTR) continue;
-      ::close(fd);
-      fd_.store(-1);
-      if (!stop_.load()) {
-        DisconnectCallback dc;
-        {
-          std::lock_guard<std::mutex> lk(cbMutex_);
-          if (!disconnectFired_) {
-            dc = disconnectCb_;
-            disconnectFired_ = true;
-          }
-        }
-        if (dc) dc();
+      // Race-safe close: shutdown() may have already taken the fd via
+      // `fd_.exchange(-1)` and closed it. If we close again on the local
+      // `fd` variable, the kernel can recycle that descriptor for the
+      // NEXT session's socket → we silently kill a brand-new connection.
+      // Only close if we win the exchange (i.e. fd_ still held our fd).
+      int prev = fd_.exchange(-1);
+      if (prev >= 0) {
+        ::close(prev);
       }
+      if (stop_.load()) break;
+      DisconnectCallback dc;
+      {
+        std::lock_guard<std::mutex> lk(cbMutex_);
+        if (!disconnectFired_) {
+          dc = disconnectCb_;
+          disconnectFired_ = true;
+        }
+      }
+      if (dc) dc();
       continue;
     }
     buf.insert(buf.end(), tmp, tmp + n);

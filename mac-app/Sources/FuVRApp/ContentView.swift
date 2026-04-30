@@ -3,10 +3,11 @@ import SwiftUI
 import FuVRControl
 
 enum Tab: String, CaseIterable, Hashable {
-    case device, session, encoder, transport, diagnostics, log, about
+    case stream, device, session, encoder, transport, diagnostics, log, about
 
     var label: String {
         switch self {
+        case .stream:      return "Stream"
         case .device:      return "Device"
         case .session:     return "Session"
         case .encoder:     return "Encoder"
@@ -19,6 +20,7 @@ enum Tab: String, CaseIterable, Hashable {
 
     var systemImage: String {
         switch self {
+        case .stream:      return "dot.radiowaves.left.and.right"
         case .device:      return "goggles"
         case .session:     return "play.circle"
         case .encoder:     return "cpu"
@@ -32,7 +34,7 @@ enum Tab: String, CaseIterable, Hashable {
 
 struct ContentView: View {
     @EnvironmentObject var state: AppState
-    @State private var tab: Tab = .device
+    @State private var tab: Tab = .stream
 
     var body: some View {
         NavigationSplitView {
@@ -49,6 +51,7 @@ struct ContentView: View {
         } detail: {
             Group {
                 switch tab {
+                case .stream:      StreamView()
                 case .device:      DeviceDashboardView()
                 case .session:     SessionView()
                 case .encoder:     EncoderSettingsView()

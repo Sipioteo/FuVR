@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use transport_core::channel::Channel;
 use transport_core::transport::Transport;
-use transport_udp::{UdpConfig, UdpTransport};
+use transport_udp::{tethering, HeartbeatGuard, UdpConfig, UdpTransport};
 use transport_usb::{UsbClient, UsbServer, DEFAULT_PORT};
 
 #[repr(C)]
@@ -26,6 +26,11 @@ pub enum FuvrTransportKind {
     UsbServer = 0,
     UsbClient = 1,
     Udp = 2,
+    /// UDP over RNDIS/NCM USB tethering. The endpoint string is ignored;
+    /// the local address is auto-discovered on `192.168.42.0/24` and the
+    /// peer is fixed at `192.168.42.129:59000`. A 500 ms heartbeat is
+    /// started automatically to keep the cable awake.
+    UdpRndis = 3,
 }
 
 #[repr(C)]
@@ -89,6 +94,7 @@ pub struct FuvrTransport {
     inner: Arc<dyn Transport>,
     callback: Mutex<Option<(FuvrRecvCallback, usize)>>,
     stats: Arc<StatsCounters>,
+    _heartbeat: Option<HeartbeatGuard>,
 }
 
 unsafe impl Send for FuvrTransport {}
@@ -112,32 +118,40 @@ pub extern "C" fn fuvr_transport_create(
         }
     };
 
-    let result: Result<Arc<dyn Transport>, ()> = rt.block_on(async {
+    let result: Result<(Arc<dyn Transport>, Option<HeartbeatGuard>), ()> = rt.block_on(async {
         match kind {
             FuvrTransportKind::UsbServer => {
                 let port = endpoint_str.parse().unwrap_or(DEFAULT_PORT);
                 UsbServer::bind(port, false)
                     .await
-                    .map(|s| s as Arc<dyn Transport>)
+                    .map(|s| (s as Arc<dyn Transport>, None))
                     .map_err(|_| ())
             }
             FuvrTransportKind::UsbClient => {
                 let port = endpoint_str.parse().unwrap_or(DEFAULT_PORT);
                 UsbClient::connect(port)
                     .await
-                    .map(|s| s as Arc<dyn Transport>)
+                    .map(|s| (s as Arc<dyn Transport>, None))
                     .map_err(|_| ())
             }
             FuvrTransportKind::Udp => {
                 let addr: SocketAddr = endpoint_str.parse().map_err(|_| ())?;
                 UdpTransport::bind(addr, UdpConfig::default())
                     .await
-                    .map(|s| s as Arc<dyn Transport>)
+                    .map(|s| (s as Arc<dyn Transport>, None))
                     .map_err(|_| ())
+            }
+            FuvrTransportKind::UdpRndis => {
+                let udp = UdpTransport::bind_rndis(UdpConfig::default())
+                    .await
+                    .map_err(|_| ())?;
+                let hb = udp.spawn_heartbeat(std::time::Duration::from_millis(500));
+                Ok((udp as Arc<dyn Transport>, Some(hb)))
             }
         }
     });
-    let inner = match result {
+    let _ = tethering::ANDROID_TETHER_GATEWAY; // keep symbol live
+    let (inner, heartbeat) = match result {
         Ok(t) => t,
         Err(()) => return std::ptr::null_mut(),
     };
@@ -147,6 +161,7 @@ pub extern "C" fn fuvr_transport_create(
         inner: inner.clone(),
         callback: Mutex::new(None),
         stats: stats.clone(),
+        _heartbeat: heartbeat,
     });
     let raw: *mut FuvrTransport = Box::into_raw(handle);
     let raw_addr = raw as usize;

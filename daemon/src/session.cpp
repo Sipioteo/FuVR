@@ -13,6 +13,7 @@
 #include "fuvr_transport.h"
 #include "fuvr_vdisplay_control.h"
 #include "fuvr/daemon/audio/audio_session.hpp"
+#include "fuvr/logger.hpp"
 
 namespace fuvr::daemon {
 
@@ -107,7 +108,17 @@ public:
         wire.insert(wire.end(), f.data, f.data + f.size);
 
         if (transport_) {
-            fuvr_transport_send(transport_, FuvrChannel_Video, wire.data(), wire.size());
+            int rc = fuvr_transport_send(transport_, FuvrChannel_Video, wire.data(), wire.size());
+            static thread_local uint64_t s_count = 0;
+            if ((s_count % 60) == 0 || rc != 0) {
+                FUVR_LOG_INFO("session",
+                              "transport send video pkt frameId=%llu seq=%llu size=%zu -> %s",
+                              (unsigned long long)f.frameId,
+                              (unsigned long long)s_count,
+                              wire.size(),
+                              rc == 0 ? "ok" : "err");
+            }
+            ++s_count;
         }
 
         uint64_t startNs = owner_->lastEncodeStartNs_.load();
@@ -217,7 +228,20 @@ bool Session::submitFrame(CVPixelBufferRef pb,
         renderedPoses_[frameId] = rp;
     }
 
-    return encoder_->submit(pb, frameId, renderStartNs, forceIdr);
+    {
+      static thread_local uint64_t s_count = 0;
+      bool log = (s_count % 60) == 0;
+      bool ok = encoder_->submit(pb, frameId, renderStartNs, forceIdr);
+      if (log || !ok) {
+        FUVR_LOG_INFO("session",
+                      "encoder submit frameId=%llu seq=%llu -> %s",
+                      (unsigned long long)frameId,
+                      (unsigned long long)s_count,
+                      ok ? "ok" : "err");
+      }
+      ++s_count;
+      return ok;
+    }
 }
 
 } // namespace fuvr::daemon

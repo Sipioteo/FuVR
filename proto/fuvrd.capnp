@@ -313,7 +313,26 @@ struct Envelope {
     # union stable across deploy skews.
     getDeviceCapabilities      @20 :Void;
     deviceCapabilitiesResponse @21 :DeviceCapabilitiesResponse;
+
+    # Pass 7: active-stream introspection. The mac-app polls this to render
+    # its "Stream" tab (which app is currently submitting frames, at what
+    # rate). For now there is a single global active stream; this naturally
+    # extends to a list when multi-session lands.
+    getActiveStream            @22 :Void;
+    activeStreamResponse       @23 :ActiveStreamResponse;
   }
+}
+
+# Snapshot of whatever the daemon currently considers the active video stream.
+# `connected = false` means no app is currently producing frames.
+struct ActiveStreamResponse {
+  connected       @0 :Bool;
+  perEyeWidth     @1 :UInt32;
+  perEyeHeight    @2 :UInt32;
+  refreshRateHz   @3 :UInt32;
+  currentFps      @4 :Float32;   # rolling 1-second submit-rate
+  framesSubmitted @5 :UInt64;    # total since the active session started
+  appKey          @6 :Text;      # empty if not connected
 }
 
 # Snapshot of the latest helloFromQuest received by the daemon. `valid` is

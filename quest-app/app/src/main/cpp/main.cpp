@@ -56,6 +56,23 @@ extern "C" void android_main(android_app* app) {
 
     fuvr::ProtocolRouter router(transport, decoder, session);
     router.install();
+    // Transport selection on Quest:
+    //   We previously tried UDP-RNDIS first with a 2 s peer-wait, falling
+    //   back to TCP. That blocked the main (OpenXR) thread for 2 s during
+    //   init — which the Quest compositor watchdog interprets as an
+    //   unresponsive app and kills.
+    //
+    //   Since macOS does NOT bind the Quest's RNDIS USB function class
+    //   (confirmed empirically: `ifconfig | grep 192.168.42` returns
+    //   nothing after toggling USB Tethering), the UDP path can never
+    //   succeed on a Mac host today. Defaulting to TCP-over-`adb reverse`
+    //   restores instant startup and matches the path the mac-app's
+    //   SessionOrchestrator already wires up.
+    //
+    //   The UDP code in `transport_client` is preserved (the dual-path
+    //   client stays functional) so a future macOS release with native
+    //   RNDIS support — or a Linux host — only needs main.cpp to flip
+    //   back to start_udp.
     transport.start("127.0.0.1", 9943);
     router.send_hello_from_quest();
 

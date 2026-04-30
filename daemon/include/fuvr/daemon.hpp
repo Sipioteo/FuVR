@@ -10,10 +10,13 @@
 #include <unordered_map>
 #include <vector>
 
+#include <CoreVideo/CoreVideo.h>
+
 #include "fuvr/clock_sync.hpp"
 #include "fuvr/input_router.hpp"
 #include "fuvr/iosurface_xpc_service.hpp"
 #include "fuvr/metrics.hpp"
+#include "fuvr/openvr_listener.hpp"
 #include "fuvr/pose_router.hpp"
 #include "fuvr/rpc_server.hpp"
 #include "fuvr/session.hpp"
@@ -35,6 +38,49 @@ public:
     MetricsAggregator& globalMetrics() { return globalMetrics_; }
     ClockSync& clockSync() { return clockSync_; }
 
+    // OpenVR-shim entry points. Used by OpenVrListener to spin up an
+    // encoder-backed Session on Hello and to resolve per-frame surface tokens
+    // into CVPixelBuffers on SubmitFrame. Kept on Daemon (rather than the
+    // listener) because XPC service ownership lives here and Session creation
+    // must latch the Quest transport that this class already owns.
+    //
+    // Returns the session id, or 0 on failure.
+    uint64_t openOpenVrSession(uint32_t perEyeWidth,
+                               uint32_t perEyeHeight,
+                               uint32_t refreshRateHz,
+                               const std::string& appKey);
+    void     closeOpenVrSession(uint64_t sessionId);
+    // Resolve `surfaceToken` to a retained CVPixelBuffer; caller releases.
+    CVPixelBufferRef resolveSurfaceToken(uint64_t surfaceToken);
+    // Submit a fully-built CVPixelBuffer through the named session. Returns
+    // false if the session has been torn down meanwhile.
+    bool submitOpenVrFrame(uint64_t sessionId,
+                           CVPixelBufferRef pb,
+                           uint64_t frameId,
+                           uint64_t renderStartNs,
+                           const float renderedLeftPose[7],
+                           const float renderedRightPose[7],
+                           const float leftFov[4],
+                           const float rightFov[4]);
+
+    // Snapshot of the currently-active OpenVR stream for the rpc.sock query.
+    struct ActiveStreamSnapshot {
+        bool        connected{false};
+        uint32_t    perEyeWidth{0};
+        uint32_t    perEyeHeight{0};
+        uint32_t    refreshRateHz{0};
+        float       currentFps{0.0f};
+        uint64_t    framesSubmitted{0};
+        std::string appKey;
+    };
+    ActiveStreamSnapshot activeStreamSnapshot() const;
+    void noteOpenVrFrameSubmitted();   // called by listener to drive fps / count
+    void setActiveStreamMeta(const std::string& appKey,
+                             uint32_t perEyeWidth,
+                             uint32_t perEyeHeight,
+                             uint32_t refreshRateHz);
+    void clearActiveStream();
+
 private:
     void onEnvelope(const InboundRpc& rpc);
     void metricsLoop();
@@ -45,6 +91,7 @@ private:
                                 const uint8_t* data, std::size_t len);
 
     RpcServer rpc_;
+    OpenVrListener openvrListener_;
     PoseRouter poseRouter_;
     InputRouter inputRouter_;
     MetricsAggregator globalMetrics_;
@@ -89,6 +136,24 @@ private:
     };
     std::mutex capsMu_;
     CachedCapabilities caps_;
+
+    // OpenVR active-stream telemetry. Single-stream only for now; later this
+    // becomes a vector keyed by sessionId. Mutex guards everything inside.
+    mutable std::mutex activeStreamMu_;
+    struct ActiveStreamState {
+        bool        connected{false};
+        uint64_t    sessionId{0};
+        std::string appKey;
+        uint32_t    perEyeWidth{0};
+        uint32_t    perEyeHeight{0};
+        uint32_t    refreshRateHz{0};
+        uint64_t    framesSubmitted{0};
+        // Sliding 1-second timestamp ring (ns since steady_clock epoch).
+        // Capped at 256 entries — at 90 Hz that holds ~2.8 s worth which
+        // is more than enough for a 1 s window even with brief stalls.
+        std::vector<uint64_t> recentSubmitNs;
+    };
+    ActiveStreamState activeStream_;
 
     FuvrTransport* transport_ = nullptr;
     std::unique_ptr<IOSurfaceXpcService> xpcService_;

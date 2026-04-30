@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "id": "fuvr",
+  "version": "${version}",
+
+  "name": "FuVR",
+  "description": "The VR mod for any loader!",
+  "icon": "vivecraft_icon.png",
+  "authors": [
+    "fayer3",
+    "Ferri_Arnus",
+    "IMS",
+    "jrbudda",
+    "minecraft player",
+    "Techjar"
+  ],
+
+  "license": "LGPLv3",
+
+  "environment": "*",
+  "entrypoints": {
+    "mm:early_risers": [
+      "org.vivecraft.fabric.VivecraftEarlyEntryForOptifabric"
+    ],
+    "main": [
+      "org.vivecraft.fabric.VivecraftMod"
+    ],
+    "modmenu": [
+      "org.vivecraft.fabric.client.VivecraftModMenuApiImpl"
+    ]
+  },
+  "mixins": [
+    "vivecraft.mixins.json",
+    "vivecraft.fabric.mixins.json",
+    "vivecraft.accessories.mixins.json",
+    "vivecraft.alexmobs.mixins.json",
+    "vivecraft.armourers_workshop.mixins.json",
+    "vivecraft.bedrockify.mixins.json",
+    "vivecraft.blur.mixins.json",
+    "vivecraft.cataclysm.mixins.json",
+    "vivecraft.curios.mixins.json",
+    "vivecraft.dynamicfps.mixins.json",
+    "vivecraft.emf.mixins.json",
+    "vivecraft.epicfight.mixins.json",
+    "vivecraft.iris.mixins.json",
+    "vivecraft.mca.mixins.json",
+    "vivecraft.modmenu.mixins.json",
+    "vivecraft.optifine.mixins.json",
+    "vivecraft.rei.mixins.json",
+    "vivecraft.resolutioncontrol.mixins.json",
+    "vivecraft.sereneseasons.mixins.json",
+    "vivecraft.sodium.mixins.json",
+    "vivecraft.trinkets.mixins.json",
+    "vivecraft.voxy.mixins.json",
+    "vivecraft.xaerosmimimap.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.1",
+    "minecraft": ["1.20", "1.20.1"],
+    "java": ">=17"
+  },
+  "breaks": {
+    "sodium": ["0.4.11+build.25", "0.4.11+build.26"]
+  },
+  "suggests": {
+    "another-mod": "*"
+  },
+  "contact": {
+    "homepage": "https://modrinth.com/mod/vivecraft",
+    "issues": "https://github.com/Vivecraft/VivecraftMod/issues",
+    "sources": "https://github.com/Vivecraft/VivecraftMod"
+  },
+  "custom": {
+    "mc-publish": {
+      "dependencies": [
+        "sodium(incompatible)#(ignore)"
+      ]
+    },
+    "modmenu": {
+      "links": {
+        "modmenu.discord": "https://discord.gg/jYyyv7zhSW",
+        "vivecraft.message.kofi": "https://ko-fi.com/vivecraft"
+      },
+      "update_checker": true
+    }
+  }
+}

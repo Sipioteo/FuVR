@@ -17,8 +17,13 @@ final class AppState: ObservableObject {
     @Published var showAbout: Bool = false
     @Published var lastError: String?
     @Published var sessionInfo: SessionInfo?
-    @Published var showOnboarding: Bool = false
     @Published var showQuestSetup: Bool = false
+
+    /// Snapshot of the currently bound OpenVR application, refreshed every
+    /// 500 ms while the Stream tab is visible. `nil` means "never polled".
+    @Published var activeStream: ActiveStream?
+
+    private var streamPollTask: Task<Void, Never>?
 
     let metrics = MetricsBuffer(capacity: 600)
 
@@ -46,6 +51,72 @@ final class AppState: ObservableObject {
         bridge = ClientBridge(owner: self)
         client.delegate = bridge
         startADBPoller()
+        Self.exportOpenXrRuntimeEnv()
+        // Publish current Encoder settings to the GUI env at startup so
+        // the FIRST Blender launch already inherits them. Subsequent
+        // edits in EncoderSettingsView re-run this via .onChange.
+        let d = UserDefaults.standard
+        let bitrate = d.object(forKey: SettingsKey.bitrateMbps) as? Int ?? 150
+        let codec   = d.object(forKey: SettingsKey.codec)       as? String ?? "hevc"
+        let refresh = d.object(forKey: SettingsKey.refreshRate) as? Int ?? 90
+        Self.publishEncoderEnv(bitrateMbps: bitrate, codec: codec, refreshHz: refresh)
+    }
+
+    /// Push the user's Encoder-page settings into the GUI session env
+    /// (via `launchctl setenv`). The runtime-macos read these at session
+    /// creation; Blender (re)launched from Finder afterwards inherits.
+    /// Idempotent. Driven from `init()` and from EncoderSettingsView's
+    /// `.onChange` handlers so changing the slider takes effect on the
+    /// NEXT Blender launch.
+    static func publishEncoderEnv(bitrateMbps: Int, codec: String, refreshHz: Int) {
+        let runArgs: (String, [String]) -> Void = { exe, args in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: exe)
+            p.arguments = args
+            try? p.run()
+            p.waitUntilExit()
+        }
+        let bps = String(max(1, bitrateMbps) * 1_000_000)
+        runArgs("/bin/launchctl", ["setenv", "FUVR_RT_BITRATE_BPS", bps])
+        runArgs("/bin/launchctl", ["setenv", "FUVR_RT_CODEC",
+                                   codec.lowercased().contains("h264") ? "h264" : "hevc"])
+        runArgs("/bin/launchctl", ["setenv", "FUVR_RT_REFRESH_HZ", String(refreshHz)])
+    }
+
+    /// Run `adb reverse tcp:9943 tcp:9943` for the given serial so the
+    /// Quest app's loopback connect tunnels back to the Mac daemon.
+    /// Best-effort and silent on failure — the recv loop on the Quest
+    /// side will keep retrying anyway.
+    nonisolated private static func setupAdbReverse(serial: String) {
+        guard let adb = try? AdbController() else { return }
+        do {
+            try adb.reverse(port: 9943, serial: serial)
+        } catch {
+            NSLog("[fuvr] adb reverse failed: \(error)")
+        }
+    }
+
+    /// Publish `XR_RUNTIME_JSON` to the GUI session so user-launched apps
+    /// (Blender, Unity-based games, anything that uses the Khronos OpenXR
+    /// loader) pick up FuVR's runtime manifest without needing the user
+    /// to set env vars manually. Idempotent and cheap; we always run it
+    /// at app startup so a stale or missing setenv self-heals.
+    private static func exportOpenXrRuntimeEnv() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let manifest = home
+            .appendingPathComponent(".config/openxr/1/active_runtime.json")
+            .path
+        guard FileManager.default.fileExists(atPath: manifest) else {
+            // No manifest yet — the install-daemon step writes it; running
+            // launchctl setenv with a non-existent file would just point
+            // Blender at a dead path.
+            return
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["setenv", "XR_RUNTIME_JSON", manifest]
+        try? p.run()
+        p.waitUntilExit()
     }
 
     // MARK: - Control-socket API (unchanged)
@@ -124,6 +195,30 @@ final class AppState: ObservableObject {
         pollerBridge = del              // retain — delegate is weak
         poller.delegate = del
         poller.start()
+        adbPollerPaused = false
+    }
+
+    /// Whether the global ADB poller is currently suspended. Exposed so the
+    /// wizard can show "ADB paused" hints when the tether toggle is active.
+    @Published private(set) var adbPollerPaused: Bool = false
+
+    /// Stop the 2 Hz `adb devices -l` poll. Used during the USB-Tethering
+    /// toggle window: when Android is mid-way through reconfiguring the
+    /// USB function set to add RNDIS, any concurrent `adb` traffic from
+    /// the host re-enumerates the device and the tether toggle silently
+    /// rolls back to OFF. Pausing the poller for the duration of the
+    /// toggle prevents that race.
+    public func pauseAdbPolling() {
+        guard !adbPollerPaused else { return }
+        poller.stop()
+        adbPollerPaused = true
+    }
+
+    /// Re-arm the poller after a tether toggle is settled (or aborted).
+    public func resumeAdbPolling() {
+        guard adbPollerPaused else { return }
+        poller.start()
+        adbPollerPaused = false
     }
 
     fileprivate func handleDevices(_ devices: [ADBDevice]) {
@@ -183,6 +278,17 @@ final class AppState: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 if ok {
+                    // Why here: the daemon's `UsbServer` listens on
+                    // `127.0.0.1:9943` (Mac side), and the Quest's
+                    // TransportClient dials its own `127.0.0.1:9943`.
+                    // Without `adb reverse tcp:9943 tcp:9943` the Quest's
+                    // localhost is its OWN host — frames go nowhere.
+                    // Setting it up here means: by the time the user (or
+                    // Blender) clicks "Start session", the tunnel is
+                    // already alive. Idempotent: adb returns success even
+                    // if the rule already exists.
+                    Self.setupAdbReverse(serial: serial)
+
                     withAnimation(.spring(duration: 0.5)) {
                         self.deviceState = .streaming(serial: serial, model: model)
                     }
@@ -223,6 +329,35 @@ final class AppState: ObservableObject {
         case .error(let s): lastError = s
         case .helloFromMac: break
         }
+    }
+
+    // MARK: - Active-stream polling
+
+    /// Begin polling the daemon for `GetActiveStream` snapshots at 2 Hz.
+    /// Reads are coalesced — if a request takes longer than the tick
+    /// interval the next tick is skipped rather than queued. Idempotent.
+    func startActiveStreamPolling(intervalMs: UInt64 = 500) {
+        guard streamPollTask == nil else { return }
+        let nanos = intervalMs * 1_000_000
+        streamPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let started = DispatchTime.now().uptimeNanoseconds
+                if let snap = try? await self?.client.getActiveStream() {
+                    await MainActor.run { self?.activeStream = snap }
+                }
+                let elapsed = DispatchTime.now().uptimeNanoseconds - started
+                if elapsed < nanos {
+                    try? await Task.sleep(nanoseconds: nanos - elapsed)
+                }
+                // If `elapsed >= nanos` we skip the sleep — that's the
+                // coalescing behaviour: never queue a backlog of pings.
+            }
+        }
+    }
+
+    func stopActiveStreamPolling() {
+        streamPollTask?.cancel()
+        streamPollTask = nil
     }
 
     fileprivate func setConnectionState(_ s: ControlClientState) {

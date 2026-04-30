@@ -316,6 +316,42 @@ bool Compositor::build_projection_layer(OpenXrSession& xr,
         views[i].subImage.imageRect.extent.height = eyes_[i].height;
         views[i].subImage.imageArrayIndex = 0;
     }
+    {
+        static int s_log_throttle = 0;
+        if ((s_log_throttle++ % 90) == 0) {
+            const auto& L = views[0].pose.position;
+            const auto& R = views[1].pose.position;
+            const auto& Lq = views[0].pose.orientation;
+            const auto& Rq = views[1].pose.orientation;
+            const auto& Lf = views[0].fov;
+            const auto& Rf = views[1].fov;
+            const float dx = R.x - L.x, dy = R.y - L.y, dz = R.z - L.z;
+            const float ipd = std::sqrt(dx*dx + dy*dy + dz*dz);
+            LOGI("proj L pos=(%.4f,%.4f,%.4f) q=(%.3f,%.3f,%.3f,%.3f) "
+                 "fov L/R/U/D rad=(%.3f,%.3f,%.3f,%.3f)",
+                 L.x, L.y, L.z, Lq.x, Lq.y, Lq.z, Lq.w,
+                 Lf.angleLeft, Lf.angleRight, Lf.angleUp, Lf.angleDown);
+            LOGI("proj R pos=(%.4f,%.4f,%.4f) q=(%.3f,%.3f,%.3f,%.3f) "
+                 "fov L/R/U/D rad=(%.3f,%.3f,%.3f,%.3f)",
+                 R.x, R.y, R.z, Rq.x, Rq.y, Rq.z, Rq.w,
+                 Rf.angleLeft, Rf.angleRight, Rf.angleUp, Rf.angleDown);
+            LOGI("proj IPD=%.4fm  delta=(%.4f,%.4f,%.4f)  "
+                 "rv_left_valid=%d rv_right_valid=%d  fov_valid_L=%d fov_valid_R=%d",
+                 ipd, dx, dy, dz,
+                 (int)((rendered_left_.pose.ow != 1.0f) || (rendered_left_.pose.ox != 0.0f) ||
+                       (rendered_left_.pose.oy != 0.0f) || (rendered_left_.pose.oz != 0.0f)),
+                 (int)((rendered_right_.pose.ow != 1.0f) || (rendered_right_.pose.ox != 0.0f) ||
+                       (rendered_right_.pose.oy != 0.0f) || (rendered_right_.pose.oz != 0.0f)),
+                 (int)(rendered_left_.fov.angleLeft != 0.0f || rendered_left_.fov.angleRight != 0.0f),
+                 (int)(rendered_right_.fov.angleLeft != 0.0f || rendered_right_.fov.angleRight != 0.0f));
+            const auto& sL = snap[0].pose.position;
+            const auto& sR = snap[1].pose.position;
+            const float sdx = sR.x - sL.x, sdy = sR.y - sL.y, sdz = sR.z - sL.z;
+            LOGI("proj snap_IPD=%.4fm snap_L=(%.4f,%.4f,%.4f) snap_R=(%.4f,%.4f,%.4f)",
+                 std::sqrt(sdx*sdx + sdy*sdy + sdz*sdz),
+                 sL.x, sL.y, sL.z, sR.x, sR.y, sR.z);
+        }
+    }
     out = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     out.space = xr.stage_space();
     out.viewCount = 2;

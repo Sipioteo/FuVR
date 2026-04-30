@@ -46,6 +46,29 @@ public:
     bool ingestPackedUpstreamFrame(const uint8_t* data, std::size_t len,
                                    uint64_t sessionId, uint64_t receivedAtNs);
 
+    // Latest pose snapshot received from the Quest, in the wire-friendly
+    // 13-float layout the OpenVR shim expects ({pos.xyz, quat.xyzw,
+    // linVel.xyz, angVel.xyz}). Used by `OpenVrListener` to answer
+    // `WM_PoseQuery` synchronously from the shim. Returns false if no
+    // pose has been observed yet (Quest not streaming).
+    //
+    // The HMD pose is synthesised as the midpoint of the two view poses
+    // since the upstream frame from the Quest carries per-eye view poses,
+    // not a separate head pose. Orientation is taken from the left view
+    // (the two eye orientations differ only by negligible roll on Quest
+    // hardware; the IPD-related half-offset on translation is < 32 mm and
+    // doesn't affect head-rotation feel which is what we need here).
+    struct LatestPoseSet {
+        bool valid = false;
+        uint32_t validMask = 0;
+        float hmd[13]{};
+        float leftCtrl[13]{};
+        float rightCtrl[13]{};
+        uint64_t questTimestampNs = 0;
+        uint64_t receivedAtNs = 0;
+    };
+    bool latestPoseSet(LatestPoseSet& out) const;
+
     void dispatchSnapshot(uint64_t sessionId,
                           uint64_t receivedAtNs,
                           uint64_t questTimestampNs,
@@ -67,6 +90,9 @@ private:
     std::mutex mu_;
     uint64_t nextStreamId_ = 1;
     std::unordered_map<uint64_t, Entry> subs_;
+
+    mutable std::mutex latestMu_;
+    LatestPoseSet latest_{};
 };
 
 } // namespace fuvr::daemon

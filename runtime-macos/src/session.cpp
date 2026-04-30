@@ -195,6 +195,31 @@ XrResult xrCreateSession_impl(XrInstance instance, const XrSessionCreateInfo* in
         std::fprintf(stderr,
                      "[fuvr-rt] no caps from daemon yet; using Quest 3 defaults\n");
     }
+    // Encoder bitrate / codec — env-driven so the mac-app's Encoder
+    // settings page can propagate the user's choice to Blender's session
+    // path (which doesn't otherwise see the mac-app UI). The mac-app
+    // does `launchctl setenv FUVR_RT_BITRATE_BPS ...` whenever the user
+    // changes the slider; Blender (re)launched from Finder inherits the
+    // env. If unset, fall back to the previous hardcoded 50 Mbps.
+    if (const char* env = std::getenv("FUVR_RT_BITRATE_BPS")) {
+      char* endp = nullptr;
+      uint64_t bps = std::strtoull(env, &endp, 10);
+      if (endp != env && bps > 0 && bps < (1ull << 32)) {
+        params.videoBitrateBps = static_cast<uint32_t>(bps);
+      }
+    }
+    if (const char* env = std::getenv("FUVR_RT_CODEC")) {
+      if (std::strcmp(env, "h264") == 0 || std::strcmp(env, "avc") == 0) {
+        params.useHevc = false;
+      } else if (std::strcmp(env, "hevc") == 0 || std::strcmp(env, "h265") == 0) {
+        params.useHevc = true;
+      }
+    }
+    if (std::getenv("FUVR_RT_DEBUG"))
+      std::fprintf(stderr, "[fuvr-rt] encoder: %s @ %u bps\n",
+                   params.useHevc ? "HEVC" : "H264",
+                   params.videoBitrateBps);
+
     // Capture the encoder-side full per-eye dims as the upscaler's output
     // target. With MetalFX on, params.perEye{Width,Height} are full; with
     // it off, they're already-scaled (and the upscaler is unused).
@@ -738,8 +763,13 @@ XrResult xrLocateViews_impl(XrSession sessionHandle,
   // cached at xrLocateViews) so a small honest margin is enough.
   // Set to 0 to disable reprojection headroom entirely (rotational
   // motion will visibly judder).
+  // Default 0°: render the Quest's native FOV with no reprojection
+  // headroom. Earlier 6°/12°/18° defaults caused visible bottom-edge
+  // warping that was worse than the lack of reprojection padding it
+  // bought us. Re-enable per-process via FUVR_RT_FOV_MARGIN_DEG env if
+  // motion judder during high angular velocity becomes a problem.
   static const float kMarginRad = []() {
-    float deg = 6.0f;
+    float deg = 0.0f;
     if (const char* env = std::getenv("FUVR_RT_FOV_MARGIN_DEG")) {
       float v = static_cast<float>(std::strtof(env, nullptr));
       if (v >= 0.0f && v <= 30.0f) deg = v;

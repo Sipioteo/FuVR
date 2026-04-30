@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "fuvr/daemon.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -53,7 +54,25 @@ bool Daemon::start(const std::string& path) {
     }
 
 #ifndef FUVR_DAEMON_NO_TRANSPORT
-    transport_ = fuvr_transport_create(FuvrTransportKind_UsbServer, "");
+    // Transport selection (env-driven so tests/CI keep the legacy path):
+    //   FUVR_TRANSPORT=tcp   → legacy TCP-over-`adb reverse` (UsbServer)
+    //   FUVR_TRANSPORT=udp   → UDP-RNDIS (auto-discovers 192.168.42.x)
+    //   unset / anything     → UDP-RNDIS, fall back to UsbServer if RNDIS
+    //                          interface is not present yet (Quest hasn't
+    //                          enabled USB Tethering — the mac-app wizard
+    //                          guides the user through that one-time toggle).
+    const char* mode = std::getenv("FUVR_TRANSPORT");
+    if (mode != nullptr && std::string(mode) == "tcp") {
+        transport_ = fuvr_transport_create(FuvrTransportKind_UsbServer, "");
+    } else {
+        transport_ = fuvr_transport_create(FuvrTransportKind_UdpRndis, "");
+        if (transport_ == nullptr) {
+            FUVR_LOG_INFO("daemon",
+                          "UDP-RNDIS unavailable (USB Tethering not enabled?); "
+                          "falling back to TCP/adb-reverse");
+            transport_ = fuvr_transport_create(FuvrTransportKind_UsbServer, "");
+        }
+    }
     if (transport_) {
         fuvr_transport_set_recv_callback(transport_, &Daemon::onTransportRecv, this);
     }
@@ -65,11 +84,21 @@ bool Daemon::start(const std::string& path) {
     }
     metricsThread_ = std::thread([this] { metricsLoop(); });
     clockSyncThread_ = std::thread([this] { clockSyncLoop(); });
+
+    // OpenVR shim listener: accepts the mock `libopenvr_api.dylib`
+    // bundled with FuVR and translates SteamVR API calls into the existing
+    // pose / submit / input plumbing. Failure to bind is non-fatal —
+    // legacy SteamVR support is opt-in.
+    if (!openvrListener_.start("/tmp/fuvr_openvr.sock", this)) {
+        FUVR_LOG_INFO("daemon",
+                      "openvr listener failed to start; legacy SteamVR titles will not connect");
+    }
     return true;
 }
 
 void Daemon::stop() {
     if (!running_.exchange(false)) return;
+    openvrListener_.stop();
     rpc_.stop();
     if (metricsThread_.joinable()) metricsThread_.join();
     if (clockSyncThread_.joinable()) clockSyncThread_.join();
@@ -543,6 +572,24 @@ void Daemon::onEnvelope(const InboundRpc& rpc) {
         });
         break;
     }
+    case ::fuvr::daemon::Envelope::Body::GET_ACTIVE_STREAM: {
+        // Why: mac-app's "Stream" tab polls this on a 500 ms timer to render
+        // which OpenVR-shim app is currently producing frames. Single-source
+        // for now (one OpenVR session at a time); the field set already
+        // tolerates extension to a list.
+        ActiveStreamSnapshot snap = activeStreamSnapshot();
+        reply([&](auto e) {
+            auto r = e.getBody().initActiveStreamResponse();
+            r.setConnected(snap.connected);
+            r.setPerEyeWidth(snap.perEyeWidth);
+            r.setPerEyeHeight(snap.perEyeHeight);
+            r.setRefreshRateHz(snap.refreshRateHz);
+            r.setCurrentFps(snap.currentFps);
+            r.setFramesSubmitted(snap.framesSubmitted);
+            r.setAppKey(snap.appKey);
+        });
+        break;
+    }
     case ::fuvr::daemon::Envelope::Body::PING:
         reply([&](auto e) { e.getBody().setPong(); });
         break;
@@ -607,6 +654,144 @@ void Daemon::metricsLoop() {
             rpc_.send(sub.fd, out.data(), out.size());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// OpenVR shim entry points (called by OpenVrListener).
+// ---------------------------------------------------------------------------
+
+uint64_t Daemon::openOpenVrSession(uint32_t perEyeWidth,
+                                   uint32_t perEyeHeight,
+                                   uint32_t refreshRateHz,
+                                   const std::string& appKey) {
+    // The OpenVR shim now composites left+right eye textures into a single
+    // side-by-side IOSurface (perEyeWidth*2 × perEyeHeight) before
+    // shipping; the encoder is configured exactly like the OpenXR path —
+    // perEyeWidth here is the single-eye width and Session::ctor builds a
+    // 2*perEyeWidth × perEyeHeight encode target.
+    SessionConfig cfg;
+    cfg.perEyeWidth = perEyeWidth;
+    cfg.perEyeHeight = perEyeHeight;
+    cfg.refreshRateHz = refreshRateHz ? refreshRateHz : 90;
+    cfg.codec = fuvr::VideoCodec::Hevc;
+    cfg.bitrateBps = 30'000'000;
+    cfg.forceIdrEveryFrames = 240;
+    cfg.enableVirtualDisplay = false;
+
+    uint64_t id;
+    {
+        std::lock_guard lk(sessionsMu_);
+        id = nextSessionId_++;
+        auto s = std::make_unique<Session>(id, cfg, transport_,
+            [this](const EncodeStatsEvent& ev) { dispatchEncodeStats(ev); });
+        sessions_[id] = std::move(s);
+    }
+    setActiveStreamMeta(appKey, perEyeWidth, perEyeHeight, cfg.refreshRateHz);
+    {
+        std::lock_guard lk(activeStreamMu_);
+        activeStream_.connected = true;
+        activeStream_.sessionId = id;
+        activeStream_.framesSubmitted = 0;
+        activeStream_.recentSubmitNs.clear();
+    }
+    FUVR_LOG_INFO("daemon",
+                  "openvr session created appKey=%s perEye=%ux%u rate=%u Hz id=%llu",
+                  appKey.c_str(), perEyeWidth, perEyeHeight,
+                  cfg.refreshRateHz, (unsigned long long)id);
+    return id;
+}
+
+void Daemon::closeOpenVrSession(uint64_t sessionId) {
+    {
+        std::lock_guard lk(sessionsMu_);
+        sessions_.erase(sessionId);
+    }
+    clearActiveStream();
+}
+
+CVPixelBufferRef Daemon::resolveSurfaceToken(uint64_t surfaceToken) {
+    return pixelBufferFromToken(xpcService_.get(), surfaceToken);
+}
+
+bool Daemon::submitOpenVrFrame(uint64_t sessionId,
+                               CVPixelBufferRef pb,
+                               uint64_t frameId,
+                               uint64_t renderStartNs,
+                               const float renderedLeftPose[7],
+                               const float renderedRightPose[7],
+                               const float leftFov[4],
+                               const float rightFov[4]) {
+    Session* s = nullptr;
+    {
+        std::lock_guard lk(sessionsMu_);
+        auto it = sessions_.find(sessionId);
+        if (it != sessions_.end()) s = it->second.get();
+    }
+    if (!s) return false;
+    // The shim composites L+R into a single SBS IOSurface and submits it
+    // once per stereo pair (eye marker = 2/"both"), but ships DISTINCT per-eye
+    // render poses (world ← head ← eye) and per-eye FOV tangents so the Quest's
+    // projection layer can place each half of the SBS texture at its true
+    // camera. Forwarding identical HMD-center poses here would double-count
+    // IPD via runtime reprojection (see /tmp/fuvr_stereo_audit.md).
+    return s->submitFrame(pb, frameId, renderStartNs, /*forceIdr=*/false,
+                          renderedLeftPose, renderedRightPose, leftFov, rightFov);
+}
+
+// ---------------------------------------------------------------------------
+// Active-stream telemetry.
+// ---------------------------------------------------------------------------
+
+Daemon::ActiveStreamSnapshot Daemon::activeStreamSnapshot() const {
+    std::lock_guard lk(activeStreamMu_);
+    ActiveStreamSnapshot s;
+    s.connected = activeStream_.connected;
+    s.perEyeWidth = activeStream_.perEyeWidth;
+    s.perEyeHeight = activeStream_.perEyeHeight;
+    s.refreshRateHz = activeStream_.refreshRateHz;
+    s.framesSubmitted = activeStream_.framesSubmitted;
+    s.appKey = activeStream_.appKey;
+    // Compute fps from the rolling 1-s window. The listener purges old
+    // entries on each push, so size() ≈ samples in the last second.
+    if (!activeStream_.recentSubmitNs.empty()) {
+        uint64_t newest = activeStream_.recentSubmitNs.back();
+        uint64_t oldest = activeStream_.recentSubmitNs.front();
+        uint64_t spanNs = newest > oldest ? (newest - oldest) : 1;
+        double seconds = static_cast<double>(spanNs) / 1e9;
+        if (seconds < 0.05) seconds = 0.05;   // floor avoids div-by-tiny on burst
+        s.currentFps = static_cast<float>(
+            (activeStream_.recentSubmitNs.size() - 1) / seconds);
+    }
+    return s;
+}
+
+void Daemon::setActiveStreamMeta(const std::string& appKey,
+                                 uint32_t perEyeWidth,
+                                 uint32_t perEyeHeight,
+                                 uint32_t refreshRateHz) {
+    std::lock_guard lk(activeStreamMu_);
+    activeStream_.appKey = appKey;
+    activeStream_.perEyeWidth = perEyeWidth;
+    activeStream_.perEyeHeight = perEyeHeight;
+    activeStream_.refreshRateHz = refreshRateHz;
+}
+
+void Daemon::clearActiveStream() {
+    std::lock_guard lk(activeStreamMu_);
+    activeStream_ = ActiveStreamState{};
+}
+
+void Daemon::noteOpenVrFrameSubmitted() {
+    uint64_t now = nowNs();
+    std::lock_guard lk(activeStreamMu_);
+    activeStream_.framesSubmitted += 1;
+    auto& v = activeStream_.recentSubmitNs;
+    v.push_back(now);
+    // Drop entries older than 1 s.
+    const uint64_t cutoff = now > 1'000'000'000ull ? now - 1'000'000'000ull : 0;
+    auto firstFresh = std::lower_bound(v.begin(), v.end(), cutoff);
+    if (firstFresh != v.begin()) v.erase(v.begin(), firstFresh);
+    if (v.size() > 256) v.erase(v.begin(), v.begin() + (v.size() - 256));
 }
 
 } // namespace fuvr::daemon

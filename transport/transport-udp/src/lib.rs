@@ -5,6 +5,7 @@
 //! timeout-based reassembly. ARQ-free.
 
 pub mod jitter;
+pub mod tethering;
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -19,10 +20,19 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use transport_core::channel::Channel;
 use transport_core::fec::{FecConfig, FecEncoder};
+use transport_core::pacing::TokenBucket;
 use transport_core::transport::{Result, Transport, TransportError};
 
 /// Max payload bytes per UDP datagram (excluding IP/UDP headers + our header).
-pub const DEFAULT_MTU_PAYLOAD: usize = 1200;
+///
+/// Tuned for RNDIS/NCM USB tethering: the virtual link advertises a 1500-byte
+/// MTU but the RNDIS encapsulation eats ~44 bytes for the BTH+ETH frame; 1450
+/// keeps every shard one cable transaction with margin for IP/UDP headers
+/// (28 B) and our `PktHeader` (25 B).
+pub const DEFAULT_MTU_PAYLOAD: usize = 1450;
+
+/// Default UDP port for the dedicated RNDIS VR stream.
+pub const DEFAULT_RNDIS_PORT: u16 = 59000;
 
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -84,11 +94,34 @@ impl PktHeader {
 pub struct UdpConfig {
     pub mtu_payload: usize,
     pub fec: FecConfig,
+    /// Optional bitrate cap (bytes/sec). When `Some`, the sender acquires from
+    /// a token bucket sized at `bitrate_bps_cap / 8` capacity, smoothing burst
+    /// emission so the Quest NDK ring buffer is not overwhelmed (UDP is
+    /// fire-and-forget; without pacing a 150 Mbps keyframe spike will drop).
+    pub bitrate_bps_cap: Option<u64>,
 }
 
 impl Default for UdpConfig {
     fn default() -> Self {
-        Self { mtu_payload: DEFAULT_MTU_PAYLOAD, fec: FecConfig::default() }
+        Self {
+            mtu_payload: DEFAULT_MTU_PAYLOAD,
+            fec: FecConfig::default(),
+            bitrate_bps_cap: None,
+        }
+    }
+}
+
+pub struct HeartbeatGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
     }
 }
 
@@ -108,6 +141,7 @@ pub struct UdpTransport {
     outgoing: mpsc::Sender<(Channel, Bytes)>,
     incoming_rx: tokio::sync::Mutex<Option<mpsc::Receiver<(Channel, Bytes)>>>,
     fec: FecEncoder,
+    pacer: Option<Arc<TokenBucket>>,
 }
 
 impl UdpTransport {
@@ -122,10 +156,56 @@ impl UdpTransport {
         Self::from_socket(sock, Some(peer), cfg)
     }
 
+    /// Discover the RNDIS host interface, bind to `<host-ip>:port`, and target
+    /// the Quest gateway at `192.168.42.129:port`. Returns an error if the
+    /// tether interface is not present (caller should prompt the user to
+    /// enable USB Tethering inside the headset).
+    pub async fn bind_rndis(cfg: UdpConfig) -> Result<Arc<Self>> {
+        let iface = tethering::find_rndis_interface().ok_or_else(|| {
+            TransportError::Other(
+                "no RNDIS interface in 192.168.42.0/24 — enable USB Tethering on the Quest"
+                    .into(),
+            )
+        })?;
+        Self::bind_connected(iface.bind_addr(), iface.peer_addr(), cfg).await
+    }
+
+    /// Spawn a background task that emits a small UDP datagram on the Control
+    /// channel at `period`, keeping the RNDIS link awake on both ends. The
+    /// task exits when the returned guard is dropped.
+    pub fn spawn_heartbeat(self: &Arc<Self>, period: Duration) -> HeartbeatGuard {
+        let me = self.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_inner = stop.clone();
+        let handle = tokio::spawn(async move {
+            // Tiny payload — Control channel is non-FEC-critical and the
+            // peer just needs the cable to see traffic.
+            let payload = Bytes::from_static(b"\x00\x00\x00\x00fuvr-hb");
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                if stop_inner.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                tick.tick().await;
+                let _ = me.outgoing.send((Channel::Control, payload.clone())).await;
+            }
+        });
+        HeartbeatGuard { stop, handle: Some(handle) }
+    }
+
     fn from_socket(sock: Arc<UdpSocket>, peer: Option<SocketAddr>, cfg: UdpConfig) -> Result<Arc<Self>> {
         let (out_tx, mut out_rx) = mpsc::channel::<(Channel, Bytes)>(1024);
         let (in_tx, in_rx) = mpsc::channel::<(Channel, Bytes)>(1024);
         let fec = FecEncoder::new(cfg.fec).map_err(|e| TransportError::Other(format!("{e}")))?;
+
+        let pacer = cfg.bitrate_bps_cap.map(|bps| {
+            let bytes_per_sec = (bps / 8).max(1) as f64;
+            // 50 ms burst budget — large enough to not stall on a keyframe,
+            // small enough to keep buffer pressure bounded.
+            let capacity = (bytes_per_sec * 0.05).max(64_000.0);
+            Arc::new(TokenBucket::new(capacity, bytes_per_sec))
+        });
 
         let me = Arc::new(Self {
             cfg,
@@ -135,6 +215,7 @@ impl UdpTransport {
             outgoing: out_tx,
             incoming_rx: tokio::sync::Mutex::new(Some(in_rx)),
             fec,
+            pacer,
         });
 
         // sender task
@@ -196,6 +277,10 @@ impl UdpTransport {
             }
             .encode(&mut buf);
             buf.extend_from_slice(shard);
+
+            if let Some(pacer) = &self.pacer {
+                pacer.acquire(buf.len() as f64).await;
+            }
 
             let peer = *self.peer.lock();
             match peer {
