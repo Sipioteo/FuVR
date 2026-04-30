@@ -89,6 +89,17 @@ public final class AdbController: @unchecked Sendable {
         _ = try run(["-s", serial, "reverse", "--remove-all"], timeout: timeout)
     }
 
+    /// Open the hidden Android Tether settings activity on the Quest. Used
+    /// once per connection cycle to land the user on the toggle screen for
+    /// USB Tethering — Meta's launcher hides this menu so we have to deep-link.
+    public func openTetherSettings(serial: String, timeout: TimeInterval = 5) throws {
+        _ = try run([
+            "-s", serial,
+            "shell", "am", "start",
+            "-n", "com.android.settings/.TetherSettings",
+        ], timeout: timeout)
+    }
+
     /// Probe whether a package is already installed on a device.
     public func isPackageInstalled(_ package: String, serial: String) -> Bool {
         guard let result = try? run(["-s", serial, "shell", "pm", "list", "packages", package], timeout: 5) else {

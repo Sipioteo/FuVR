@@ -17,7 +17,13 @@ let package = Package(
             dependencies: ["FuVRControl", "FuVRADB"],
             path: "Sources/FuVRApp",
             exclude: ["Resources/Assets.xcassets"],
-            resources: []
+            resources: [
+                // Standalone PNG used by AppDelegate to set the dock icon at
+                // launch. SwiftPM doesn't compile .xcassets for command-line
+                // executables, so we ship the raw 1024×1024 PNG and load it
+                // via Bundle.module.
+                .process("Resources/AppIcon.png"),
+            ]
         ),
         .target(
             name: "FuVRControl",
@@ -29,6 +35,15 @@ let package = Package(
                 // the directory tree so we can pick the right arch at runtime.
                 .copy("Resources/adb"),
                 .copy("Resources/quest"),
+                // Universal-binary mock libopenvr_api.dylib, staged here by
+                // the CMake `openvr_api` target's POST_BUILD step. The
+                // OpenVrBridgeInstaller copies it next to the user's
+                // Vivecraft install on demand.
+                .copy("Resources/openvr"),
+                // FuVR-flavored Vivecraft fork (built from fuvr-mod/upstream).
+                // OpenVrBridgeInstaller drops this into discovered Minecraft
+                // instances' mods/ folders.
+                .copy("Resources/fuvr-mod.jar"),
             ]
         ),
         .target(

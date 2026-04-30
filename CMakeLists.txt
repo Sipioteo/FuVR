@@ -46,6 +46,13 @@ add_subdirectory(runtime-macos)
 add_subdirectory(virtual-display-helper)
 add_subdirectory(daemon)
 
+# Optional: mock libopenvr_api.dylib for legacy SteamVR Mac titles.
+# Universal binary (x86_64+arm64) so Rosetta 2 games can dlopen it.
+option(FUVR_BUILD_OPENVR_SHIM "Build the mock libopenvr_api.dylib (universal binary)" ON)
+if(FUVR_BUILD_OPENVR_SHIM)
+  add_subdirectory(openvr-shim)
+endif()
+
 # Optional: build the host-side ATW math test on the Mac (no NDK needed).
 # Just the rotational-ATW math test is built from the top-level project; the
 # rest of the quest-app host tests live under their own standalone

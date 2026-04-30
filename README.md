@@ -222,7 +222,7 @@ Hardware test reports, results on different headset models, and ADR proposals ar
 >
 > ![Accurate depiction](docs/dev-collab.gif)
 
-Designed and built by [Sipioteo](https://github.com/Sipioteo). [Claude Opus 4.7](https://anthropic.com) was used as a development companion throughout — sounding board, code reviewer, implementation aid. All architectural decisions, technical direction, and intellectual authorship are mine.
+Designed and built by [Sipioteo](https://github.com/Sipioteo).
 
 ---
 

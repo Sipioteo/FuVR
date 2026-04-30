@@ -34,3 +34,9 @@ proto/gen/
 .idea/
 .vscode/
 *.swp
+
+# Android NDK build cache
+quest-app/app/.cxx/
+
+# Local junk
+--help

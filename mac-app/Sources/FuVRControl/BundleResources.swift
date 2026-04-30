@@ -33,6 +33,49 @@ public enum FuVRControlBundle {
         return FileManager.default.fileExists(atPath: candidate) ? candidate : nil
     }
 
+    /// Path to the bundled mock `libopenvr_api.dylib` (universal binary).
+    /// Returns `nil` when the `openvr_api` CMake target has not yet been
+    /// built — its POST_BUILD step stages the dylib here.
+    ///
+    /// SwiftPM lays out `.copy` resources differently between dev builds
+    /// (`<bundle>/openvr/libopenvr_api.dylib`) and shipped .app bundles
+    /// (`<bundle>/Contents/Resources/openvr/libopenvr_api.dylib`). We
+    /// prefer `Bundle.module.url(forResource:...)` which abstracts the
+    /// difference, and fall back to manually probing both layouts.
+    public static func openvrShimPath() -> String? {
+        let fm = FileManager.default
+        if let url = Bundle.module.url(forResource: "libopenvr_api",
+                                       withExtension: "dylib",
+                                       subdirectory: "openvr") {
+            return url.path
+        }
+        let candidates = [
+            Bundle.module.bundleURL.appendingPathComponent("openvr/libopenvr_api.dylib"),
+            Bundle.module.bundleURL.appendingPathComponent("Contents/Resources/openvr/libopenvr_api.dylib"),
+        ]
+        for c in candidates where fm.fileExists(atPath: c.path) { return c.path }
+        return nil
+    }
+
+    /// URL of the bundled `fuvr-mod.jar` (our forked Vivecraft mod), or `nil`
+    /// if the jar has not yet been staged into the package resources.
+    /// The build pipeline drops it at `Resources/fuvr-mod.jar`; until then
+    /// callers should treat the absence as "no mod install available" rather
+    /// than a hard error.
+    public static var fuvrModJarURL: URL? {
+        if let url = Bundle.module.url(forResource: "fuvr-mod",
+                                       withExtension: "jar") {
+            return url
+        }
+        let fm = FileManager.default
+        let candidates = [
+            Bundle.module.bundleURL.appendingPathComponent("fuvr-mod.jar"),
+            Bundle.module.bundleURL.appendingPathComponent("Contents/Resources/fuvr-mod.jar"),
+        ]
+        for c in candidates where fm.fileExists(atPath: c.path) { return c }
+        return nil
+    }
+
     private static func currentArch() -> String {
         var sysinfo = utsname()
         uname(&sysinfo)

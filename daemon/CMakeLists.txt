@@ -2,6 +2,7 @@
 
 add_library(fuvr_daemon_core STATIC
   src/daemon.cpp
+  src/openvr_listener.cpp
   src/rpc_server.cpp
   src/session.cpp
   src/iosurface_bridge.mm

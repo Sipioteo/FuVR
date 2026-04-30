@@ -15,6 +15,11 @@ typedef enum FuvrTransportKind {
     FuvrTransportKind_UsbServer = 0,
     FuvrTransportKind_UsbClient = 1,
     FuvrTransportKind_Udp = 2,
+    /* UDP over RNDIS USB tethering. The endpoint string is ignored; the
+     * transport auto-discovers the host interface in 192.168.42.0/24 and
+     * targets the Quest at 192.168.42.129:59000. A 500ms heartbeat is
+     * started automatically. */
+    FuvrTransportKind_UdpRndis = 3,
 } FuvrTransportKind;
 
 typedef enum FuvrChannel {

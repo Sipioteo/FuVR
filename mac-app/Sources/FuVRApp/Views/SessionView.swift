@@ -29,6 +29,10 @@ struct SessionView: View {
     @AppStorage(SettingsKey.bitrateMbps)   private var bitrateMbps: Int = 150
     @AppStorage(SettingsKey.audioEnabled)  private var audioEnabled: Bool = true
 
+    @State private var showTetheringWizard: Bool = false
+    @State private var rndisLink: RndisInterfaceMonitor.Snapshot?
+    @State private var linkMonitor = RndisInterfaceMonitor()
+
     private var pillColor: Color {
         switch state.statusColorName {
         case "green":  return .green
@@ -78,6 +82,32 @@ struct SessionView: View {
                     }.padding(8)
                 }
 
+                GroupBox("USB Link") {
+                    HStack(spacing: 12) {
+                        if let link = rndisLink {
+                            Image(systemName: "bolt.horizontal.circle.fill")
+                                .foregroundStyle(.green)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("High-Speed Link Active").font(.headline)
+                                Text("Host \(link.ipv4) on \(link.interfaceName) → Quest 192.168.42.129:59000")
+                                    .font(.caption).foregroundStyle(.secondary).monospaced()
+                            }
+                        } else {
+                            Image(systemName: "cable.connector.horizontal")
+                                .foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("USB Tethering not active").font(.headline)
+                                Text("Quest will fall back to legacy TCP. Run the wizard for the lower-latency UDP path.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        Button(rndisLink == nil ? "Set up…" : "Re-run wizard") {
+                            showTetheringWizard = true
+                        }
+                    }.padding(8)
+                }
+
                 GroupBox("Stream") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 24) {
@@ -123,6 +153,21 @@ struct SessionView: View {
             }
             .padding(28)
         }
+        .sheet(isPresented: $showTetheringWizard) {
+            TetheringWizardView(
+                serial: nil,
+                onLinkActive: { snap in rndisLink = snap },
+                onDismiss: { showTetheringWizard = false }
+            )
+        }
+        .onAppear {
+            rndisLink = RndisInterfaceMonitor.currentSnapshot()
+            linkMonitor.onChange = { snap in
+                Task { @MainActor in rndisLink = snap }
+            }
+            linkMonitor.start()
+        }
+        .onDisappear { linkMonitor.stop() }
     }
 
     private func metric(_ label: String, _ value: String) -> some View {

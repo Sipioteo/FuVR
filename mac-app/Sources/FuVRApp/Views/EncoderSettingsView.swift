@@ -58,6 +58,20 @@ struct EncoderSettingsView: View {
         .formStyle(.grouped)
         .padding()
         .navigationTitle("Encoder")
+        // Republish env vars whenever the user touches the Encoder UI so
+        // the next Blender launch picks up the change. Cheap (3 launchctl
+        // setenvs); idempotent.
+        .onChange(of: bitrateMbps) { _ in republishEnv() }
+        .onChange(of: codec)       { _ in republishEnv() }
+        .onChange(of: refreshRate) { _ in republishEnv() }
+        .onAppear { republishEnv() }
+    }
+
+    private func republishEnv() {
+        AppState.publishEncoderEnv(
+            bitrateMbps: bitrateMbps,
+            codec: codec,
+            refreshHz: refreshRate)
     }
 
     private var presetSelection: Binding<Int> {

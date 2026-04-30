@@ -16,11 +16,19 @@ public enum SettingsKey {
 }
 
 public enum DefaultSocketPath {
+    /// Path the live `fuvrd` daemon binds for control RPC. The daemon's
+    /// `RpcServer::start` writes here (see `daemon/src/rpc_server.cpp`)
+    /// and the launchd service points to the same location, so the
+    /// mac-app must connect here. Historical drift left this resolver
+    /// returning `control.sock` while the daemon actually listened on
+    /// `rpc.sock` — the names were divergent and the Connect button
+    /// silently dialled a non-existent socket. Keep this name in sync
+    /// with the daemon.
     public static func resolve() -> String {
         if let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
             let dir = cache.appendingPathComponent("fuvr", isDirectory: true)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            return dir.appendingPathComponent("control.sock").path
+            return dir.appendingPathComponent("rpc.sock").path
         }
         return "/tmp/fuvr.sock"
     }
