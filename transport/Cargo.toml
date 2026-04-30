@@ -18,7 +18,7 @@ repository = "https://github.com/fuvr/fuvr"
 
 [workspace.dependencies]
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 bytes = "1.7"
 tokio = { version = "1.40", features = ["full"] }
 tokio-stream = "0.1"
