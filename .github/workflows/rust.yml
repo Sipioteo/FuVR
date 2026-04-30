@@ -28,7 +28,7 @@ jobs:
       run:
         working-directory: transport
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install capnp (Linux)
         if: runner.os == 'Linux'

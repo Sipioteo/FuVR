@@ -21,7 +21,7 @@ jobs:
         os: [macos-14, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache Homebrew prefix
         uses: actions/cache@v4
