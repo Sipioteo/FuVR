@@ -18,4 +18,4 @@ astro-dnssd = "0.3"
 # on other platforms the crate compiles to a no-op stub. mdns-sd is pulled
 # in for cross-platform browse so the CLI's `mdns-browse` subcommand still
 # works on the Linux runners during integration tests.
-mdns-sd = "0.11"
+mdns-sd = "0.19"
