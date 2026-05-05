@@ -65,8 +65,8 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("org.khronos.openxr:openxr_loader_for_android:1.1.36")
+    implementation("androidx.core:core-ktx:1.18.0")
+    implementation("org.khronos.openxr:openxr_loader_for_android:1.1.58")
 }
 
 // Cap'n Proto code generation. Fails clearly if `capnp` isn't on PATH.
